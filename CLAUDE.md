@@ -50,13 +50,13 @@ After every code change, run all five locally before claiming done — they matc
 ## Architecture
 
 - **Stack:** Next.js 16 (App Router) + React 19 + TypeScript; Tailwind 4 + Shadcn/UI; Monaco editor; TanStack Table + react-virtual; `jose` JWT + `openid-client` OIDC.
-- **DB drivers:** `pg`, `mysql2`, **`bun:sqlite`** (the DB provider) / `better-sqlite3` (the storage layer), `oracledb`, `mssql`, `mongodb`, `ioredis`.
+- **DB drivers:** `pg`, `mysql2`, **`bun:sqlite`/`node:sqlite`** (the DB provider, runtime-selected; `LIBREDB_SQLITE_DRIVER` overrides) / `better-sqlite3` (the storage layer), `oracledb`, `mssql`, `mongodb`, `ioredis`.
 - **Layout:** full tree + data flow in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Key dirs: `src/lib/db` (DB providers, Strategy Pattern), `src/lib/llm` (LLM providers), `src/lib/storage` (pluggable persistence), `src/workspace` + `src/exports` (the npm-package embedding layer), `src/proxy.ts` (RBAC middleware).
 - **Path alias:** `@/*` → `./src/*`.
 
 ### Rules & patterns
 
-> **⚠️ Providers are the lifeblood of this project — keep the triad in lockstep: code ↔ docs ↔ tests**, 1:1 per canonical type-id (`postgres`, `mysql`, `sqlite`, `oracle`, `mssql`, `mongodb`, `redis`):
+> **⚠️ Providers are the lifeblood of this project — keep the triad in lockstep: code ↔ docs ↔ tests**, 1:1 per canonical type-id (`postgres`, `mysql`, `sqlite`, `oracle`, `mssql`, `mongodb`, `redis`, plus the embedded `libredb`):
 > - Code: `src/lib/db/providers/<family>/<type-id>.ts` · Docs: `docs/providers/<type-id>.md` · Tests: `tests/integration/db/<type-id>-provider.test.ts`
 > - Any change to one side MUST sync the others **in the same PR**. The doc mirrors the code and the code mirrors the doc — never let them drift.
 
