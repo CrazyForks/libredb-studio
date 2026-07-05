@@ -9,6 +9,7 @@ import * as path from "path";
 import {
   artifactName,
   assertReleaseVersion,
+  assessNodeRuntime,
   LauncherUsageError,
   parseLauncherArgs,
   parseSha256Sums,
@@ -196,5 +197,76 @@ describe("parseLauncherArgs", () => {
   test("rejects unknown arguments", () => {
     expect(() => parseLauncherArgs(["--verbose"])).toThrow(LauncherUsageError);
     expect(() => parseLauncherArgs(["serve"])).toThrow(LauncherUsageError);
+  });
+});
+
+describe("assessNodeRuntime", () => {
+  test.each(["18.19.0", "20.0.0", "20.8.9"])("fails below the 20.9 floor (%s)", (version) => {
+    const result = assessNodeRuntime(version);
+    expect(result.action).toBe("fail");
+    expect(result.message).toContain("requires Node.js 20.9 or newer");
+    expect(result.message).toContain(version);
+    expect(result.message).toContain("docker run");
+  });
+
+  test.each([
+    "20.9.0",
+    "20.19.5",
+    "21.7.3",
+    "22.0.0",
+    "22.5.0",
+    "22.12.0",
+  ])("warns that all SQLite features are unavailable on %s (no unflagged node:sqlite)", (version) => {
+    const result = assessNodeRuntime(version);
+    expect(result.action).toBe("warn");
+    expect(result.message).toContain("SQLite features are unavailable");
+    expect(result.message).toContain("node:sqlite");
+    expect(result.message).toContain("Node 24");
+  });
+
+  test.each([
+    "22.13.0",
+    "22.23.1",
+    "23.4.0",
+  ])("warns only about server-side SQLite storage on %s (node:sqlite present, better-sqlite3 ABI mismatch)", (version) => {
+    const result = assessNodeRuntime(version);
+    expect(result.action).toBe("warn");
+    expect(result.message).toContain("STORAGE_PROVIDER=sqlite");
+    expect(result.message).toContain("Node 24 ABI");
+    expect(result.message).not.toContain("SQLite features are unavailable");
+  });
+
+  test.each(["24.0.0", "24.14.0", "25.1.0", "26.0.0"])("is silent on the fully supported %s", (version) => {
+    const result = assessNodeRuntime(version);
+    expect(result.action).toBe("ok");
+    expect(result.message).toBeNull();
+  });
+
+  test("handles prerelease-style version strings by their numeric prefix", () => {
+    expect(assessNodeRuntime("24.0.0-nightly202512").action).toBe("ok");
+    expect(assessNodeRuntime("20.8.0-rc.1").action).toBe("fail");
+  });
+
+  test("fails loudly on an unparsable version string", () => {
+    const result = assessNodeRuntime("weird");
+    expect(result.action).toBe("fail");
+    expect(result.message).toContain("could not parse");
+  });
+
+  test("fails closed on two-component version strings (process.versions.node is always three)", () => {
+    expect(assessNodeRuntime("22.13").action).toBe("fail");
+  });
+
+  test("fail boundary matches the package.json engines floor (single source of truth)", () => {
+    // MINIMUM_NODE in launcher-utils.mjs and engines.node in package.json
+    // state the same floor in two places; this pins them together so bumping
+    // one without the other fails a test instead of shipping a drift.
+    const pkg = JSON.parse(fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+    const match = /^>=(\d+)\.(\d+)\.(\d+)$/.exec(pkg.engines.node);
+    expect(match).not.toBeNull();
+    const [major, minor, patch] = [Number(match![1]), Number(match![2]), Number(match![3])];
+    expect(assessNodeRuntime(`${major}.${minor}.${patch}`).action).not.toBe("fail");
+    const justBelow = minor > 0 ? `${major}.${minor - 1}.999` : `${major - 1}.999.999`;
+    expect(assessNodeRuntime(justBelow).action).toBe("fail");
   });
 });
