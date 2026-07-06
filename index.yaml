@@ -30,7 +30,7 @@ entries:
       version: 16.x.x
     description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
       SQLite, Oracle, SQL Server, MongoDB, and Redis
-    digest: cb2b6e8ea3a1915aa8a43cc9a1510a37086ccea51d7289096cc81f8b7ac5f572
+    digest: 03b3e464029b0823aae11457e4e75937c824d5b710570c0f09c16aeec9887cd4
     home: https://github.com/libredb/libredb-studio
     icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
     keywords:
