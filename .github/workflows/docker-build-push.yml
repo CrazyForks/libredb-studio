@@ -167,6 +167,9 @@ jobs:
             # A plain manual dispatch (backfilling an old version) must never
             # move latest - the 0.9.46 chain shipped with latest stuck on the
             # previous release because dispatch could not move it at all.
+            # Keep this "release context" condition in step with the
+            # dispatch-helm-release job's if: below - if they drift, the
+            # chart dispatch and the latest tag disagree on what a release is.
             type=raw,value=latest,enable=${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true) }}
             type=raw,value=main,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref != 'refs/heads/main' }}
@@ -201,3 +204,33 @@ jobs:
           echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
+
+  dispatch-helm-release:
+    # The chart deploys the image this run just published, so helm-release
+    # runs only AFTER a successful publish: the version-bump merge's own
+    # helm-release run ends as a no-op at its image gate, and this dispatch
+    # re-triggers it now that the image exists. Release context only -
+    # main/dev branch builds must not publish charts - and a failed build
+    # dispatches nothing, so the chart correctly stays unpublished. Separate
+    # job so actions:write is never granted to ordinary branch builds, and
+    # the dispatch targets THIS run's ref so the chart is released from the
+    # same commit as the image (a main dispatch could pick up a newer,
+    # not-yet-built chart). The if: below is the same "release context"
+    # condition as the latest-tag enable in the metadata step above - keep
+    # the two in step.
+    name: Dispatch Helm chart release
+    needs: build-and-push
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch helm-release on this ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          gh workflow run helm-release.yml --ref "$REF"
+          echo "Dispatched helm-release on ${REF}."
