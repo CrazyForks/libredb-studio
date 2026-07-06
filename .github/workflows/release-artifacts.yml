@@ -475,6 +475,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Required by the chain-dispatch step below: gh workflow run calls the
+      # Actions API, and an explicit permissions block disables every scope
+      # it does not name.
+      actions: write
     steps:
       - name: Verify the draft carries the full asset set
         env:
@@ -519,3 +523,26 @@ jobs:
           set -euo pipefail
           gh release edit "$TAG" --draft=false --latest
           echo "Release '$TAG' published with the verified asset set."
+
+      - name: Dispatch npm and Docker publish
+        # The publish above runs under GITHUB_TOKEN, and events created by
+        # GITHUB_TOKEN do not trigger other workflows (the 0.9.46 release
+        # published without npm/Docker firing). workflow_dispatch API calls
+        # are NOT subject to that restriction, so chain the downstream
+        # channels explicitly. Their own guards re-validate the version.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          # --ref pins both runs to the tagged commit: a default-branch
+          # dispatch would build whatever main has moved to in the meantime.
+          # npm-publish gets NO version input: its "Set version" step runs
+          # `npm version <input>`, which fails with "Version not changed"
+          # when package.json already carries the tag version - always the
+          # case on a tag ref. Empty input = publish the package.json
+          # version at the tag, which is the released version by definition.
+          gh workflow run npm-publish.yml --ref "refs/tags/$TAG"
+          gh workflow run docker-build-push.yml --ref "refs/tags/$TAG" -f "version=$TAG"
+          echo "Dispatched npm-publish and docker-build-push for '$TAG'."
