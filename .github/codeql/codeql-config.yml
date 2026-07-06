@@ -1,0 +1,9 @@
+name: "LibreDB CodeQL config"
+
+# operator/ is entirely operator-sdk generated scaffold plus a vendored copy of
+# the published Helm chart (a codeless helm-operator: no first-party source).
+# The chart is published and scanned on its own, so scanning the embedded copy
+# only re-flags its placeholder defaults (e.g. the disabled PostgreSQL
+# subchart's empty password). Exclude the generated tree from analysis.
+paths-ignore:
+  - "operator/**"
