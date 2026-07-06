@@ -1,0 +1,149 @@
+apiVersion: studio.libredb.org/v1alpha1
+kind: LibreDBStudio
+metadata:
+  name: libredbstudio-sample
+spec:
+  # Default values copied from <project_dir>/helm-charts/libredb-studio/values.yaml
+  affinity: {}
+  authProvider: local
+  autoscaling:
+    enabled: false
+    maxReplicas: 10
+    minReplicas: 2
+    targetCPUUtilizationPercentage: 75
+    targetMemoryUtilizationPercentage: 80
+  config:
+    authBootstrap: "off"
+    llmApiUrl: ""
+    llmModel: ""
+    llmProvider: ""
+    logLevel: info
+    oidcAdminRoles: admin
+    oidcIssuer: ""
+    oidcRoleClaim: ""
+    oidcScope: openid profile email
+    storageProvider: local
+    storageSqlitePath: /app/data/libredb-storage.db
+  extraEnv: []
+  extraEnvFrom: []
+  fullnameOverride: ""
+  image:
+    pullPolicy: IfNotPresent
+    repository: ghcr.io/libredb/libredb-studio
+    tag: ""
+  imagePullSecrets: []
+  ingress:
+    annotations: {}
+    className: ""
+    enabled: false
+    hosts:
+    - host: libredb.local
+      paths:
+      - path: /
+        pathType: Prefix
+    tls: []
+  livenessProbe:
+    httpGet:
+      path: /api/db/health
+      port: http
+    initialDelaySeconds: 30
+    periodSeconds: 30
+  nameOverride: ""
+  networkPolicy:
+    additionalEgress: []
+    additionalIngress: []
+    enabled: false
+  nodeSelector: {}
+  persistence:
+    accessModes:
+    - ReadWriteOnce
+    annotations: {}
+    enabled: false
+    existingClaim: ""
+    size: 1Gi
+    storageClassName: ""
+  podAnnotations: {}
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  podLabels: {}
+  podSecurityContext:
+    fsGroup: 1001
+    runAsGroup: 1001
+    runAsNonRoot: true
+    runAsUser: 1001
+    seccompProfile:
+      type: RuntimeDefault
+  postgresql:
+    auth:
+      database: libredb_storage
+      password: ""
+      username: libredb
+    enabled: false
+  readinessProbe:
+    httpGet:
+      path: /api/db/health
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  replicaCount: 1
+  resources:
+    limits:
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  secrets:
+    adminEmail: admin@libredb.org
+    adminPassword: ""
+    existingSecret: ""
+    existingSecretKeys:
+      adminEmail: admin-email
+      adminPassword: admin-password
+      jwtSecret: jwt-secret
+      llmApiKey: llm-api-key
+      oidcClientId: oidc-client-id
+      oidcClientSecret: oidc-client-secret
+      storagePostgresUrl: storage-postgres-url
+      userEmail: user-email
+      userPassword: user-password
+    jwtSecret: ""
+    llmApiKey: ""
+    oidcClientId: ""
+    oidcClientSecret: ""
+    storagePostgresUrl: ""
+    userEmail: user@libredb.org
+    userPassword: ""
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+    readOnlyRootFilesystem: true
+  seedConnections:
+    cacheTTL: 60000
+    config: {}
+    configMapKey: seed-connections.yaml
+    enabled: false
+    existingConfigMap: ""
+  service:
+    annotations: {}
+    nodePort: ""
+    port: 80
+    targetPort: 3000
+    type: ClusterIP
+  serviceAccount:
+    annotations: {}
+    automountServiceAccountToken: false
+    create: true
+    name: ""
+  startupProbe:
+    failureThreshold: 30
+    httpGet:
+      path: /api/db/health
+      port: http
+    periodSeconds: 2
+  tolerations: []
+  topologySpreadConstraints: []
+  
+  

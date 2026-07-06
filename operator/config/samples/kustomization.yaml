@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- studio_v1alpha1_libredbstudio.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
