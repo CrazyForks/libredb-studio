@@ -5,21 +5,12 @@ entries:
       artifacthub.io/category: database
       artifacthub.io/changes: |
         - Track app release 0.9.49 (appVersion bump; default image tag follows)
-        - Default install is now zero-config: with no values set, first-run admin credentials are generated and printed to the pod log (config.authBootstrap default changed from "off" to ""); set config.authBootstrap=off for strict fail-closed installs
-        - Secret keys and env entries for JWT_SECRET, ADMIN_PASSWORD, USER_EMAIL and USER_PASSWORD are rendered only when their values are set (or an existingSecret is used), so pods no longer reference missing Secret keys
-        - Strict mode now requires only secrets.jwtSecret and secrets.adminPassword; secrets.userPassword is optional in all modes (the non-admin account is an optional app feature and is never generated)
-        - With secrets.existingSecret, auth env entries are optional only in zero-config mode; strict mode references jwt-secret and admin-password hard, so the pod waits for missing keys instead of starting without them
-        - Mount an emptyDir at /app/data when persistence is disabled so first-run credentials can be persisted under readOnlyRootFilesystem
-        - Declare linux/arm64 in artifacthub.io/images (the image is multi-arch) and clear the prerelease flag
-        - Refuse zero-config installs with replicaCount > 1 or autoscaling enabled (per-pod generated JWT secrets would break sessions across replicas); set secrets.jwtSecret or config.authBootstrap=off for multi-replica setups
-        - Upgrade note: releases relying on the previous strict default keep fail-closed behavior only by setting config.authBootstrap=off explicitly
       artifacthub.io/containsSecurityUpdates: "false"
       artifacthub.io/images: |
         - name: libredb-studio
           image: ghcr.io/libredb/libredb-studio:0.9.49
           platforms:
             - linux/amd64
-            - linux/arm64
       artifacthub.io/license: MIT
       artifacthub.io/links: |
         - name: Documentation
@@ -28,10 +19,10 @@ entries:
           url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
         - name: Source
           url: https://github.com/libredb/libredb-studio
-      artifacthub.io/prerelease: "false"
+      artifacthub.io/prerelease: "true"
     apiVersion: v2
     appVersion: 0.9.49
-    created: "2026-07-07T09:20:59.381510052Z"
+    created: "2026-07-06T21:04:15.233732481Z"
     dependencies:
     - condition: postgresql.enabled
       name: postgresql
@@ -39,7 +30,7 @@ entries:
       version: 16.x.x
     description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
       SQLite, Oracle, SQL Server, MongoDB, and Redis
-    digest: e14d83634a964dae0aba5fa6b70ad7544ac87d776731a45416af351fcff2b30c
+    digest: 9e275d1e9fda2852e8220e89a059425209a8b02fd56d5fcd9226ec20ce65c22b
     home: https://github.com/libredb/libredb-studio
     icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
     keywords:
@@ -450,4 +441,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-07-07T09:20:59.375104606Z"
+generated: "2026-07-06T21:04:15.227205783Z"
