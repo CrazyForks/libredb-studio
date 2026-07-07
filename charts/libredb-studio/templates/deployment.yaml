@@ -1,3 +1,11 @@
+{{- /*
+Zero-config bootstrap generates JWT_SECRET per pod on its own data volume, so
+two replicas would sign sessions with different keys (intermittent 401s behind
+the Service). Refuse the combination instead of shipping it broken.
+*/}}
+{{- if and (not (include "libredb-studio.authStrict" .)) (not .Values.secrets.jwtSecret) (not .Values.secrets.existingSecret) (or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1)) }}
+{{- fail "zero-config bootstrap generates a per-pod JWT secret, which breaks sessions across replicas: with replicaCount > 1 or autoscaling.enabled, set secrets.jwtSecret (or secrets.existingSecret), or use config.authBootstrap=off" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,31 +57,48 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           env:
+            {{- if or .Values.secrets.jwtSecret .Values.secrets.existingSecret }}
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "libredb-studio.secretName" . }}
                   key: {{ .Values.secrets.existingSecretKeys.jwtSecret }}
+                  {{- if not (include "libredb-studio.authStrict" .) }}
+                  optional: true
+                  {{- end }}
+            {{- end }}
+            {{- if or .Values.secrets.adminEmail .Values.secrets.existingSecret }}
             - name: ADMIN_EMAIL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "libredb-studio.secretName" . }}
                   key: {{ .Values.secrets.existingSecretKeys.adminEmail }}
+                  optional: true
+            {{- end }}
+            {{- if or .Values.secrets.adminPassword .Values.secrets.existingSecret }}
             - name: ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "libredb-studio.secretName" . }}
                   key: {{ .Values.secrets.existingSecretKeys.adminPassword }}
+                  {{- if not (include "libredb-studio.authStrict" .) }}
+                  optional: true
+                  {{- end }}
+            {{- end }}
+            {{- if or .Values.secrets.userPassword .Values.secrets.existingSecret }}
             - name: USER_EMAIL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "libredb-studio.secretName" . }}
                   key: {{ .Values.secrets.existingSecretKeys.userEmail }}
+                  optional: true
             - name: USER_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "libredb-studio.secretName" . }}
                   key: {{ .Values.secrets.existingSecretKeys.userPassword }}
+                  optional: true
+            {{- end }}
             {{- if or .Values.secrets.llmApiKey .Values.secrets.existingSecret }}
             - name: LLM_API_KEY
               valueFrom:
@@ -142,10 +167,8 @@ spec:
               mountPath: /app/.next/cache
             - name: tmp
               mountPath: /tmp
-            {{- if include "libredb-studio.persistenceEnabled" . }}
             - name: data
               mountPath: /app/data
-            {{- end }}
             {{- if .Values.seedConnections.enabled }}
             - name: seed-config
               mountPath: /app/config
@@ -160,6 +183,9 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "libredb-studio.pvcName" . }}
+        {{- else }}
+        - name: data
+          emptyDir: {}
         {{- end }}
         {{- if .Values.seedConnections.enabled }}
         - name: seed-config

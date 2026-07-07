@@ -16,15 +16,24 @@ Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL, SQLite, O
 helm repo add libredb https://libredb.org/libredb-studio/
 helm repo update
 
-# Install with minimal configuration
-helm install libredb libredb/libredb-studio \
-  --set secrets.jwtSecret=$(openssl rand -base64 32) \
-  --set secrets.adminPassword=MyAdmin123 \
-  --set secrets.userPassword=MyUser123
+# Zero-config install: first-run admin credentials are generated automatically
+helm install libredb libredb/libredb-studio
+
+# Retrieve the generated admin credentials from the pod log
+kubectl logs deployment/libredb-libredb-studio | grep -A 4 "generated admin credentials"
 
 # Access via port-forward
 kubectl port-forward svc/libredb-libredb-studio 3000:80
 # Open http://localhost:3000
+```
+
+For production, provide your own secrets instead of relying on generated ones
+(add `--set secrets.userPassword=...` only if you want the optional non-admin account):
+
+```bash
+helm install libredb libredb/libredb-studio \
+  --set secrets.jwtSecret=$(openssl rand -base64 32) \
+  --set secrets.adminPassword=MyAdmin123
 ```
 
 ### OCI Registry Install
@@ -33,8 +42,7 @@ kubectl port-forward svc/libredb-libredb-studio 3000:80
 helm install libredb oci://ghcr.io/libredb/charts/libredb-studio \
   --version 0.1.8 \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
-  --set secrets.adminPassword=MyAdmin123 \
-  --set secrets.userPassword=MyUser123
+  --set secrets.adminPassword=MyAdmin123
 ```
 
 ## Storage Modes
@@ -51,8 +59,7 @@ Persistent file-based storage. A PVC is automatically created.
 helm install libredb libredb/libredb-studio \
   --set config.storageProvider=sqlite \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
-  --set secrets.adminPassword=MyAdmin123 \
-  --set secrets.userPassword=MyUser123
+  --set secrets.adminPassword=MyAdmin123
 ```
 
 > **Note:** SQLite is single-writer. Do not use with multiple replicas.
@@ -66,8 +73,7 @@ helm install libredb libredb/libredb-studio \
   --set postgresql.enabled=true \
   --set postgresql.auth.password=pg-secret \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
-  --set secrets.adminPassword=MyAdmin123 \
-  --set secrets.userPassword=MyUser123
+  --set secrets.adminPassword=MyAdmin123
 ```
 
 Storage provider is automatically set to `postgres` when the subchart is enabled.
@@ -79,15 +85,21 @@ helm install libredb libredb/libredb-studio \
   --set config.storageProvider=postgres \
   --set secrets.storagePostgresUrl="postgresql://user:pass@host:5432/libredb" \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
-  --set secrets.adminPassword=MyAdmin123 \
-  --set secrets.userPassword=MyUser123
+  --set secrets.adminPassword=MyAdmin123
 ```
 
 ## Auth Bootstrap (Zero-Config vs Strict)
 
-The application supports a zero-config bootstrap mode (`AUTH_BOOTSTRAP=on`, the app default): missing `JWT_SECRET` / `ADMIN_PASSWORD` are auto-generated on first start, printed once to the pod log, and persisted in the data directory. **The chart defaults to strict mode instead** (`config.authBootstrap: "off"`): Kubernetes deployments inject real secrets anyway, and generated credentials in pod logs are undesirable when logs are collected centrally. In strict mode, missing `secrets.jwtSecret` or `secrets.adminPassword` surface as a clear login error.
+**The chart defaults to the application's zero-config bootstrap** (`config.authBootstrap: ""` — the `AUTH_BOOTSTRAP` variable is omitted and the app default, on, applies): when `secrets.jwtSecret` / `secrets.adminPassword` are not provided, they are generated on first start, printed once to the pod log, and stored in `/app/data/auth-bootstrap.json`. Explicitly set values always win — only missing ones are generated. This makes the chart deployable with default values, which certified catalogs such as the Rancher partner-charts repository require.
 
-If you opt into zero-config (`--set config.authBootstrap=on`), set `persistence.enabled=true` so the generated credentials survive pod restarts — without a persistent volume for the data directory, every restart generates new credentials. Set `config.authBootstrap=""` to omit the variable entirely and use the app default.
+Notes on the zero-config default:
+
+- The default install is **admin-only**. The second, non-admin account is never generated; set `secrets.userPassword` to enable it.
+- Without persistence the data directory is an `emptyDir`: generated credentials survive container restarts but are regenerated when the pod is recreated. Set `persistence.enabled=true` or provide your own `secrets.*` values for stable credentials.
+- Generated credentials appear once in the pod log. If your logs are collected centrally, prefer explicit secrets or strict mode.
+- Zero-config is single-replica only: each pod would generate its own JWT secret, breaking sessions across replicas, so the chart refuses to render with `replicaCount > 1` or `autoscaling.enabled` unless `secrets.jwtSecret` (or `secrets.existingSecret`) is set.
+
+**Strict mode** (`--set config.authBootstrap=off`) restores fail-closed behavior: `secrets.jwtSecret` and `secrets.adminPassword` are required (or use `secrets.existingSecret`) and the install fails fast with a clear message when either is missing; with an existing secret the pod will not start until the referenced keys exist. Recommended for production. `secrets.userPassword` stays optional in every mode. Setting `config.authBootstrap=on` is equivalent to the default `""`, just explicit.
 
 ## OIDC SSO
 
@@ -98,8 +110,7 @@ helm install libredb libredb/libredb-studio \
   --set secrets.oidcClientId=your-client-id \
   --set secrets.oidcClientSecret=your-client-secret \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
-  --set secrets.adminPassword=MyAdmin123 \
-  --set secrets.userPassword=MyUser123
+  --set secrets.adminPassword=MyAdmin123
 ```
 
 ## AI Configuration
@@ -110,8 +121,7 @@ helm install libredb libredb/libredb-studio \
   --set config.llmModel=gpt-4o \
   --set secrets.llmApiKey=sk-your-key \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
-  --set secrets.adminPassword=MyAdmin123 \
-  --set secrets.userPassword=MyUser123
+  --set secrets.adminPassword=MyAdmin123
 ```
 
 ## Production Setup (Ingress + HA)
@@ -120,7 +130,6 @@ helm install libredb libredb/libredb-studio \
 helm install libredb libredb/libredb-studio \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
   --set secrets.adminPassword=StrongPass123 \
-  --set secrets.userPassword=StrongPass456 \
   --set postgresql.enabled=true \
   --set postgresql.auth.password=pg-secret \
   --set ingress.enabled=true \
@@ -156,11 +165,9 @@ helm install libredb libredb/libredb-studio \
   --set secrets.existingSecret=my-libredb-secret
 ```
 
-Your external secret must contain these keys (customizable via `secrets.existingSecretKeys`):
-- `jwt-secret`
-- `admin-email`, `admin-password`
-- `user-email`, `user-password`
-- Optional: `llm-api-key`, `oidc-client-id`, `oidc-client-secret`, `storage-postgres-url`
+Your external secret is referenced with these keys (customizable via `secrets.existingSecretKeys`):
+- `jwt-secret`, `admin-password` — required in strict mode (the pod waits for them); in zero-config mode missing ones are generated at first start
+- Optional: `admin-email`, `user-email`, `user-password` (the non-admin account exists only when `user-password` is set), `llm-api-key`, `oidc-client-id`, `oidc-client-secret`, `storage-postgres-url`
 
 ## Upgrading
 
@@ -168,6 +175,14 @@ Your external secret must contain these keys (customizable via `secrets.existing
 helm repo update
 helm upgrade libredb libredb/libredb-studio
 ```
+
+> **Behavior change:** the chart default flipped from strict (`config.authBootstrap: "off"`)
+> to zero-config (`""`). Releases that relied on the old default become zero-config on
+> upgrade: missing `secrets.jwtSecret`/`secrets.adminPassword` no longer fail the install,
+> and with `secrets.existingSecret` the auth env references become `optional: true` — a pod
+> whose external Secret is missing a key now starts with generated credentials instead of
+> waiting in `CreateContainerConfigError`. To keep the previous fail-closed behavior, set
+> `config.authBootstrap=off` explicitly.
 
 ## Uninstalling
 
@@ -189,12 +204,12 @@ helm uninstall libredb
 | `image.tag` | Image tag | `""` (Chart appVersion) |
 | `image.pullPolicy` | Pull policy | `IfNotPresent` |
 | `authProvider` | Auth mode: local or oidc | `local` |
-| `config.authBootstrap` | Auth bootstrap: off (strict), on (zero-config), "" (app default) | `off` |
+| `config.authBootstrap` | Auth bootstrap: `""` (zero-config, app default), `on` (explicit zero-config), `off` (strict) | `""` |
 | `secrets.jwtSecret` | JWT signing secret | `""` |
 | `secrets.adminEmail` | Admin email | `admin@libredb.org` |
 | `secrets.adminPassword` | Admin password | `""` |
 | `secrets.userEmail` | User email | `user@libredb.org` |
-| `secrets.userPassword` | User password | `""` |
+| `secrets.userPassword` | User password (optional; enables the non-admin account) | `""` |
 | `secrets.existingSecret` | Use existing Secret | `""` |
 | `config.storageProvider` | Storage: local, sqlite, postgres | `local` |
 | `config.llmProvider` | AI provider | `""` |
