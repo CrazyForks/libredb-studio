@@ -3,6 +3,8 @@
 This folder is the **source of truth** for deploying LibreDB Studio on
 [CapRover](https://caprover.com) as a one-click app.
 
+> Tracking issue: [libredb-studio#56](https://github.com/libredb/libredb-studio/issues/56)
+
 | File | Purpose |
 |------|---------|
 | `libredb-studio.yml` | CapRover `captainVersion: 4` template (Docker-Compose + `caproverOneClickApp` block). |
