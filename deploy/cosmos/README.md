@@ -13,6 +13,8 @@ The canonical servapp definition lives in the Cosmos marketplace repo at
 [`servapps/LibreDB-Studio/`](https://github.com/azukaar/cosmos-servapps-official/tree/master/servapps/LibreDB-Studio);
 this folder is a documentation mirror, not the source of truth.
 
+> Tracking issue: [libredb-studio#172](https://github.com/libredb/libredb-studio/issues/172)
+
 ## Install
 
 From a running Cosmos instance (see the
