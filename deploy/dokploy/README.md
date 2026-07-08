@@ -13,6 +13,8 @@ The canonical blueprint lives in the Dokploy templates repo at
 (`docker-compose.yml` + `template.toml`); this folder is a documentation mirror,
 not the source of truth.
 
+> Tracking issue: [libredb-studio#171](https://github.com/libredb/libredb-studio/issues/171)
+
 ## Install
 
 From a running Dokploy instance (see the
