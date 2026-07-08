@@ -99,7 +99,7 @@ The `${{ secret(...) }}` values are auto-generated per deploy.
   - root `README.md` (the `## ⚡ One-Click Deploy` section)
   - `deploy/railway/README.md`
 - Current published link:
-  `https://railway.com/deploy/libredb-studio?referralCode=bGijnc&utm_medium=integration&utm_source=template&utm_campaign=generic`
+  `https://railway.com/deploy/libredb-studio?referralCode=libredb&utm_medium=integration&utm_source=template&utm_campaign=generic`
 
 ## Maintaining the template
 

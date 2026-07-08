@@ -3,6 +3,8 @@
 This folder is the **source of truth** for deploying LibreDB Studio on
 [Railway](https://railway.com) as a one-click marketplace template.
 
+> Tracking issue: [libredb-studio#174](https://github.com/libredb/libredb-studio/issues/174)
+
 | File | Purpose |
 |------|---------|
 | `template.json` | Reviewable serialization of the template service config (image, env vars, volume, healthcheck). Railway does not ingest it directly — see note below. |
@@ -22,7 +24,7 @@ This folder is the **source of truth** for deploying LibreDB Studio on
 
 Click the button to deploy from the Railway template marketplace:
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/libredb-studio?referralCode=bGijnc&utm_medium=integration&utm_source=template&utm_campaign=generic)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/libredb-studio?referralCode=libredb&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
 Or browse the Railway template marketplace and search **LibreDB Studio**.
 
