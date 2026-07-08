@@ -12,6 +12,8 @@ The canonical template lives in the Kubero repo at
 as a `KuberoApp` custom resource; this folder is a documentation mirror, not the
 source of truth.
 
+> Tracking issue: [libredb-studio#173](https://github.com/libredb/libredb-studio/issues/173)
+
 ## Install
 
 From a running Kubero instance (see the
