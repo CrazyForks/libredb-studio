@@ -111,13 +111,13 @@ The test instance comes with a pre-configured PostgreSQL database via [Seed Conn
 - **Chart Persistence**: Save chart configurations and reload them instantly. Manage a library of saved charts.
 - **Chart Dashboard**: Grid view of all saved charts for at-a-glance data overview directly in the bottom panel.
 
-### Data Privacy & Masking
-- **Automatic Sensitive Column Detection**: 10 built-in patterns (email, phone, credit card, SSN, password, IP, date, financial, and more) with regex-based column name matching.
-- **Configurable Masking Rules**: Admin panel to add, edit, enable/disable masking patterns. Custom patterns with regex support.
-- **RBAC-Enforced Masking**: User role cannot toggle or reveal masked data. Admin role has full control with per-cell temporary reveal (10s auto-hide).
-- **Export Protection**: CSV, JSON, and SQL INSERT exports contain masked values when masking is active — no raw data leakage.
-- **Full Coverage**: Masking applied across desktop grid, mobile card view, mobile table view, row detail sheet, and clipboard operations.
-- **Persistent Configuration**: Masking settings stored in localStorage and survive page reloads.
+### Display Masking (Preview)
+- **Client-Side Display Layer**: Masks sensitive values in the browser UI — useful for screen sharing, demos, and reducing accidental on-screen exposure. **Not server-enforced**; query API responses still contain full values for authenticated users.
+- **Column-Name Pattern Matching**: 10 built-in patterns (email, phone, credit card, SSN, password, IP, date, financial, and more) match **result column headers** by regex. Works when the output name matches (e.g. `SELECT salary`). Aliases (`salary AS x`) and aggregates (`SUM(salary)`) are not masked today.
+- **Configurable Rules**: Admin panel to add, edit, enable/disable masking patterns. Custom patterns with regex support. Settings stored per-browser in localStorage.
+- **RBAC UI Controls**: User role cannot toggle or reveal masked cells in the UI. Admin role can toggle masking and temporarily reveal individual cells (10s auto-hide).
+- **Export & Clipboard**: CSV, JSON, and SQL INSERT exports use masked display values when masking is active in the UI. This does not prevent access to raw data via the API, browser DevTools, or admin reveal.
+- **UI Coverage**: Grid, mobile card/table views, row detail sheet, and clipboard copy respect the active display mask.
 
 ### Analyst & Developer Tools
 - **AI Data Profiler**: One-click table profiling with column statistics (null %, cardinality, min/max, sample values) and AI-powered narrative summaries.
@@ -165,7 +165,7 @@ The test instance comes with a pre-configured PostgreSQL database via [Seed Conn
 | **MongoDB** | `mongodb` | JSON query editor, collection operations (find, aggregate, insert, update, delete) |
 | **Redis** | `ioredis` | Command editor, key browser, INFO-based monitoring |
 
-> All SQL databases share: schema explorer, ER diagrams, schema diff & migration, data masking, monitoring dashboard, and connection string import.
+> All SQL databases share: schema explorer, ER diagrams, schema diff & migration, display masking (preview), monitoring dashboard, and connection string import.
 
 > **Provider reference docs:** each database has an in-depth reference (design, connection, query format, monitoring, limitations) under [`docs/providers/`](docs/providers/README.md). For the provider architecture and a guide to adding a new database, see [`docs/DATABASE_PROVIDERS.md`](docs/DATABASE_PROVIDERS.md).
 
@@ -687,7 +687,7 @@ extraEnvFrom:
 - [x] **Phase 6**: Enterprise Foundation (Connection Testing, SSL/TLS, SSH Tunnel, Transaction Control, Query Cancellation).
 - [x] **Phase 7**: AI Intelligence (NL2SQL, Query Safety Analysis, AI Index Advisor, Multi-Turn Chat, Query Autopilot).
 - [x] **Phase 8**: Analyst & Developer Tools (Data Profiler, Code Generator, Test Data Generator, Pivot Table, Column Filtering, Database Docs).
-- [x] **Phase 9**: Data Privacy (Automatic Sensitive Column Detection, Configurable Masking Patterns, RBAC-Enforced Masking, Export Protection).
+- [x] **Phase 9**: Display Masking — Preview (column-name pattern matching, configurable rules, RBAC UI controls, client-side export/clipboard masking).
 - [x] **Phase 10**: Advanced ERD (Real FK Edges, ELK.js Auto-Layout, MiniMap, PNG/SVG Export, Compact Mode, Table Search).
 - [x] **Phase 11**: Schema Diff & Migration (Snapshot Timeline, Cross-Connection Diff, Migration SQL Generation for PostgreSQL, MySQL, SQLite, Oracle, and SQL Server).
 - [x] **Phase 12**: Advanced Charting (Scatter, Histogram, Stacked Charts, Aggregation, Date Grouping, Chart Save/Load, Chart Dashboard).
@@ -696,6 +696,7 @@ extraEnvFrom:
 - [x] **Phase 15**: SSO Integration — Vendor-agnostic OIDC authentication (Auth0, Keycloak, Okta, Azure AD, Zitadel) with PKCE, role mapping, and provider logout.
 - [ ] **Phase 16**: DBA & Monitoring (Lock Dependency Graph, Vacuum Scheduler, Prometheus Export).
 - [ ] **Phase 17**: Enterprise Collaboration (User Identity, Shared Workspaces, SAML 2.0).
+- [ ] **Phase 18**: Server-Enforced Data Masking (SQL output-lineage, deployment-global policy, fail-closed API masking, alias/aggregate coverage).
 
 ---
 
