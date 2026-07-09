@@ -124,3 +124,5 @@ snap-payload/
 # deploy test results
 deploy/rancher/results/
 
+.cursor/plans/
+.cursor/specs/
