@@ -6,8 +6,12 @@ Vercel, and Netlify) that runs Docker Compose services behind Traefik and
 installs apps from a built-in template catalog with one click.
 
 LibreDB Studio is listed in the official
+
 [Dokploy template catalog](https://templates.dokploy.com)
+[LibreDB Studio Dokploy Template](https://templates.dokploy.com/?q=libredb+studio)
+
 (merged in [Dokploy/templates#931](https://github.com/Dokploy/templates/pull/931)).
+
 The canonical blueprint lives in the Dokploy templates repo at
 [`blueprints/libredb-studio/`](https://github.com/Dokploy/templates/tree/main/blueprints/libredb-studio)
 (`docker-compose.yml` + `template.toml`); this folder is a documentation mirror,
