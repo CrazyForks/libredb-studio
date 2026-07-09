@@ -40,7 +40,7 @@
 
 | Test | URL | Credentials |
 |------|-----|-------------|
-| **Public Test** | [app.libredb.org](https://app.libredb.org) | `admin@libredb.org` / `LibreDB.2026` |
+| **Public Test** | [app.libredb.org](https://app.libredb.org) | SSO |
 
 The test instance comes with a pre-configured PostgreSQL database via [Seed Connections](#seed-connections-pre-configured-databases). No setup required!
 
