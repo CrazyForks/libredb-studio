@@ -126,3 +126,7 @@ deploy/rancher/results/
 
 .cursor/plans/
 .cursor/specs/
+docs/summaries/
+
+# Maintainer loop runtime artifacts (not source)
+.loop/

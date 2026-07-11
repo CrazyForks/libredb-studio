@@ -5,8 +5,9 @@
  * everything here is unit tested in tests/unit/launcher-utils.test.ts.
  * The CLI entry stays thin and composes these helpers.
  */
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync, renameSync, rmSync } from "node:fs";
 import * as path from "node:path";
 
 /**
@@ -121,6 +122,45 @@ export function sha256File(filePath) {
     stream.on("data", (chunk) => hash.update(chunk));
     stream.on("end", () => resolve(hash.digest("hex")));
   });
+}
+
+/**
+ * Move a previous payload's data/ directory (generated auth-bootstrap.json,
+ * SQLite storage state) over a freshly extracted staging directory's own
+ * data/ dir before it replaces the payload directory. Every release tarball
+ * ships an empty data/ (scripts/build-standalone-payload.sh), so a re-extract
+ * (--verify-cache, --archive) would otherwise silently wipe generated
+ * credentials and server-side SQLite storage on every run (issue #132). A
+ * no-op when there is nothing to preserve: first extraction (no payloadDir
+ * yet) or a payloadDir with no data/ dir.
+ *
+ * @param {string} payloadDir the previous payload root (may not exist)
+ * @param {string} stagingDir the freshly extracted staging directory
+ */
+export function preservePayloadData(payloadDir, stagingDir) {
+  const existingData = path.join(payloadDir, "data");
+  if (!existsSync(existingData)) return;
+  const stagingData = path.join(stagingDir, "data");
+  rmSync(stagingData, { recursive: true, force: true });
+  renameSync(existingData, stagingData);
+}
+
+/**
+ * Extract a tarball into destDir via the system `tar`. Release tarballs are
+ * packed under a top-level libredb-studio-<version>/ root (issue #133,
+ * scripts/lib/pack-standalone-tarball.sh) instead of a tarbomb, so every
+ * entry is unwrapped one path component - the payload (server.js, etc.)
+ * lands directly in destDir, matching every caller's expectation.
+ *
+ * @param {string} tarballPath
+ * @param {string} destDir
+ * @returns {{ status: number | null, error: Error | null }}
+ */
+export function extractTarball(tarballPath, destDir) {
+  const result = spawnSync("tar", ["-xzf", tarballPath, "-C", destDir, "--strip-components=1"], {
+    stdio: "inherit",
+  });
+  return { status: result.status, error: result.error ?? null };
 }
 
 /**

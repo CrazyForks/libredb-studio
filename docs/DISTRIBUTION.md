@@ -66,12 +66,19 @@ exception - containers must bind `0.0.0.0` and are isolated by container network
 |---|---|---|
 | npx | `127.0.0.1` | `npx @libredb/studio --host 0.0.0.0` (or set `HOSTNAME`) |
 | .deb / .rpm (systemd) | `127.0.0.1` | `HOSTNAME=0.0.0.0` in `/etc/libredb-studio/env`, then restart |
-| Homebrew service | `127.0.0.1` | run the binary manually with `HOSTNAME=0.0.0.0`, or front it with a reverse proxy |
+| .deb / .rpm (direct run) | `127.0.0.1` | `LIBREDB_BIND=0.0.0.0 libredb-studio` |
+| Homebrew service | `127.0.0.1` | run the binary manually with `LIBREDB_BIND=0.0.0.0`, or front it with a reverse proxy |
 | Snap | `127.0.0.1` | `sudo systemctl edit snap.libredb-studio.libredb-studio.service` with `[Service]` `Environment=HOSTNAME=0.0.0.0` |
 | Docker / Helm | `0.0.0.0` (container-internal) | publish/route ports as usual (`-p`, Service/Ingress) |
 
 For anything reachable from a network, prefer a reverse proxy with TLS in front and strict mode
 (`AUTH_BOOTSTRAP=off`) with explicit credentials.
+
+A direct run of the `.deb`/`.rpm` wrapper or the Homebrew binary ignores any inherited `HOSTNAME`
+(empty, or - under Docker - the container ID Next.js would otherwise bind to) and defaults to
+loopback; `LIBREDB_BIND` is the explicit opt-in for that case. Under systemd, `HOSTNAME` in
+`/etc/libredb-studio/env` is still the override, since the unit resolves it before the wrapper
+runs (detected via the systemd-set `INVOCATION_ID`, so the wrapper leaves it untouched there).
 
 ## Release artifact naming
 
@@ -87,6 +94,13 @@ Release tags carry **no `v` prefix** (tag `0.9.41` == package.json version). Eac
 
 `SHA256SUMS` covers the standalone tarballs; each `.deb`/`.rpm` ships its own per-file
 `<artifact>.sha256` sidecar instead (the packages are built in a separate job).
+
+Standalone tarball entries are rooted under a top-level `libredb-studio-<version>/` directory
+(not a tarbomb) - extract with `tar --strip-components=1` (`tar xzf <artifact>
+--strip-components=1`), which is what the npx launcher, the deb/rpm/snap packaging jobs, and
+`scripts/build-standalone-payload.sh`'s own `--smoke` self-test all do; Homebrew strips the single
+top-level directory automatically for its main `url`/`sha256` download, so the formula needs no
+extra flag.
 
 Download URL pattern:
 `https://github.com/libredb/libredb-studio/releases/download/<version>/<artifact>`.
@@ -201,7 +215,10 @@ digest with `--archive-sha256 <hex>` - only use archives you built yourself or o
 trusted source. Downloads retry transient failures with
 backoff and abort when the connection stalls. The cache in `~/.libredb-studio/<version>/` lives
 in your home directory's trust domain; `--verify-cache` re-checks the cached tarball against the
-cached `SHA256SUMS` and re-extracts the payload.
+cached `SHA256SUMS` and re-extracts the payload. Re-extraction (`--verify-cache` and every
+`--archive` run) preserves the payload's `data/` directory - generated `auth-bootstrap.json`
+credentials and any `STORAGE_PROVIDER=sqlite` state survive across it, so a re-verify or a
+rebuilt archive never invalidates a previously printed admin password.
 
 - Later runs start straight from the cache (per-version directory; delete it to force a
   re-download).
@@ -247,8 +264,11 @@ brew services start libredb-studio
   storage (it sets `STORAGE_PROVIDER=sqlite`) under `$(brew --prefix)/var/libredb-studio/` —
   the data dir where generated credentials are persisted. The service does not capture stdout,
   so read the generated password from `$(brew --prefix)/var/libredb-studio/auth-bootstrap.json`.
-- When running `libredb-studio` directly, set `STORAGE_SQLITE_PATH` to a path outside the keg
-  if you use `STORAGE_PROVIDER=sqlite`, so state survives upgrades.
+- Running `libredb-studio` directly also defaults `STORAGE_SQLITE_PATH` to
+  `$(brew --prefix)/var/libredb-studio/libredb-storage.db` — the same location `brew services`
+  uses — unless you set it explicitly. This keeps the zero-config `auth-bootstrap.json` (and any
+  `STORAGE_PROVIDER=sqlite` data) outside the versioned keg so it survives `brew upgrade`, and
+  lets both run modes share one data dir.
 
 ## Linux packages (.deb / .rpm)
 
