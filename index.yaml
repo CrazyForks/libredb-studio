@@ -4,6 +4,65 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "Expand values.schema.json coverage (serviceAccount, pod/container security contexts, imagePullSecrets, tolerations, affinity, topologySpreadConstraints, networkPolicy, service/persistence annotations, ingress hosts/tls, persistence accessModes, extraEnv/extraEnvFrom, podDisruptionBudget.maxUnavailable)"
+        - "Machine-enforce the documented jwtSecret length in values.schema.json - empty (zero-config) or at least 32 characters"
+        - "PodDisruptionBudget - an explicit minAvailable 0 now renders; minAvailable/maxUnavailable are mutually exclusive and exactly one is required when the PDB is enabled"
+        - "Autoscaling - the HPA is no longer rendered when the effective storage provider is sqlite (single-writer); the deployment falls back to replicaCount and the install notes warn"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.9.53
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.9.53
+    created: "2026-07-12T13:48:54.327101932Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: e8a8b36f99a6e0d1ca34b6f40d477f3a6ef8102e11184c179d247625c12d0572
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.13/libredb-studio-0.1.13.tgz
+    version: 0.1.13
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - Track app release 0.9.52 (appVersion bump; default image tag follows)
         - Default install is now zero-config: with no values set, first-run admin credentials are generated and printed to the pod log (config.authBootstrap default changed from "off" to ""); set config.authBootstrap=off for strict fail-closed installs
         - Secret keys and env entries for JWT_SECRET, ADMIN_PASSWORD, USER_EMAIL and USER_PASSWORD are rendered only when their values are set (or an existingSecret is used), so pods no longer reference missing Secret keys
@@ -633,4 +692,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-07-12T01:09:19.83379722Z"
+generated: "2026-07-12T13:48:54.320267338Z"
