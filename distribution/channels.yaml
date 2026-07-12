@@ -34,8 +34,10 @@ channels:
       catalog: https://github.com/libredb/libredb-studio/releases
       docs: docs/DISTRIBUTION.md
     pin:
-      strategy: none
-      note: Assets are built from the tag by release-artifacts.yml; nothing to drift.
+      strategy: remote_file
+      url: https://api.github.com/repos/libredb/libredb-studio/releases/latest
+      extract: '"tag_name":\s*"(\d+\.\d+\.\d+)"'
+      note: Probes the latest-release API; confirms the draft-first publish actually landed.
 
   - id: docker-ghcr
     name: Docker image (GHCR, canonical)
@@ -49,7 +51,7 @@ channels:
       catalog: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
     pin:
       strategy: none
-      note: Version and latest tags pushed by docker-build-push.yml on release.
+      note: Version and latest tags pushed by docker-build-push.yml on release; served-state probe tracked in issue 182.
 
   - id: docker-hub-mirror
     name: Docker Hub mirror (discoverability only)
@@ -63,7 +65,7 @@ channels:
       catalog: https://hub.docker.com/r/libredb/libredb-studio
     pin:
       strategy: none
-      note: Mirror of GHCR; immutable-tag rules must stay semver-only.
+      note: Mirror of GHCR; immutable-tag rules must stay semver-only. Push is secret-gated and skips silently; served-state probe tracked in issue 182.
 
   - id: npm
     name: npm package @libredb/studio (library + npx launcher)
@@ -78,8 +80,10 @@ channels:
       first_pr: https://github.com/libredb/libredb-studio/pull/122
       catalog: https://www.npmjs.com/package/@libredb/studio
     pin:
-      strategy: none
-      note: Published by npm-publish.yml; registry API probe is a phase-2 idea.
+      strategy: remote_file
+      url: https://registry.npmjs.org/-/package/@libredb/studio/dist-tags
+      extract: '"latest":\s*"(\d+\.\d+\.\d+)"'
+      note: Probes the npm dist-tags endpoint; confirms npm-publish.yml actually landed.
 
   # ---- Tier 1: packaged formats owned by this repo, CI-published ----------
 
@@ -135,7 +139,7 @@ channels:
       catalog: https://snapcraft.io/libredb-studio
     pin:
       strategy: none
-      note: Store-published by the release-artifacts snap job; store API probe is a phase-2 idea.
+      note: Store-published by the release-artifacts snap job; store API probe tracked in issue 182.
 
   - id: linux-deb-rpm
     name: Linux .deb / .rpm packages (release assets)
