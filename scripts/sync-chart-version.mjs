@@ -59,6 +59,57 @@ export function bumpPatch(version) {
 }
 
 /**
+ * ArtifactHub refuses to index a chart version whose artifacthub.io/changes entries
+ * contain any of {}:[],&*#?|-<>=!%@ unquoted ("error preparing package ... invalid
+ * changes annotation"); released 0.1.1 and 0.1.9-0.1.11 are missing from the AH
+ * listing for exactly this reason. House style therefore requires every entry to be
+ * a double-quoted plain string, which sidesteps the character list entirely.
+ * Continuation lines (deeper indentation) are not entries and are ignored.
+ *
+ * @param {string} chartYaml
+ * @returns {string[]} violation messages (empty = clean or annotation absent)
+ */
+export function checkChangesAnnotation(chartYaml) {
+  const violations = [];
+  // Normalize CRLF and guarantee a trailing newline so the block regex sees
+  // every line the same way regardless of checkout/editor settings.
+  let text = chartYaml.replace(/\r\n/g, "\n");
+  if (!text.endsWith("\n")) {
+    text += "\n";
+  }
+  if (!/^[ \t]*artifacthub\.io\/changes:/m.test(text)) {
+    return violations;
+  }
+  // Locate the block scalar independent of the key's indentation: its body is
+  // every following line indented deeper than the key (or blank). If the key
+  // exists but this extraction fails, the guard must fail LOUDLY - a silent
+  // pass here is exactly the failure mode this check exists to prevent.
+  const block = text.match(/^([ \t]*)artifacthub\.io\/changes:[ \t]*\|[^\n]*\n((?:\1[ \t]+[^\n]*\n|[ \t]*\n)*)/m);
+  if (!block) {
+    violations.push(
+      `${CHART_YAML}: artifacthub.io/changes exists but its block scalar could not be parsed - ` +
+        `use a literal block ("changes: |" with indented entries) or update checkChangesAnnotation`,
+    );
+    return violations;
+  }
+  const lines = block[2].split("\n").filter((line) => line.trim() !== "");
+  const entryIndent = lines.length > 0 ? lines[0].match(/^[ \t]*/)[0].length : 0;
+  for (const raw of lines) {
+    if (raw.match(/^[ \t]*/)[0].length > entryIndent) {
+      continue; // continuation of a multi-line entry; the entry's first line is judged
+    }
+    const entry = raw.trim();
+    if (!/^- "[^"]*"$/.test(entry)) {
+      violations.push(
+        `${CHART_YAML}: artifacthub.io/changes entry must be a single-line double-quoted string ` +
+          `(ArtifactHub refuses unquoted {}:[],&*#?|-<>=!%@ and skips the whole chart version): ${entry}`,
+      );
+    }
+  }
+  return violations;
+}
+
+/**
  * The released-version check only matters when the appVersion changed against the base
  * AND the chart version moved off the base's (otherwise the chart-releaser violation
  * covers it). Shared by checkSync() and main() so the gating cannot drift (#151).
@@ -95,6 +146,7 @@ export function checkSync({ pkgVersion, chartYaml, readme, baseChart = null, cha
   if (imageTag !== appVersion) {
     violations.push(`${CHART_YAML}: artifacthub.io/images tag '${imageTag}' does not equal appVersion '${appVersion}'`);
   }
+  violations.push(...checkChangesAnnotation(chartYaml));
   const readmeVersion = parseReadmeVersion(readme);
   if (readmeVersion !== version) {
     violations.push(`${CHART_README}: --version example '${readmeVersion}' does not equal chart version '${version}'`);
@@ -133,8 +185,8 @@ export function applyBump({ pkgVersion, chartYaml, readme }) {
     .replace(/^(\s*image:\s*ghcr\.io\/libredb\/libredb-studio:)\S+/gm, `$1${pkgVersion}`);
   if (appVersion !== pkgVersion) {
     newChartYaml = newChartYaml.replace(
-      /- Track app release .*/,
-      `- Track app release ${pkgVersion} (appVersion bump; default image tag follows)`,
+      /- "?Track app release .*/,
+      `- "Track app release ${pkgVersion} (appVersion bump; default image tag follows)"`,
     );
   }
   const newReadme = readme.replace(/--version\s+\S+/g, `--version ${newVersion}`);
