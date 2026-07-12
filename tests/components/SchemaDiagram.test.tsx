@@ -5,13 +5,20 @@ import "../helpers/mock-navigation";
 import { mock } from "bun:test";
 import { setupFramerMotionMock } from "../helpers/mock-monaco";
 
+// Module-scope handles so tests can assert on mock internals
+const mockUpdateNodeInternals = mock(() => {});
+// Latest props ReactFlow was rendered with (culling assertions)
+let lastReactFlowProps: Record<string, unknown> = {};
+
 // Enhanced XYFlow mock that renders nodes via nodeTypes
 mock.module("@xyflow/react", () => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const React = require("react");
   return {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ReactFlow: ({ children, nodes = [], nodeTypes = {}, onNodeClick, onPaneClick }: Record<string, any>) => {
+    ReactFlow: (props: Record<string, any>) => {
+      lastReactFlowProps = props;
+      const { children, nodes = [], nodeTypes = {}, onNodeClick, onPaneClick } = props;
       const renderedNodes = nodes.map((node: { id: string; type: string; data: Record<string, unknown> }) => {
         const NodeComp = nodeTypes[node.type];
         if (!NodeComp) return null;
@@ -40,8 +47,12 @@ mock.module("@xyflow/react", () => {
             if (e.target === e.currentTarget) onPaneClick?.();
           },
         },
-        React.createElement("div", { key: "__nodes__", "data-testid": "nodes-container" }, renderedNodes),
-        React.createElement("svg", { key: "__svg__" }),
+        React.createElement(
+          "div",
+          { key: "__viewport__", className: "react-flow__viewport" },
+          React.createElement("div", { key: "__nodes__", "data-testid": "nodes-container" }, renderedNodes),
+          React.createElement("svg", { key: "__svg__" }),
+        ),
         React.createElement(React.Fragment, { key: "__children__" }, children),
       );
     },
@@ -50,9 +61,22 @@ mock.module("@xyflow/react", () => {
     Controls: () => null,
     Background: () => null,
     Handle: () => null,
+    BaseEdge: ({ id, path, style }: Record<string, unknown>) =>
+      React.createElement("path", { "data-testid": "mock-base-edge", "data-edge-id": id, d: path, style }),
+    EdgeLabelRenderer: ({ children }: { children: unknown }) => children,
+    getSmoothStepPath: () => ["M0 0 L10 10", 5, 5],
+    getNodesBounds: () => ({ x: 0, y: 0, width: 800, height: 600 }),
+    getViewportForBounds: () => ({ x: 32, y: 32, zoom: 1 }),
+    applyNodeChanges: (_changes: unknown, nodes: unknown[]) => nodes,
     useNodesState: () => [[], mock(() => {}), mock(() => {})],
     useEdgesState: () => [[], mock(() => {}), mock(() => {})],
-    useReactFlow: () => ({ fitView: mock(() => {}), getNodes: mock(() => []), getEdges: mock(() => []) }),
+    // The real useReactFlow returns a referentially stable instance; effects
+    // in the component depend on it, so the mock must be a singleton too.
+    useReactFlow: (() => {
+      const instance = { fitView: mock(() => {}), getNodes: mock(() => []), getEdges: mock(() => []) };
+      return () => instance;
+    })(),
+    useUpdateNodeInternals: () => mockUpdateNodeInternals,
     Position: { Top: "top", Bottom: "bottom", Left: "left", Right: "right" },
     MarkerType: { ArrowClosed: "arrowclosed" },
     Panel: ({ children, position }: { children: unknown; position?: string }) =>
@@ -62,24 +86,54 @@ mock.module("@xyflow/react", () => {
 
 setupFramerMotionMock();
 
-// Mock elkjs
-mock.module("elkjs/lib/elk.bundled.js", () => ({
-  default: class MockELK {
-    layout(graph: unknown) {
-      return Promise.resolve(graph);
-    }
-  },
+// Mock the layout engine so component tests never spin up workers or ELK.
+// Its own behavior is unit-tested in tests/unit/schema-diagram/. Tests can
+// swap the implementation via setLayoutEngineImpl (restored in beforeEach).
+type MockLayoutEngine = {
+  layout: (graph: { children: Array<{ id: string }> }) => Promise<unknown>;
+  dispose: () => Promise<void>;
+};
+const defaultLayoutEngine: MockLayoutEngine = {
+  layout: (graph) =>
+    Promise.resolve({
+      id: "root",
+      children: graph.children.map((child, i) => ({ ...child, x: i * 100, y: 0 })),
+    }),
+  dispose: () => Promise.resolve(),
+};
+let layoutEngineImpl: MockLayoutEngine = defaultLayoutEngine;
+function setLayoutEngineImpl(impl: MockLayoutEngine) {
+  layoutEngineImpl = impl;
+}
+mock.module("@/components/schema-diagram/layout-engine", () => ({
+  createLayoutEngine: () => ({
+    layout: (graph: { children: Array<{ id: string }> }) => layoutEngineImpl.layout(graph),
+    dispose: () => layoutEngineImpl.dispose(),
+  }),
 }));
 
-// Track html2canvas calls
-const mockHtml2canvas = mock(() =>
-  Promise.resolve({
-    toDataURL: () => "data:image/png;base64,mock",
-  }),
-);
+// Track snapdom captures (PNG via result.toBlob, SVG via result.url)
+const mockToBlob = mock(() => Promise.resolve(new Blob(["png-bytes"], { type: "image/png" })));
+const mockSvgDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent("<svg><text>users</text></svg>")}`;
+// Inline styles AT CAPTURE TIME - snapdom snapshots the live DOM, so the
+// export transform/size must be applied when it runs. snapdom normalizes away
+// the ROOT element's translate, so the captured root must be the viewport's
+// PARENT (sized to the export box) with the transform on the viewport child.
+let capturedStyles: { transform: string; width: string; height: string; hasViewportChild: boolean } | null = null;
+const mockSnapdom = mock((el: unknown, _options?: Record<string, unknown>) => {
+  const root = el as HTMLElement;
+  const viewport = root.querySelector<HTMLElement>(".react-flow__viewport");
+  capturedStyles = {
+    transform: viewport?.style.transform ?? "(no viewport child)",
+    width: root.style.width,
+    height: root.style.height,
+    hasViewportChild: viewport != null,
+  };
+  return Promise.resolve({ toBlob: mockToBlob, url: mockSvgDataUrl });
+});
 
-mock.module("html2canvas", () => ({
-  default: mockHtml2canvas,
+mock.module("@zumer/snapdom", () => ({
+  snapdom: mockSnapdom,
 }));
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -87,6 +141,9 @@ import { render, fireEvent, within, cleanup, act } from "@testing-library/react"
 import React from "react";
 
 import { SchemaDiagram } from "@/components/SchemaDiagram";
+import { FkEdge } from "@/components/schema-diagram/FkEdge";
+import { createHighlightStore, HighlightStoreProvider } from "@/components/schema-diagram/highlight-store";
+import { mockToastError } from "../helpers/mock-sonner";
 import { mockSchema, emptySchema } from "../fixtures/schemas";
 import type { TableSchema } from "@/lib/types";
 
@@ -253,7 +310,23 @@ describe("SchemaDiagram", () => {
   });
 
   beforeEach(() => {
-    mockHtml2canvas.mockClear();
+    mockToBlob.mockClear();
+    mockSnapdom.mockClear();
+    mockToastError.mockClear();
+    capturedStyles = null;
+    mockUpdateNodeInternals.mockClear();
+    setLayoutEngineImpl(defaultLayoutEngine);
+    mockSnapdom.mockImplementation((el: unknown, _options?: Record<string, unknown>) => {
+      const root = el as HTMLElement;
+      const viewport = root.querySelector<HTMLElement>(".react-flow__viewport");
+      capturedStyles = {
+        transform: viewport?.style.transform ?? "(no viewport child)",
+        width: root.style.width,
+        height: root.style.height,
+        hasViewportChild: viewport != null,
+      };
+      return Promise.resolve({ toBlob: mockToBlob, url: mockSvgDataUrl });
+    });
   });
 
   // ── Rendering ───────────────────────────────────────────────────────────
@@ -358,23 +431,31 @@ describe("SchemaDiagram", () => {
     expect(view.queryByText("SVG")).not.toBeNull();
   });
 
-  test("PNG export button click does not crash", () => {
+  test("PNG export button click does not crash", async () => {
     const props = createDefaultProps();
     const { container } = render(<SchemaDiagram {...props} />);
     const view = within(container);
 
     const pngButton = view.getByText("PNG").closest("button")!;
-    fireEvent.click(pngButton);
+    // Let the async export flow finish inside this test so it cannot bleed
+    // into later tests (the mocks are shared module-level state).
+    await act(async () => {
+      fireEvent.click(pngButton);
+      await new Promise((r) => setTimeout(r, 40));
+    });
     // Should not throw
   });
 
-  test("SVG export button click does not crash", () => {
+  test("SVG export button click does not crash", async () => {
     const props = createDefaultProps();
     const { container } = render(<SchemaDiagram {...props} />);
     const view = within(container);
 
     const svgButton = view.getByText("SVG").closest("button")!;
-    fireEvent.click(svgButton);
+    await act(async () => {
+      fireEvent.click(svgButton);
+      await new Promise((r) => setTimeout(r, 40));
+    });
     // Should not throw
   });
 
@@ -502,6 +583,17 @@ describe("SchemaDiagram", () => {
     const view = within(container);
 
     expect(view.queryByText(/No FK data available/)).not.toBeNull();
+    // schemaNoFK produces no heuristic edges either - the message must not
+    // claim dashed relationships are being shown.
+    expect(view.queryByText(/heuristic relationships/)).toBeNull();
+  });
+
+  test("warning mentions dashed heuristic edges only when some are displayed", () => {
+    const props = createDefaultProps({ schema: schemaHeuristic });
+    const { container } = render(<SchemaDiagram {...props} />);
+    const view = within(container);
+
+    expect(view.queryByText(/No FK data available/)).not.toBeNull();
     expect(view.queryByText(/heuristic relationships/)).not.toBeNull();
   });
 
@@ -510,6 +602,39 @@ describe("SchemaDiagram", () => {
     const { container } = render(<SchemaDiagram {...props} />);
     const view = within(container);
 
+    expect(view.queryByText(/No FK data available/)).toBeNull();
+  });
+
+  test("shows warning when FK data exists but the displayed graph is heuristic", () => {
+    // invoices HAS FK data, but it references a table outside the schema -
+    // the diagram falls back to dashed heuristic edges and must explain them.
+    const unusableFk: TableSchema[] = [
+      {
+        name: "customer",
+        columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
+        indexes: [],
+        foreignKeys: [],
+        rowCount: 1,
+      },
+      {
+        name: "invoices",
+        columns: [
+          { name: "id", type: "integer", nullable: false, isPrimary: true },
+          { name: "customer_id", type: "integer", nullable: false, isPrimary: false },
+        ],
+        indexes: [],
+        foreignKeys: [{ columnName: "customer_id", referencedTable: "archived_customers", referencedColumn: "id" }],
+        rowCount: 1,
+      },
+    ];
+    const props = createDefaultProps({ schema: unusableFk });
+    const { container } = render(<SchemaDiagram {...props} />);
+    const view = within(container);
+
+    // FK metadata EXISTS here (it just references a table outside the view),
+    // so the message must not claim there is no FK data at all.
+    expect(view.queryByText(/No usable FK relationships in this view/)).not.toBeNull();
+    expect(view.queryByText(/heuristic relationships/)).not.toBeNull();
     expect(view.queryByText(/No FK data available/)).toBeNull();
   });
 
@@ -907,17 +1032,35 @@ describe("SchemaDiagram", () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe("Export functionality", () => {
-    test("PNG export calls html2canvas and creates download link", async () => {
+    function spyOnDownloads() {
       const clickMock = mock(() => {});
+      const downloads: string[] = [];
       const originalCreateElement = document.createElement.bind(document);
       const createElementSpy = mock((tag: string) => {
         const el = originalCreateElement(tag);
         if (tag === "a") {
-          Object.defineProperty(el, "click", { value: clickMock });
+          Object.defineProperty(el, "click", {
+            configurable: true,
+            value: () => {
+              downloads.push((el as HTMLAnchorElement).download);
+              clickMock();
+            },
+          });
         }
         return el;
       });
       document.createElement = createElementSpy as unknown as typeof document.createElement;
+      return {
+        clickMock,
+        downloads,
+        restore: () => {
+          document.createElement = originalCreateElement;
+        },
+      };
+    }
+
+    test("PNG export captures the viewport via toBlob and downloads an erd_*.png file", async () => {
+      const spy = spyOnDownloads();
 
       const props = createDefaultProps();
       const { container } = render(<SchemaDiagram {...props} />);
@@ -926,35 +1069,49 @@ describe("SchemaDiagram", () => {
       const pngButton = view.getByText("PNG").closest("button")!;
       await act(async () => {
         fireEvent.click(pngButton);
+        await new Promise((r) => setTimeout(r, 20));
       });
 
-      // html2canvas should have been called
-      expect(mockHtml2canvas).toHaveBeenCalledTimes(1);
+      expect(mockSnapdom).toHaveBeenCalledTimes(1);
+      const [capturedEl, options] = mockSnapdom.mock.calls[0] as unknown as [HTMLElement, Record<string, unknown>];
+      // snapdom strips translate() from the ROOT element it captures, so the
+      // root must be the viewport's PARENT while the fit-all transform lives
+      // on the viewport child.
+      expect(capturedEl.classList.contains("react-flow__viewport")).toBe(false);
+      expect(options.backgroundColor).toBe("#050505");
+      // Desired scale is 2 for sharp output; capPixelRatio clamps it against
+      // browser canvas limits for huge diagrams (mocked bounds are small).
+      expect(options.scale).toBe(2);
+      // Webfont embedding reads cssRules from every stylesheet; Monaco's
+      // cross-origin CDN stylesheet makes that throw a SecurityError, so it
+      // must stay off (the diagram uses system fonts anyway).
+      expect(options.embedFonts).toBe(false);
 
-      // Wait for the async chain
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 10));
+      // At capture time the parent carries the export box size and the
+      // viewport child carries the fit-all transform.
+      // (mocked getNodesBounds: 800x600; getViewportForBounds: x=32 y=32 zoom=1)
+      expect(capturedStyles).toEqual({
+        transform: "translate(32px, 32px) scale(1)",
+        width: "864px",
+        height: "664px",
+        hasViewportChild: true,
       });
+      // ...and everything must be restored afterwards.
+      const viewportEl = capturedEl.querySelector<HTMLElement>(".react-flow__viewport")!;
+      expect(viewportEl.style.transform).toBe("");
+      expect(capturedEl.style.width).toBe("");
+      expect(capturedEl.style.height).toBe("");
 
-      expect(clickMock).toHaveBeenCalled();
+      expect(mockToBlob).toHaveBeenCalledTimes(1);
+      expect(spy.clickMock).toHaveBeenCalled();
+      expect(spy.downloads[0]).toMatch(/^erd_\d+\.png$/);
 
-      // Restore
-      document.createElement = originalCreateElement;
+      spy.restore();
     });
 
-    test("SVG export uses XMLSerializer and creates download link", async () => {
-      const clickMock = mock(() => {});
+    test("SVG export captures the viewport via toSvg and downloads an erd_*.svg file", async () => {
+      const spy = spyOnDownloads();
       const revokeObjectURLMock = mock(() => {});
-      const originalCreateElement = document.createElement.bind(document);
-      const createElementSpy = mock((tag: string) => {
-        const el = originalCreateElement(tag);
-        if (tag === "a") {
-          Object.defineProperty(el, "click", { value: clickMock });
-        }
-        return el;
-      });
-      document.createElement = createElementSpy as unknown as typeof document.createElement;
-
       const originalRevokeObjectURL = URL.revokeObjectURL;
       URL.revokeObjectURL = revokeObjectURLMock;
 
@@ -965,19 +1122,319 @@ describe("SchemaDiagram", () => {
       const svgButton = view.getByText("SVG").closest("button")!;
       await act(async () => {
         fireEvent.click(svgButton);
+        await new Promise((r) => setTimeout(r, 20));
       });
 
-      // Wait for async chain
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 10));
-      });
+      expect(mockSnapdom).toHaveBeenCalledTimes(1);
+      const [capturedEl] = mockSnapdom.mock.calls[0] as unknown as [HTMLElement];
+      expect(capturedEl.querySelector(".react-flow__viewport")).not.toBeNull();
 
-      expect(clickMock).toHaveBeenCalled();
+      expect(spy.clickMock).toHaveBeenCalled();
+      expect(spy.downloads[0]).toMatch(/^erd_\d+\.svg$/);
       expect(revokeObjectURLMock).toHaveBeenCalled();
+      expect(mockToBlob).not.toHaveBeenCalled();
 
-      // Restore
-      document.createElement = originalCreateElement;
+      spy.restore();
       URL.revokeObjectURL = originalRevokeObjectURL;
+    });
+
+    test("failed PNG export surfaces a destructive toast instead of failing silently", async () => {
+      mockSnapdom.mockImplementation(() => Promise.reject(new Error("capture exploded")));
+
+      const props = createDefaultProps();
+      const { container } = render(<SchemaDiagram {...props} />);
+      const view = within(container);
+
+      const pngButton = view.getByText("PNG").closest("button")!;
+      await act(async () => {
+        fireEvent.click(pngButton);
+        await new Promise((r) => setTimeout(r, 20));
+      });
+
+      expect(mockToastError).toHaveBeenCalled();
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // FkEdge rendering (direct, with a real highlight store)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("FkEdge", () => {
+    const edgeProps = {
+      id: "orders.user_id->users.id",
+      source: "orders",
+      target: "users",
+      sourceX: 0,
+      sourceY: 0,
+      targetX: 100,
+      targetY: 100,
+      sourcePosition: "right",
+      targetPosition: "left",
+    } as never;
+
+    function renderEdge(store: ReturnType<typeof createHighlightStore>, heuristic: boolean) {
+      const props = { ...(edgeProps as Record<string, unknown>), data: { heuristic } };
+      return render(
+        <HighlightStoreProvider value={store}>
+          <svg>{React.createElement(FkEdge as unknown as React.ComponentType<Record<string, unknown>>, props)}</svg>
+        </HighlightStoreProvider>,
+      );
+    }
+
+    test("real FK edge renders solid blue at rest with no label", () => {
+      const store = createHighlightStore();
+      const { container } = renderEdge(store, false);
+      const path = container.querySelector('[data-testid="mock-base-edge"]') as HTMLElement;
+      expect(path).not.toBeNull();
+      expect(path.style.stroke).toBe("#3b82f6");
+      expect(path.style.strokeDasharray).toBe("");
+      expect(within(container).queryByText("1:N")).toBeNull();
+    });
+
+    test("heuristic edge renders dashed gray with thinner stroke", () => {
+      const store = createHighlightStore();
+      const { container } = renderEdge(store, true);
+      const path = container.querySelector('[data-testid="mock-base-edge"]') as HTMLElement;
+      expect(path.style.stroke).toBe("#6b7280");
+      expect(path.style.strokeDasharray).toBe("4 2");
+    });
+
+    test("edge touching the selected table is highlighted and labeled", () => {
+      const store = createHighlightStore();
+      store.select("orders", new Set(["users"]));
+      const { container } = renderEdge(store, false);
+      const path = container.querySelector('[data-testid="mock-base-edge"]') as HTMLElement;
+      expect(path.style.opacity).toBe("1");
+      expect(path.style.strokeWidth).toBe("2");
+      expect(within(container).queryByText("1:N")).not.toBeNull();
+    });
+
+    test("heuristic highlighted edge is labeled with a question mark", () => {
+      const store = createHighlightStore();
+      store.select("orders", new Set(["users"]));
+      const { container } = renderEdge(store, true);
+      expect(within(container).queryByText("1:N?")).not.toBeNull();
+    });
+
+    test("edge unrelated to the selection is dimmed", () => {
+      const store = createHighlightStore();
+      store.select("products", new Set());
+      const { container } = renderEdge(store, false);
+      const path = container.querySelector('[data-testid="mock-base-edge"]') as HTMLElement;
+      expect(path.style.opacity).toBe("0.12");
+      expect(within(container).queryByText("1:N")).toBeNull();
+    });
+
+    test("edge reacts to selection changes made after mount", () => {
+      const store = createHighlightStore();
+      const { container } = renderEdge(store, false);
+      expect(within(container).queryByText("1:N")).toBeNull();
+
+      act(() => {
+        store.select("users", new Set(["orders"]));
+      });
+      expect(within(container).queryByText("1:N")).not.toBeNull();
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Large-schema behaviors
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("Large schemas", () => {
+    const bigSchema: TableSchema[] = Array.from({ length: 150 }, (_, i) => ({
+      name: `table_${i}`,
+      columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
+      indexes: [],
+      foreignKeys: [],
+      rowCount: 1,
+    }));
+
+    test("viewport culling is enabled above the threshold but disabled while exporting", async () => {
+      let cullingDuringExport: unknown = "not-captured";
+      mockSnapdom.mockImplementation(() => {
+        cullingDuringExport = lastReactFlowProps.onlyRenderVisibleElements;
+        return Promise.resolve({ toBlob: mockToBlob, url: mockSvgDataUrl });
+      });
+
+      const props = createDefaultProps({ schema: bigSchema });
+      const { container } = render(<SchemaDiagram {...props} />);
+      const view = within(container);
+
+      expect(lastReactFlowProps.onlyRenderVisibleElements).toBe(true);
+
+      const pngButton = view.getByText("PNG").closest("button")!;
+      await act(async () => {
+        fireEvent.click(pngButton);
+        await new Promise((r) => setTimeout(r, 40));
+      });
+
+      // Culled (unmounted) nodes cannot be captured - the snapshot must run
+      // with culling off so every table is in the DOM.
+      expect(cullingDuringExport).toBe(false);
+      expect(lastReactFlowProps.onlyRenderVisibleElements).toBe(true);
+    });
+
+    test("small schemas never enable culling", () => {
+      const props = createDefaultProps();
+      render(<SchemaDiagram {...props} />);
+      expect(lastReactFlowProps.onlyRenderVisibleElements).toBe(false);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Async FK arrival (two-phase schema fetch)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("Async FK arrival", () => {
+    test("highlight neighbors refresh when relations arrive while a table is selected", async () => {
+      const onClose = mock(() => {});
+      const { container, rerender } = render(<SchemaDiagram schema={schemaNoFK} onClose={onClose} />);
+
+      // Select users while no FK data exists
+      fireEvent.click(container.querySelector('[data-node-id="users"]')!);
+      expect(container.querySelector('[data-node-id="users"]')!.querySelector(".border-blue-500\\/60")).not.toBeNull();
+      expect(container.querySelector('[data-node-id="posts"]')!.querySelector(".border-blue-500\\/60")).toBeNull();
+
+      // Relations arrive: posts now references users
+      const withFk: TableSchema[] = [
+        schemaNoFK[0],
+        {
+          ...schemaNoFK[1],
+          columns: [...schemaNoFK[1].columns, { name: "user_id", type: "integer", nullable: false, isPrimary: false }],
+          foreignKeys: [{ columnName: "user_id", referencedTable: "users", referencedColumn: "id" }],
+        },
+      ];
+      await act(async () => {
+        rerender(<SchemaDiagram schema={withFk} onClose={onClose} />);
+        await new Promise((r) => setTimeout(r, 20));
+      });
+
+      // posts is now a neighbor of the still-selected users -> highlighted
+      expect(container.querySelector('[data-node-id="posts"]')!.querySelector(".border-blue-500\\/60")).not.toBeNull();
+    });
+
+    test("node internals re-measure when FK anchors appear on existing tables", async () => {
+      const onClose = mock(() => {});
+      const { rerender } = render(<SchemaDiagram schema={schemaNoFK} onClose={onClose} />);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      const callsBefore = mockUpdateNodeInternals.mock.calls.length;
+
+      // Identity-only rebuild (same schema content) must NOT re-measure
+      await act(async () => {
+        rerender(<SchemaDiagram schema={[...schemaNoFK]} onClose={onClose} />);
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      expect(mockUpdateNodeInternals.mock.calls.length).toBe(callsBefore);
+
+      // FK arrival adds handles -> React Flow must be told to re-measure,
+      // otherwise the new edges never attach.
+      const withFk: TableSchema[] = [
+        schemaNoFK[0],
+        {
+          ...schemaNoFK[1],
+          columns: [...schemaNoFK[1].columns, { name: "user_id", type: "integer", nullable: false, isPrimary: false }],
+          foreignKeys: [{ columnName: "user_id", referencedTable: "users", referencedColumn: "id" }],
+        },
+      ];
+      await act(async () => {
+        rerender(<SchemaDiagram schema={withFk} onClose={onClose} />);
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      expect(mockUpdateNodeInternals.mock.calls.length).toBeGreaterThan(callsBefore);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Layout failure behavior
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("Layout failure", () => {
+    const wideTable: TableSchema[] = [
+      {
+        name: "wide",
+        columns: Array.from({ length: 30 }, (_, i) => ({
+          name: `col_${i}`,
+          type: "integer",
+          nullable: true,
+          isPrimary: i === 0,
+        })),
+        indexes: [],
+        foreignKeys: [],
+        rowCount: 1,
+      },
+    ];
+
+    test("a failed (null) layout is not retried on cosmetic rebuilds", async () => {
+      let layoutCalls = 0;
+      setLayoutEngineImpl({
+        layout: () => {
+          layoutCalls++;
+          return Promise.resolve(null);
+        },
+        dispose: () => Promise.resolve(),
+      });
+
+      const props = createDefaultProps({ schema: wideTable });
+      const { container } = render(<SchemaDiagram {...props} />);
+      const view = within(container);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      expect(layoutCalls).toBe(1);
+
+      // Expanding a table changes graph identity but not structure - the
+      // known-failed layout must not rerun (no spinner churn).
+      fireEvent.click(view.getByText(/\+\d+ more/));
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      expect(layoutCalls).toBe(1);
+      expect(view.queryByText("col_29")).not.toBeNull();
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Column capping (+N more expander)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("Column capping", () => {
+    const wideTable: TableSchema[] = [
+      {
+        name: "wide",
+        columns: Array.from({ length: 30 }, (_, i) => ({
+          name: `col_${i}`,
+          type: "integer",
+          nullable: true,
+          isPrimary: i === 0,
+        })),
+        indexes: [],
+        foreignKeys: [],
+        rowCount: 1,
+      },
+    ];
+
+    test("wide tables show a +N more expander instead of all columns", () => {
+      const props = createDefaultProps({ schema: wideTable });
+      const { container } = render(<SchemaDiagram {...props} />);
+      const view = within(container);
+
+      expect(view.queryByText("col_0")).not.toBeNull();
+      expect(view.queryByText("col_29")).toBeNull();
+      expect(view.queryByText(/\+\d+ more/)).not.toBeNull();
+    });
+
+    test("clicking the expander reveals all columns", () => {
+      const props = createDefaultProps({ schema: wideTable });
+      const { container } = render(<SchemaDiagram {...props} />);
+      const view = within(container);
+
+      fireEvent.click(view.getByText(/\+\d+ more/));
+
+      expect(view.queryByText("col_29")).not.toBeNull();
+      expect(view.queryByText(/\+\d+ more/)).toBeNull();
     });
   });
 
