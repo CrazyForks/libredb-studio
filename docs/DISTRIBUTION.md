@@ -319,8 +319,8 @@ sudo systemctl restart libredb-studio        # apply configuration changes
 
 ## Snap
 
-Available once the snap is published to the Snap Store (publishing is wired in release CI but
-gated on store credentials — see [Maintainer notes](#maintainer-notes)):
+Published on the [Snap Store](https://snapcraft.io/libredb-studio) for amd64 and arm64 (live
+since 0.9.52; release CI publishes every release to the `stable` channel):
 
 ```bash
 sudo snap install libredb-studio
@@ -367,8 +367,8 @@ Release publishing is driven by two workflows, both triggered on `release: publi
 
 ### First-release validation runbook
 
-The macOS matrix legs, the Homebrew tap push, and the Snap publish first run live on the next
-release. Right after publishing it:
+All channels have now had their first live run (the Snap publish completed its first with
+0.9.52, validated per this runbook). Right after publishing a release:
 
 1. Watch the `release-artifacts` run: all four tarball legs green (if the `macos-15-intel` or
    `macos-14` runner labels ever disappear, check the current labels in
@@ -409,12 +409,10 @@ setups still publish the rest:
 
 ### Manual steps still open
 
-- **Snap Store account**: the snap name `libredb-studio` must be registered in the Snap Store
-  and `SNAPCRAFT_STORE_CREDENTIALS` configured before the snap channel goes live
-  ([issue #113](https://github.com/libredb/libredb-studio/issues/113)).
 - **Snap Store listing screenshots**: the description and icon ship with the snap
   (`snap/snapcraft.yaml`, `public/logo.svg`), but screenshots are a manual upload in the
-  Snap Store web UI — part of the #113 store-listing acceptance criteria.
+  Snap Store web UI (https://snapcraft.io/libredb-studio/listing). The snap name is registered
+  and `SNAPCRAFT_STORE_CREDENTIALS` is configured — the channel went live with 0.9.52.
 - **Website install docs**: the libredb-website documentation must be updated with the new
   channels (npx, Homebrew, .deb/.rpm, Snap) — a cross-repo step and part of issue #111's
   "README and website docs" acceptance criterion (and implicitly of #110/#112/#113).
@@ -434,8 +432,9 @@ record matches the implementation:
   criterion to [#114](https://github.com/libredb/libredb-studio/issues/114) before closing.
 - **#111 (Homebrew)**: the website half of "Install instructions added to README and website
   docs" is a cross-repo step (see Manual steps above).
-- **#113 (Snap)**: store account/credentials and listing screenshots remain manual (see Manual
-  steps above).
+- **#113 (Snap)**: closed after the 0.9.52 live validation (store publish from release CI,
+  amd64+arm64 on `stable`). Listing screenshots remain a store-side manual upload (see Manual
+  steps above); version-bump auto-refresh is observable at the next release.
 - **#115 (desktop wrapper spike)**: the written go/no-go recommendation is delivered
   ([`docs/DESKTOP_WRAPPER_SPIKE.md`](DESKTOP_WRAPPER_SPIKE.md)), but the hands-on spike scope
   (Tauri prototype, WebKitGTK/Monaco validation, unsigned PoC builds) was re-scoped into its

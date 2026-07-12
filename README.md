@@ -200,7 +200,7 @@ The test instance comes with a pre-configured PostgreSQL database via [Seed Conn
   | **npx** | `npx @libredb/studio` | Linux/macOS, Node 20.9+ (Node 24 LTS recommended); downloads the release server tarball |
   | **Homebrew** | `brew trust libredb/tap && brew install libredb/tap/libredb-studio` | `brew trust` is required once (Homebrew 6+; run `brew update` if unknown) |
   | **deb / rpm** | `sudo dpkg -i libredb-studio_<version>_amd64.deb` | Attached to each GitHub release; systemd service included |
-  | **Snap** | `sudo snap install libredb-studio` | From the next release, once Snap Store publishing goes live |
+  | **Snap** | `sudo snap install libredb-studio` | Zero-config: the admin password is printed to `sudo snap logs libredb-studio` on first run — [Snap Store listing](https://snapcraft.io/libredb-studio) |
 
   > Homebrew, deb/rpm, Snap, and the npx launcher consume standalone artifacts attached to each GitHub release. Full per-channel guide — commands, configuration, systemd usage, and the Docker image tag model — in [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).
 
