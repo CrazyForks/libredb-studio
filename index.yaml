@@ -4,6 +4,70 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - Track app release 0.9.52 (appVersion bump; default image tag follows)
+        - Default install is now zero-config: with no values set, first-run admin credentials are generated and printed to the pod log (config.authBootstrap default changed from "off" to ""); set config.authBootstrap=off for strict fail-closed installs
+        - Secret keys and env entries for JWT_SECRET, ADMIN_PASSWORD, USER_EMAIL and USER_PASSWORD are rendered only when their values are set (or an existingSecret is used), so pods no longer reference missing Secret keys
+        - Strict mode now requires only secrets.jwtSecret and secrets.adminPassword; secrets.userPassword is optional in all modes (the non-admin account is an optional app feature and is never generated)
+        - With secrets.existingSecret, auth env entries are optional only in zero-config mode; strict mode references jwt-secret and admin-password hard, so the pod waits for missing keys instead of starting without them
+        - Mount an emptyDir at /app/data when persistence is disabled so first-run credentials can be persisted under readOnlyRootFilesystem
+        - Declare linux/arm64 in artifacthub.io/images (the image is multi-arch) and clear the prerelease flag
+        - Refuse zero-config installs with replicaCount > 1 or autoscaling enabled (per-pod generated JWT secrets would break sessions across replicas); set secrets.jwtSecret or config.authBootstrap=off for multi-replica setups
+        - Upgrade note: releases relying on the previous strict default keep fail-closed behavior only by setting config.authBootstrap=off explicitly
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.9.52
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.9.52
+    created: "2026-07-12T01:09:19.840394894Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: cb1c14577e3bac47f44cfa2e616026aee903db9dde608730a8f7f83b1ec17b12
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.11/libredb-studio-0.1.11.tgz
+    version: 0.1.11
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - Track app release 0.9.51 (appVersion bump; default image tag follows)
         - Default install is now zero-config: with no values set, first-run admin credentials are generated and printed to the pod log (config.authBootstrap default changed from "off" to ""); set config.authBootstrap=off for strict fail-closed installs
         - Secret keys and env entries for JWT_SECRET, ADMIN_PASSWORD, USER_EMAIL and USER_PASSWORD are rendered only when their values are set (or an existingSecret is used), so pods no longer reference missing Secret keys
@@ -569,4 +633,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-07-11T23:04:47.107884767Z"
+generated: "2026-07-12T01:09:19.83379722Z"
