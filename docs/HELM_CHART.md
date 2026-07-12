@@ -260,6 +260,14 @@ queries GHCR anonymously and relies on the image package being public.
   `--version` example in step. The `artifacthub.io/changes` line is written by
   `chart:bump` but deliberately not checked, so hand-written changelog entries for
   chart-only releases never trip the guard.
+- Base comparisons read main's `Chart.yaml` at the merge-base of `HEAD` and `origin/main`,
+  so a release merged to `main` after your branch point cannot false-positive the
+  already-released check on a stale branch (issue #151); in shallow checkouts with no
+  computable merge-base (CI's depth-1 fetch), the `origin/main` tip is used as before,
+  which is effectively exact on PR merge refs. CI sets `CHART_SYNC_STRICT=1`
+  (`ci.yml`), which turns the guard's skip-and-warn paths (`origin/main` not resolvable,
+  origin tags unreachable) into hard failures; unset locally, they stay warnings so
+  offline runs still work.
 
 #### Versioning policy: version and appVersion stay independent (researched 2026-07)
 
@@ -312,6 +320,6 @@ helm install libredb libredb/libredb-studio \
 
 ## Known Limitations
 
-1. **SQLite + Multi-Replica**: SQLite is single-writer. `storageProvider=sqlite` with `replicaCount > 1` will cause write conflicts. Use `postgres` for multi-replica.
+1. **SQLite + Multi-Replica**: SQLite is single-writer. `storageProvider=sqlite` with `replicaCount > 1` will cause write conflicts. Use `postgres` for multi-replica. With SQLite storage `autoscaling.enabled` is ignored: the HPA is not rendered (NOTES.txt warns) and the deployment falls back to `replicaCount`.
 2. **ISR Cache**: Next.js ISR cache is per-pod (emptyDir). Session-based app, so no impact.
 3. **Chart appVersion**: Not auto-bumped - a version-bump PR must run `bun run chart:bump`; the CI sync guard blocks the merge until `appVersion` equals `package.json` (see Version Management above).

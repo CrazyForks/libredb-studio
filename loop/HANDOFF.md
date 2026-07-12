@@ -5,51 +5,58 @@
 
 ## Current milestone
 
-Maintainer Bug Sweep 1 — issues #132, #133, #134, #135, #137 (first-run/install-path bugs across
-the npx, standalone tarball, deb/rpm, Homebrew, and Helm distribution channels).
+Maintainer Sweep 2 — the first fully autonomous milestone (triage → planning → build over the
+open public issue tracker), on branch `loop/maintainer-sweep-2`. Queue: the 7 issues labeled
+`loop:queued` at planning time — #126, #125, #136, #151, #45, #124, #96 — each with a
+sanitized spec in `loop/TRIAGE.md`. Definition of done: `loop/ACCEPTANCE.md` (sentinel
+`LIBREDB-STUDIO-SWEEP-2-DONE`).
 
 ## Status
 
-COMPLETE. All 5 issues fixed test-first on `loop/maintainer-bugsweep-1`, one commit each:
+COMPLETE. As of 2026-07-12, all three stages of the first fully autonomous milestone ran on
+this branch:
 
-- #134 — `8779173` — force loopback bind on direct deb/rpm and Homebrew runs
-- #135 — `bf4080c` — default Homebrew direct-run state dir outside the Cellar keg
-- #132 — `0150d94` — preserve payload/data across npx launcher re-extraction
-- #133 — `b8ed99a` — extract standalone tarball under a versioned root, not a tarbomb
-- #137 — `50e3a2f` — regression test pinning the writable `/app/data` default (fix itself
-  predates this loop, shipped in PR #165/commit `3a22428`)
+- Triage: 15 issues across three batches (commits `3c78105`, `26fb92f`, `ca7cc05`) —
+  7 queued, 1 needs-info (#94), 4 escalated to moderator (#40, #123, #127, #167),
+  3 not-for-loop (#100, #108, #170).
+- Planning: 7 queued issues → 8 build tasks (#96 pre-split), commit `3b5472d`.
+- Build: all 8 tasks done, one commit each, every one with RED evidence and a fresh-context
+  `loop-reviewer` verdict of PASS or PASS WITH NOTES (details per entry in
+  `loop/PROGRESS.md`):
+  - #126 `01873b9` — Oracle/MSSQL `supportsExplain: false` + docs tri-sync
+  - #125 `f334137` — sqlite path guard rejects NUL only; dead traversal branch removed
+  - #136 `586b3b5` — render-level test pins the minimal two-secret install
+  - #151 `b751399` — chart:check merge-base comparison + shared predicate + polish
+  - #45 `496c191` — chart hardening (schema coverage, jwtSecret length, PDB zero-value and
+    exclusivity, no HPA with sqlite); chart 0.1.11 → 0.1.12
+  - #124 `e26dcf9` — deny-list prune of the standalone payload (105M → 32M locally)
+  - #96a `c2de170` — registry-based value renderers behind `formatCellValue`
+  - #96b `7a7f7e4` — pretty-printed json-kind values in the row detail sheet
+- Close-out: every `loop/ACCEPTANCE.md` criterion re-verified against actual repo state; the
+  full gate re-run fresh and green (format, lint, typecheck, all 18 test groups, build, plus
+  `helm lint --strict` and `bun run chart:check`); `.loop/COMPLETE` created.
+- All 7 queued issues remain OPEN by design — a human closes them at PR merge.
 
-Full gate reverified green on the clean branch tip at close-out: format clean, lint 0 errors
-(pre-existing warnings only), typecheck OK, `bun run test` 18/18 groups pass (0 fail), build OK,
-`helm lint charts/libredb-studio --strict` 0 charts failed. No issue is labeled
-`loop:needs-info`. All 5 functional tasks plus Phase F are ticked in
-`loop/IMPLEMENTATION_PLAN.md`. `docs/DISTRIBUTION.md` updated for #134/#135/#133 (verified via
-grep for `LIBREDB_BIND`, `STORAGE_SQLITE_PATH`, and the versioned-root paragraph); #137 needed no
-doc changes (already documented by PR #165). All 5 issues remain OPEN on GitHub — this loop does
-not close issues; a human closes them at PR merge.
+## Human gates outstanding
 
-## Next milestone (infrastructure ready, not yet planned)
-
-The loop is now hardened for FULLY AUTONOMOUS operation against the open public issue tracker
-(2026-07-12, human-driven hardening — see the PROGRESS.md entry of that date). The pipeline for
-the next milestone, on a fresh dedicated branch off `main`:
-
-1. **Triage mode** — set `LOOP_PROMPT_FILE="loop/PROMPT-TRIAGE.md"` in `loop/config/loop.env`,
-   run `./loop/scripts/loop.sh <N>`. Classifies every untriaged open issue into `loop:queued`
-   (sanitized spec written to `loop/TRIAGE.md`), `loop:needs-info` (question posted),
-   `loop:needs-moderator-action` (human-only), or the TRIAGE.md "Not for the loop" list.
-   Labels exist already (`loop/scripts/setup-labels.sh`, idempotent).
-2. **Human checkpoint (optional but recommended for the first run)** — skim `loop/TRIAGE.md`
-   and the labels; veto by removing `loop:queued` or editing specs.
-3. **Planning mode** — `LOOP_PROMPT_FILE="loop/PROMPT-PLANNING.md"`, one iteration; writes
-   `loop/IMPLEMENTATION_PLAN.md` from the queue. Author `loop/ACCEPTANCE.md` for the milestone
-   (or let it list "all loop:queued issues at planning time") and bump
-   `LOOP_COMPLETION_SENTINEL` in `loop/config/loop.env`.
-4. **Build mode** — `LOOP_PROMPT_FILE="loop/PROMPT.md"`, run to completion. Each task now ends
-   with a mandatory fresh-context `loop-reviewer` pass before its commit.
-5. **Human close** — review the branch, push, open the PR (the loop never pushes).
-
-Backlog candidates known today: open `bug` issues not in Bug Sweep 1 (#40, #94, #126), #127
-(question: sqlite absent from selectableTypes), #125 (traversal-check intent), #124 (trim
-standalone payload; deferred from #133), the npx launcher's latent `HOSTNAME`-passthrough gap
-noted in `loop/PROGRESS.md`'s #134 entry, and whatever triage mode queues from the rest.
+- #94 (`loop:needs-info`) — awaiting the reporter's answer (question posted as issue comment
+  4949538647); only a human removing the label makes it pickable. Reported as an open gap at
+  close-out, NOT part of this milestone.
+- Moderator queue (`loop:needs-moderator-action`): #40 (ER-diagram export needs a new runtime
+  dependency decision), #123 (release signing/SLSA — privileged pipeline), #127 (expose
+  sqlite in the connection form — trust-model product call), #167 (helm-release republish
+  guard — workflow edit), plus pre-existing #175, #166, #152, #114, #72. Build mode must not
+  touch any of these.
+- Final human gate: review the branch (8 task commits + close-out), push, open the PR
+  (base `main`) — the loop never pushes. The PR bumps chart content (#45), and the chart
+  version bump (0.1.12) is already in the same commit per the charts/** repo rule.
+- Human-follow-up flags collected during the build (details in the matching
+  `loop/PROGRESS.md` entries): the embedded libredb provider carries the same dead traversal
+  branch #125 removed from sqlite; the Dockerfile runner stage still copies the untrimmed
+  standalone output (#124's prune covers only the payload script); a real `npmjs-token` file
+  sits at this dev machine's repo root (credential hygiene — move it off the repo root);
+  deployment.yaml's pre-existing zero-config guard message is slightly stale for the
+  sqlite+autoscaling case (#45); RowDetailSheet's pre-existing `Eye` icon lacks
+  `strokeWidth={1.5}` (#96b).
+- Next milestone: start with triage mode (`LOOP_PROMPT_FILE="loop/PROMPT-TRIAGE.md"`), new
+  sentinel in `loop/config/loop.env`, and remove the stale `.loop/COMPLETE` before running.
