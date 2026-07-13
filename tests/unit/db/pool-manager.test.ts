@@ -457,6 +457,25 @@ describe("withRetry", () => {
     }
   });
 
+  test("throws without invoking fn when maxAttempts is 0", async () => {
+    let calls = 0;
+    try {
+      await withRetry(
+        async () => {
+          calls++;
+          return "never";
+        },
+        { maxAttempts: 0 },
+      );
+      expect(true).toBe(false);
+    } catch (error) {
+      // The retry loop never runs, so the guard after it throws a real error
+      expect(error).toBeInstanceOf(RangeError);
+      expect((error as RangeError).message).toContain("maxAttempts must be >= 1");
+    }
+    expect(calls).toBe(0);
+  });
+
   test("uses exponential backoff", async () => {
     let attempt = 0;
     const startTime = Date.now();
