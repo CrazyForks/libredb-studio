@@ -279,6 +279,33 @@ brew services start libredb-studio
   `STORAGE_PROVIDER=sqlite` data) outside the versioned keg so it survives `brew upgrade`, and
   lets both run modes share one data dir.
 
+### Configuration
+
+All configuration is environment-driven. The formula does not ship an env file (unlike
+`.deb`/`.rpm`).
+
+**Foreground** (`libredb-studio`): export variables in your shell, or prefix the command.
+Explicit values override [zero-config first run](#zero-config-first-run). Bind with
+`LIBREDB_BIND` (the wrapper maps it to `HOSTNAME` — see [Network exposure](#network-exposure-bind-address)):
+
+```bash
+# AI, auth, OIDC, or Postgres storage — same variables as .env.example
+export LLM_PROVIDER=openai LLM_API_KEY=sk-... LLM_MODEL=gpt-4o
+# export NEXT_PUBLIC_AUTH_PROVIDER=oidc OIDC_ISSUER=... OIDC_CLIENT_ID=... OIDC_CLIENT_SECRET=...
+# export STORAGE_PROVIDER=postgres STORAGE_POSTGRES_URL=postgresql://user:pass@127.0.0.1:5432/libredb
+# LIBREDB_BIND=0.0.0.0 libredb-studio   # expose beyond loopback
+libredb-studio
+```
+
+**`brew services`:** the service block only sets `STORAGE_PROVIDER=sqlite`,
+`STORAGE_SQLITE_PATH`, and `HOSTNAME=127.0.0.1`. Homebrew has no supported way to inject
+extra env into that plist (upgrades regenerate it). For LLM, OIDC, Postgres storage, strict
+auth, or a non-loopback bind, run the binary in the foreground with the env above (or put a
+reverse proxy in front of the loopback service).
+
+Full variable reference: [`.env.example`](../.env.example). OIDC: [`docs/OIDC.md`](OIDC.md).
+Storage: [`docs/STORAGE.md`](STORAGE.md).
+
 ## Linux packages (.deb / .rpm)
 
 Native packages for Debian/Ubuntu and RHEL/Fedora (amd64/x86_64 and arm64/aarch64) are attached
