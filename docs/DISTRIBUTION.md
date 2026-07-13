@@ -273,6 +273,9 @@ brew services start libredb-studio
   storage (it sets `STORAGE_PROVIDER=sqlite`) under `$(brew --prefix)/var/libredb-studio/` —
   the data dir where generated credentials are persisted. The service does not capture stdout,
   so read the generated password from `$(brew --prefix)/var/libredb-studio/auth-bootstrap.json`.
+  On Linux, `brew services` registers a per-user systemd unit (`~/.config/systemd/user`): it
+  starts at login — not at boot — and stops when your last session ends unless lingering is
+  enabled (`loginctl enable-linger $USER`).
 - Running `libredb-studio` directly also defaults `STORAGE_SQLITE_PATH` to
   `$(brew --prefix)/var/libredb-studio/libredb-storage.db` — the same location `brew services`
   uses — unless you set it explicitly. This keeps the zero-config `auth-bootstrap.json` (and any
@@ -392,8 +395,13 @@ The drop-in is written to
 `/etc/systemd/system/snap.libredb-studio.libredb-studio.service.d/override.conf`
 (root-owned). Explicit values override the defaults baked into
 [`snap/snapcraft.yaml`](../snap/snapcraft.yaml) and take precedence over
-[zero-config first run](#zero-config-first-run) generation. Keep secrets in that file only on
-trusted hosts — it is readable by root the same way other systemd overrides are.
+[zero-config first run](#zero-config-first-run) generation. Note that `systemctl edit`
+creates the drop-in world-readable (mode 0644, like any systemd override), so after adding
+secrets tighten it — systemd reads drop-ins as root, so this does not affect the service:
+
+```bash
+sudo chmod 600 /etc/systemd/system/snap.libredb-studio.libredb-studio.service.d/override.conf
+```
 
 Example drop-in (uncomment and fill what you need):
 
