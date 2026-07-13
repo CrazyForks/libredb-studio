@@ -345,6 +345,67 @@ sudo snap logs libredb-studio   # first run prints the generated admin password 
 - The `.snap` file is also attached to each GitHub release for offline installs
   (`sudo snap install --dangerous libredb-studio_<version>_amd64.snap`).
 
+### Configuration
+
+Unlike the `.deb`/`.rpm` packages (which ship `/etc/libredb-studio/env`), the snap has no
+dedicated config file. Override environment variables with a systemd drop-in on the unit snapd
+generates:
+
+```bash
+sudo systemctl edit snap.libredb-studio.libredb-studio.service
+```
+
+Add `[Service]` `Environment=` lines, then restart:
+
+```bash
+sudo systemctl restart snap.libredb-studio.libredb-studio.service
+```
+
+The drop-in is written to
+`/etc/systemd/system/snap.libredb-studio.libredb-studio.service.d/override.conf`
+(root-owned). Explicit values override the defaults baked into
+[`snap/snapcraft.yaml`](../snap/snapcraft.yaml) and take precedence over
+[zero-config first run](#zero-config-first-run) generation. Keep secrets in that file only on
+trusted hosts — it is readable by root the same way other systemd overrides are.
+
+Example drop-in (uncomment and fill what you need):
+
+```ini
+[Service]
+# Bind (default is loopback — see Network exposure above)
+#Environment=HOSTNAME=0.0.0.0
+
+# Auth (optional; omit to keep zero-config bootstrap)
+#Environment=AUTH_BOOTSTRAP=off
+#Environment=JWT_SECRET=change-me-to-a-random-32-char-string
+#Environment=ADMIN_EMAIL=admin@libredb.org
+#Environment=ADMIN_PASSWORD=
+
+# AI query assistance
+#Environment=LLM_PROVIDER=gemini
+#Environment=LLM_API_KEY=
+#Environment=LLM_MODEL=gemini-2.5-flash
+#Environment=LLM_API_URL=http://127.0.0.1:11434/v1
+
+# OIDC (login page reads NEXT_PUBLIC_AUTH_PROVIDER at runtime)
+#Environment=NEXT_PUBLIC_AUTH_PROVIDER=oidc
+#Environment=OIDC_ISSUER=https://example.auth0.com
+#Environment=OIDC_CLIENT_ID=
+#Environment=OIDC_CLIENT_SECRET=
+
+# Persisted storage (default: sqlite under $SNAP_DATA — leave unset to keep it)
+#Environment=STORAGE_PROVIDER=postgres
+#Environment=STORAGE_POSTGRES_URL=postgresql://user:pass@127.0.0.1:5432/libredb?sslmode=disable
+```
+
+**Storage:** by default the snap sets `STORAGE_PROVIDER=sqlite` and
+`STORAGE_SQLITE_PATH=$SNAP_DATA/libredb-storage.db` — no further config is required. To switch
+to server-side Postgres, uncomment the `STORAGE_PROVIDER` / `STORAGE_POSTGRES_URL` lines above
+(TCP only; unix-socket Postgres on the host is not reachable under strict confinement).
+
+Full variable reference: [`.env.example`](../.env.example). OIDC setup details:
+[`docs/OIDC.md`](OIDC.md). Storage providers: [`docs/STORAGE.md`](STORAGE.md).
+
 ## Building a standalone payload locally
 
 The single source of truth for the release tarballs also works locally (Linux and macOS):
