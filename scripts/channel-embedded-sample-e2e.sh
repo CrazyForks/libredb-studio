@@ -312,7 +312,12 @@ channel_rpm() {
   # nfpm rpms store absolute member paths (/usr/lib/...); GNU cpio would
   # extract those to the real filesystem root - strip the leading slash so
   # everything lands under the work tree (0.9.55 release incident, take 2).
-  (cd "$WORK/root" && rpm2cpio "$pkg" | cpio -idm --no-absolute-filenames --quiet)
+  # pipefail is disabled for this one pipeline because Ubuntu's rpm2cpio
+  # exits 1 even after streaming the payload completely (take 3; verified
+  # PIPESTATUS '1 0' on ubuntu:24.04 with a fully intact tree) - cpio's
+  # status still fails the step on a truncated archive, and
+  # run_extracted_linux_tree refuses to boot a tree without server.js.
+  (cd "$WORK/root" && set +o pipefail && rpm2cpio "$pkg" | cpio -idm --no-absolute-filenames --quiet)
   run_extracted_linux_tree rpm "$WORK/root" "$port"
   record rpm PASS
   cleanup
