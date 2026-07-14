@@ -818,3 +818,194 @@ describe("VisualExplain", () => {
     expect(chevrons.length).toBe(0);
   });
 });
+
+// ============================================================================
+// Tree render model (sqlite-queryplan and other tagged-tree strategies)
+// ============================================================================
+
+describe("tree render model (sqlite-queryplan)", () => {
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    cleanup();
+  });
+
+  const TREE_INPUT = {
+    kind: "tree" as const,
+    root: {
+      label: "Query Plan",
+      children: [{ label: "SCAN employee", children: [{ label: "USING INDEX idx_dept", children: [] }] }],
+    },
+    raw: [{ id: 3, parent: 0, notused: 0, detail: "SCAN employee" }],
+  };
+
+  test("renders the tree labels without fabricated metric badges", () => {
+    const { getByText, queryByText } = render(
+      <VisualExplain plan={TREE_INPUT} query="SELECT 1" databaseType="sqlite" />,
+    );
+    expect(getByText("SCAN employee")).toBeTruthy();
+    expect(getByText("USING INDEX idx_dept")).toBeTruthy();
+    expect(queryByText(/0 rows/)).toBeNull();
+  });
+
+  test("hides the insights tab for metric-less plans and defaults to tree", () => {
+    const { queryByText } = render(<VisualExplain plan={TREE_INPUT} query="SELECT 1" databaseType="sqlite" />);
+    expect(queryByText("insights")).toBeNull();
+  });
+
+  test("raw tab stringifies the raw rows", () => {
+    // switch to the raw tab per the file's existing tab-click helper, then:
+    const { getByText, queryByText } = render(
+      <VisualExplain plan={TREE_INPUT} query="SELECT 1" databaseType="sqlite" />,
+    );
+    fireEvent.click(queryByText("raw")!);
+    expect(getByText(/"detail": "SCAN employee"/)).toBeTruthy();
+  });
+
+  test("legacy array prop still renders the postgres pipeline", () => {
+    // reuse the file's existing postgres plan fixture through the UNCHANGED array prop
+    // and assert the insights tab is present — proves the widening is additive.
+    const { queryByText } = render(<VisualExplain plan={samplePlan} />);
+    expect(queryByText("insights")).not.toBeNull();
+  });
+
+  test("empty tree input falls back to the empty state", () => {
+    const { getByText } = render(<VisualExplain plan={null} query="" />);
+    expect(getByText("No execution plan")).toBeTruthy();
+  });
+
+  test("renders metric badges only for nodes that carry them", () => {
+    const treeWithMetrics = {
+      kind: "tree" as const,
+      root: {
+        label: "Query Plan",
+        children: [
+          {
+            label: "SCAN employee",
+            metrics: { actualRows: 42, actualTimeMs: 3.5 },
+            children: [],
+          },
+        ],
+      },
+      raw: [],
+    };
+    const { getByText, queryByText } = render(<VisualExplain plan={treeWithMetrics} />);
+    expect(getByText(/42 rows/)).toBeTruthy();
+    expect(getByText("3.50ms")).toBeTruthy();
+    // The root node itself carries no metrics, so it must not fabricate a badge.
+    expect(queryByText(/0 rows/)).toBeNull();
+  });
+
+  test("tree header shows a node count instead of postgres stat chips", () => {
+    const { getByText, queryByText } = render(
+      <VisualExplain plan={TREE_INPUT} query="SELECT 1" databaseType="sqlite" />,
+    );
+    // 3 nodes total: root + "SCAN employee" + "USING INDEX idx_dept"
+    expect(getByText("3")).toBeTruthy();
+    expect(getByText("nodes")).toBeTruthy();
+    expect(queryByText("execution")).toBeNull();
+    expect(queryByText("cost")).toBeNull();
+  });
+
+  test("resyncs the active tab when the mounted instance's plan kind changes", () => {
+    // BottomPanel keeps one VisualExplain mounted across query-tab/connection switches,
+    // so the SAME instance can flip from a postgres plan to a tree plan without unmounting.
+    const { rerender, getByText, queryByText } = render(<VisualExplain plan={samplePlan} query="SELECT 1" />);
+    // postgres kind defaults to the insights tab
+    expect(queryByText("Performance Issues")).not.toBeNull();
+
+    rerender(<VisualExplain plan={TREE_INPUT} query="SELECT 1" databaseType="sqlite" />);
+
+    // insights is unavailable for tree plans and the tree content must actually be
+    // visible — a stale "insights" activeTab would leave a blank content panel.
+    expect(queryByText("insights")).toBeNull();
+    expect(getByText("SCAN employee")).toBeTruthy();
+    expect(getByText("USING INDEX idx_dept")).toBeTruthy();
+  });
+
+  test("renders estimate badges for estimate-only metrics", () => {
+    const estimateTree = {
+      kind: "tree" as const,
+      root: {
+        label: "Query Plan",
+        children: [{ label: "SCAN employee", metrics: { estRows: 1200, estCost: 7 }, children: [] }],
+      },
+      raw: [],
+    };
+    const { getByText, queryByText } = render(<VisualExplain plan={estimateTree} />);
+    expect(getByText("~1.2K rows")).toBeTruthy();
+    expect(getByText("cost 7")).toBeTruthy();
+    // no fabricated actuals for an estimate-only node
+    expect(queryByText(/0 rows/)).toBeNull();
+  });
+
+  test("parent tree rows are keyboard-accessible; leaf rows are non-interactive", () => {
+    const { getByText, queryByText } = render(
+      <VisualExplain plan={TREE_INPUT} query="SELECT 1" databaseType="sqlite" />,
+    );
+
+    // "SCAN employee" has a child, so its row must be a focusable button
+    const parentRow = getByText("SCAN employee").closest('[role="button"]') as HTMLElement | null;
+    expect(parentRow).not.toBeNull();
+    expect(parentRow!.getAttribute("tabindex")).toBe("0");
+    expect(parentRow!.getAttribute("aria-expanded")).toBe("true");
+
+    // Enter collapses the children
+    parentRow!.focus();
+    fireEvent.keyDown(parentRow!, { key: "Enter" });
+    expect(queryByText("USING INDEX idx_dept")).toBeNull();
+    expect(parentRow!.getAttribute("aria-expanded")).toBe("false");
+
+    // Space expands them again
+    fireEvent.keyDown(parentRow!, { key: " " });
+    expect(queryByText("USING INDEX idx_dept")).not.toBeNull();
+
+    // any other key does nothing
+    fireEvent.keyDown(parentRow!, { key: "a" });
+    expect(queryByText("USING INDEX idx_dept")).not.toBeNull();
+
+    // the leaf row (no children) is a plain non-interactive div
+    const leafRow = getByText("USING INDEX idx_dept").parentElement!.parentElement!;
+    expect(leafRow.getAttribute("role")).toBeNull();
+    expect(leafRow.getAttribute("tabindex")).toBeNull();
+    expect(leafRow.className).not.toContain("cursor-pointer");
+  });
+
+  test("AI tab clears the previous plan's analysis when the plan changes", async () => {
+    const user = userEvent.setup();
+    globalThis.fetch = mockFetchStream("## Old Analysis\nPostgres plan details.") as unknown as typeof fetch;
+    const abortSpy = spyOn(AbortController.prototype, "abort");
+
+    try {
+      const { queryByText, rerender } = render(
+        <VisualExplain plan={samplePlan} query="SELECT * FROM users" databaseType="postgres" />,
+      );
+      fireEvent.click(queryByText("AI Explain")!);
+      await user.click(queryByText("Analyze with AI")!);
+      await waitFor(() => {
+        expect(queryByText("Old Analysis")).not.toBeNull();
+      });
+
+      // same mounted instance switches plans while the AI tab stays active
+      rerender(<VisualExplain plan={TREE_INPUT} query="SELECT 1" databaseType="sqlite" />);
+
+      await waitFor(() => {
+        // the previous plan's response is gone and the tab is back to its initial state
+        expect(queryByText("Old Analysis")).toBeNull();
+        expect(queryByText("AI Query Analysis")).not.toBeNull();
+        // the previous request's controller was aborted
+        expect(abortSpy).toHaveBeenCalled();
+      });
+    } finally {
+      abortSpy.mockRestore();
+    }
+  });
+
+  test("tagged postgres-json input with an empty plan falls back to the empty state", () => {
+    const { getByText } = render(<VisualExplain plan={{ kind: "postgres-json", plan: [] }} />);
+    expect(getByText("No execution plan")).toBeTruthy();
+  });
+});

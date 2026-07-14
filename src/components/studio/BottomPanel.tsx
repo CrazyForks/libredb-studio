@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useMemo } from "react";
 import type { DatabaseConnection, QueryTab, TableSchema, QueryResult } from "@/lib/types";
 import type { ProviderMetadata } from "@/hooks/use-provider-metadata";
 import type { MaskingConfig } from "@/lib/data-masking";
@@ -10,11 +10,12 @@ import { NL2SQLPanel } from "@/components/NL2SQLPanel";
 import { AIAutopilotPanel } from "@/components/AIAutopilotPanel";
 import { PivotTable } from "@/components/PivotTable";
 import { DatabaseDocs } from "@/components/DatabaseDocs";
-import { VisualExplain, type ExplainPlanResult } from "@/components/VisualExplain";
+import { VisualExplain } from "@/components/VisualExplain";
 import { QueryHistory } from "@/components/QueryHistory";
 import { SavedQueries } from "@/components/SavedQueries";
 import { DataCharts } from "@/components/DataCharts";
 import { SchemaDiff } from "@/components/SchemaDiff";
+import { resolveExplainPlan } from "@/lib/explain";
 import { cn } from "@/lib/utils";
 import {
   BarChart3,
@@ -159,6 +160,8 @@ export function BottomPanel({
   isLoadingMore,
   onExportResults,
 }: BottomPanelProps) {
+  const explainInput = useMemo(() => resolveExplainPlan(currentTab.explainPlan), [currentTab.explainPlan]);
+
   const tabs: { key: BottomPanelMode; label: string; icon: React.ReactNode; activeClass: string }[] = [
     {
       key: "results",
@@ -237,6 +240,7 @@ export function BottomPanel({
           {visibleTabs.map((tab) => (
             <button
               key={tab.key}
+              data-testid={tab.key === "explain" ? "bottom-panel-tab-explain" : undefined}
               onClick={() => {
                 onSetMode(tab.key);
                 if (tab.key === "nl2sql") onSetIsNL2SQLOpen(true);
@@ -344,7 +348,7 @@ export function BottomPanel({
           <ChartDashboardLazy result={currentTab.result} />
         ) : mode === "explain" ? (
           <VisualExplain
-            plan={currentTab.explainPlan as ExplainPlanResult[] | null | undefined}
+            plan={explainInput}
             query={currentTab.query}
             schemaContext={schemaContext}
             databaseType={activeConnection?.type}
