@@ -44,6 +44,15 @@ fi
 CHANNEL=$1
 ARTIFACT=${2:-}
 
+# Resolve a file artifact to an absolute path against the CALLER's cwd before
+# cd'ing to the repo root: channel functions cd into private work dirs (the
+# rpm extract subshell), where a relative path silently stops resolving - the
+# 0.9.55 release run failed exactly there (rpm2cpio: No such file or
+# directory). Docker image references are not files and pass through as-is.
+if [ -n "$ARTIFACT" ] && [ -f "$ARTIFACT" ]; then
+  ARTIFACT=$(cd "$(dirname "$ARTIFACT")" && pwd)/$(basename "$ARTIFACT")
+fi
+
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT_DIR"
 
