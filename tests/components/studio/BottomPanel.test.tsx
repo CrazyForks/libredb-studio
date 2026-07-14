@@ -238,7 +238,9 @@ describe("BottomPanel", () => {
   });
 
   test("renders tab buttons for all modes", () => {
-    const props = createDefaultProps();
+    const props = createDefaultProps({
+      metadata: { capabilities: { explainFormat: "postgres-json", supportsExplain: true } },
+    });
     const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
 
     const expectedLabels = [
@@ -258,6 +260,20 @@ describe("BottomPanel", () => {
       const btn = getByText(label);
       expect(btn).not.toBeNull();
     }
+  });
+
+  test("Explain tab is hidden when provider metadata lacks explainFormat", () => {
+    const props = createDefaultProps(); // metadata: null
+    const { queryByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+    expect(queryByText("Explain")).toBeNull();
+  });
+
+  test("Explain tab is visible when provider declares explainFormat", () => {
+    const props = createDefaultProps({
+      metadata: { capabilities: { explainFormat: "postgres-json", supportsExplain: true } },
+    });
+    const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+    expect(getByText("Explain")).not.toBeNull();
   });
 
   test('Results tab is active by default when mode="results"', () => {
@@ -368,16 +384,17 @@ describe("BottomPanel", () => {
     expect(queryByTestId("schemadiff")).not.toBeNull();
   });
 
-  test('Explain tab renders VisualExplain when mode="explain" and result exists', () => {
+  test('Explain tab renders VisualExplain when mode="explain" even with result=null (real explain-run shape)', () => {
     const props = createDefaultProps({
       mode: "explain",
       currentTab: {
         id: "tab-1",
         name: "Q",
         query: "SELECT 1",
-        result: { rows: [{ id: 1 }], fields: ["id"], rowCount: 1, executionTime: 10 },
+        result: null, // executeQuery(isExplain=true) always nulls result (bug B1 regression guard)
         isExecuting: false,
         type: "sql" as const,
+        explainPlan: [{ Plan: { "Node Type": "Seq Scan" } }],
       },
     });
     const { queryByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);

@@ -477,6 +477,57 @@ describe("useQueryExecution", () => {
     expect(result.current.bottomPanelMode).toBe("saved");
   });
 
+  // ── bottomPanelMode resets when the connection loses explain support ───────
+  // useProviderMetadata creates a fresh metadata object per fetch and never
+  // refetches for the same connection id — reference change IS the
+  // connection-switch signal this effect relies on.
+
+  test("bottomPanelMode resets from explain when metadata loses explain support", async () => {
+    mockGlobalFetch({});
+    const params = createDefaultParams();
+    const unsupported = {
+      ...mockMetadata,
+      capabilities: { ...mockMetadata.capabilities, supportsExplain: false, explainFormat: undefined },
+    };
+
+    const { result, rerender } = renderHook(({ metadata }) => useQueryExecution({ ...params, metadata }), {
+      initialProps: { metadata: mockMetadata as ProviderMetadata },
+    });
+
+    act(() => {
+      result.current.setBottomPanelMode("explain");
+    });
+    expect(result.current.bottomPanelMode).toBe("explain");
+
+    rerender({ metadata: unsupported });
+
+    await waitFor(() => expect(result.current.bottomPanelMode).toBe("results"));
+  });
+
+  test("bottomPanelMode resets from explain when metadata lacks explainFormat even if supportsExplain is true", async () => {
+    mockGlobalFetch({});
+    const params = createDefaultParams();
+    // Divergent state (reachable via custom metadata in embedded mode): the tab
+    // filter and getExplainStrategy key on explainFormat, so the reset must too.
+    const noFormat = {
+      ...mockMetadata,
+      capabilities: { ...mockMetadata.capabilities, supportsExplain: true, explainFormat: undefined },
+    };
+
+    const { result, rerender } = renderHook(({ metadata }) => useQueryExecution({ ...params, metadata }), {
+      initialProps: { metadata: mockMetadata as ProviderMetadata },
+    });
+
+    act(() => {
+      result.current.setBottomPanelMode("explain");
+    });
+    expect(result.current.bottomPanelMode).toBe("explain");
+
+    rerender({ metadata: noFormat });
+
+    await waitFor(() => expect(result.current.bottomPanelMode).toBe("results"));
+  });
+
   // ── executeQuery sets explain panel mode for explain queries ────────────────
 
   test("executeQuery sets explain panel mode for explain queries", async () => {

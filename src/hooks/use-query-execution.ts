@@ -70,6 +70,15 @@ export function useQueryExecution({
     | "dashboard"
   >("results");
 
+  // Capability honesty: if the active provider has no explainFormat (e.g. the
+  // user switched connections), never leave the panel stuck on a hidden tab.
+  // Keyed on explainFormat to match the BottomPanel tab filter and getExplainStrategy.
+  useEffect(() => {
+    if (bottomPanelMode === "explain" && metadata && !metadata.capabilities.explainFormat) {
+      setBottomPanelMode("results");
+    }
+  }, [bottomPanelMode, metadata]);
+
   const { toast } = useToast();
 
   // Unified executeQuery — handles both normal and force (skipSafety) execution
