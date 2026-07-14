@@ -85,14 +85,13 @@ export function CreateTableModal({ isOpen, onClose, onTableCreated }: CreateTabl
   };
 
   const handleCreate = async () => {
-    if (!tableName.trim()) {
-      toast.error("Table name is required");
-      return;
-    }
-
-    const emptyCols = columns.filter((c) => !c.name.trim());
-    if (emptyCols.length > 0) {
-      toast.error("All columns must have a name");
+    // The name check is unreachable via the UI (the input sanitizes whitespace
+    // to "_" and the button disables on empty); kept for imperative callers.
+    const nameError = tableName.trim() ? "" : "Table name is required";
+    const columnError = columns.some((c) => !c.name.trim()) ? "All columns must have a name" : "";
+    const validationError = nameError || columnError;
+    if (validationError) {
+      toast.error(validationError);
       return;
     }
 
