@@ -309,7 +309,10 @@ channel_rpm() {
   # still validates the rpm's content and boot path.
   log rpm "extracting $(basename "$pkg") and booting from the tree"
   mkdir -p "$WORK/root"
-  (cd "$WORK/root" && rpm2cpio "$pkg" | cpio -idm --quiet)
+  # nfpm rpms store absolute member paths (/usr/lib/...); GNU cpio would
+  # extract those to the real filesystem root - strip the leading slash so
+  # everything lands under the work tree (0.9.55 release incident, take 2).
+  (cd "$WORK/root" && rpm2cpio "$pkg" | cpio -idm --no-absolute-filenames --quiet)
   run_extracted_linux_tree rpm "$WORK/root" "$port"
   record rpm PASS
   cleanup
