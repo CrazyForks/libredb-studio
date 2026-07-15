@@ -69,7 +69,13 @@ export function resolveSQLiteDriverName(): SQLiteDriverName {
 }
 
 async function loadBunDriver(): Promise<SQLiteConstructor> {
-  const sqlite = await import("bun:sqlite");
+  // The ignore comments keep the bundler's hands off this import: Turbopack
+  // would otherwise emit an externals chunk FILE named after the specifier
+  // ("[externals]_bun:sqlite_<hash>._.js"), and the colon makes that name
+  // unwritable on NTFS - the win32 standalone build fails (issue #114).
+  // At runtime nothing changes: Bun resolves its builtin natively, and this
+  // branch is only ever taken under the Bun runtime.
+  const sqlite = await import(/* turbopackIgnore: true */ /* webpackIgnore: true */ "bun:sqlite");
   return sqlite.Database as unknown as SQLiteConstructor;
 }
 
