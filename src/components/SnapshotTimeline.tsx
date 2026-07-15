@@ -16,8 +16,10 @@ interface SnapshotTimelineProps {
 // multi-line JSX text and attribute tails are otherwise unattributable.
 const EMPTY_MESSAGE = "No snapshots taken yet. Take a snapshot to start tracking schema changes.";
 const NODE_CLASS = "relative flex flex-col items-center min-w-[100px] cursor-pointer group";
+// w-6 h-6 keeps a 24x24 minimum hit target: the control sits on top of the
+// stretched selection overlay, so a near miss must not select the snapshot.
 const DELETE_BUTTON_CLASS =
-  "absolute -top-2 -right-1 p-0.5 text-zinc-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity";
+  "absolute -top-3 -right-2 z-20 w-6 h-6 flex items-center justify-center text-zinc-600 hover:text-red-400 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100 transition-opacity";
 
 export function SnapshotTimeline({ snapshots, onCompare, onDelete }: SnapshotTimelineProps) {
   const [selected, setSelected] = useState<string[]>([]);
@@ -69,37 +71,29 @@ export function SnapshotTimeline({ snapshots, onCompare, onDelete }: SnapshotTim
             e.stopPropagation();
             onDelete(snapshot.id);
           };
-          const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-            // Ignore keydown bubbling from the nested delete button so its
-            // native Enter/Space activation is not hijacked into selection.
-            if (e.target !== e.currentTarget) return;
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              handleClick(snapshot.id);
-            }
-          };
 
           return (
-            <div
-              key={snapshot.id}
-              className={NODE_CLASS}
-              role="button"
-              tabIndex={0}
-              onClick={() => handleClick(snapshot.id)}
-              onKeyDown={handleKeyDown}
-            >
+            <div key={snapshot.id} className={NODE_CLASS}>
               <div
                 className={cn(
                   "w-3.5 h-3.5 rounded-full border-2 z-10 transition-all",
                   isSelected
                     ? "bg-blue-500 border-blue-400 scale-125"
-                    : "bg-[#0d0d0d] border-white/20 hover:border-white/40",
+                    : "bg-[#0d0d0d] border-white/20 group-hover:border-white/40",
                 )}
               />
 
               {idx < sorted.length - 1 && <div className="absolute top-[7px] left-[50%] w-full h-[2px] bg-white/10" />}
 
-              <div className={labelClass}>
+              {/* Stretched-link pattern: the button's ::after overlay makes the
+                  whole node clickable. after:z-10 lifts it above the z-10 dot
+                  flex item; the z-20 delete button stays on top. */}
+              <button
+                type="button"
+                aria-pressed={isSelected}
+                onClick={() => handleClick(snapshot.id)}
+                className={cn(labelClass, "cursor-pointer after:absolute after:inset-0 after:z-10")}
+              >
                 <div className="text-xs font-medium truncate max-w-[90px]">
                   {snapshot.label || snapshot.connectionName}
                 </div>
@@ -109,9 +103,13 @@ export function SnapshotTimeline({ snapshots, onCompare, onDelete }: SnapshotTim
                 <Badge variant="secondary" className="text-[0.625rem] mt-1">
                   {snapshot.schema.length} tables
                 </Badge>
-              </div>
+              </button>
 
-              <button onClick={handleDelete} className={DELETE_BUTTON_CLASS}>
+              <button
+                onClick={handleDelete}
+                aria-label={`Delete ${snapshot.label || snapshot.connectionName}`}
+                className={DELETE_BUTTON_CLASS}
+              >
                 <Trash2 strokeWidth={1.5} className="w-2.5 h-2.5" />
               </button>
             </div>

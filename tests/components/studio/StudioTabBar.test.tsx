@@ -97,9 +97,8 @@ describe("StudioTabBar", () => {
   test("click on tab fires onSetActiveTabId with tab id", () => {
     const onSetActiveTabId = mock(() => {});
     const props = createDefaultProps({ onSetActiveTabId });
-    const { container } = render(<StudioTabBar {...props} />);
-    const tabElements = container.querySelectorAll('[class*="border-t-2"]');
-    fireEvent.click(tabElements[1]!);
+    const { getAllByRole } = render(<StudioTabBar {...props} />);
+    fireEvent.click(getAllByRole("tab")[1]);
     expect(onSetActiveTabId).toHaveBeenCalledTimes(1);
     expect(onSetActiveTabId).toHaveBeenCalledWith("tab-2");
   });
@@ -109,11 +108,8 @@ describe("StudioTabBar", () => {
   test("plus button fires onAddTab", () => {
     const onAddTab = mock(() => {});
     const props = createDefaultProps({ onAddTab });
-    const { container } = render(<StudioTabBar {...props} />);
-    const svgElements = container.querySelectorAll("svg");
-    const plusIcon = Array.from(svgElements).find((el) => el.getAttribute("class")?.includes("cursor-pointer"));
-    expect(plusIcon).not.toBeNull();
-    fireEvent.click(plusIcon!);
+    const { getByRole } = render(<StudioTabBar {...props} />);
+    fireEvent.click(getByRole("button", { name: "New tab" }));
     expect(onAddTab).toHaveBeenCalledTimes(1);
   });
 
@@ -122,19 +118,18 @@ describe("StudioTabBar", () => {
   test("close button fires onCloseTab when multiple tabs", () => {
     const onCloseTab = mock(() => {});
     const props = createDefaultProps({ onCloseTab });
-    const { container } = render(<StudioTabBar {...props} />);
-    const closeIcons = container.querySelectorAll('svg[class*="ml-auto"]');
-    expect(closeIcons.length).toBeGreaterThan(0);
-    fireEvent.click(closeIcons[0]);
+    const { getAllByRole } = render(<StudioTabBar {...props} />);
+    const closeButtons = getAllByRole("button", { name: /^Close / });
+    expect(closeButtons.length).toBeGreaterThan(0);
+    fireEvent.click(closeButtons[0]);
     expect(onCloseTab).toHaveBeenCalledTimes(1);
   });
 
   test("close button hidden when only one tab", () => {
     const singleTab = createTab({ id: "tab-1", name: "Query 1" });
     const props = createDefaultProps({ tabs: [singleTab], activeTabId: "tab-1" });
-    const { container } = render(<StudioTabBar {...props} />);
-    const closeIcons = container.querySelectorAll('svg[class*="ml-auto"]');
-    expect(closeIcons.length).toBe(0);
+    const { queryAllByRole } = render(<StudioTabBar {...props} />);
+    expect(queryAllByRole("button", { name: /^Close / }).length).toBe(0);
   });
 
   // ── Double-click → rename mode ────────────────────────────────────────
@@ -143,9 +138,8 @@ describe("StudioTabBar", () => {
     const onSetEditingTabId = mock(() => {});
     const onSetEditingTabName = mock(() => {});
     const props = createDefaultProps({ onSetEditingTabId, onSetEditingTabName });
-    const { container } = render(<StudioTabBar {...props} />);
-    const tabElements = container.querySelectorAll('[class*="border-t-2"]');
-    fireEvent.doubleClick(tabElements[0]!);
+    const { getAllByRole } = render(<StudioTabBar {...props} />);
+    fireEvent.doubleClick(getAllByRole("tab")[0]);
     expect(onSetEditingTabId).toHaveBeenCalledTimes(1);
     expect(onSetEditingTabId).toHaveBeenCalledWith("tab-1");
     expect(onSetEditingTabName).toHaveBeenCalledTimes(1);
@@ -328,5 +322,98 @@ describe("StudioTabBar", () => {
     expect(capturedFn).not.toBeNull();
     const result = capturedFn!([tab1]);
     expect(result[0].name).toBe("Blur Name");
+  });
+
+  // ── A11y semantics (#100) ─────────────────────────────────────────────
+
+  describe("a11y semantics", () => {
+    test("tabs expose the tab role with aria-selected state", () => {
+      const props = createDefaultProps({ activeTabId: "tab-1" });
+      const { getAllByRole } = render(<StudioTabBar {...props} />);
+      const tabs = getAllByRole("tab");
+      expect(tabs.length).toBe(2);
+      expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+      expect(tabs[1].getAttribute("aria-selected")).toBe("false");
+    });
+
+    test("tablist uses a roving tabindex: only the active tab is in tab order", () => {
+      const props = createDefaultProps({ activeTabId: "tab-1" });
+      const { getAllByRole } = render(<StudioTabBar {...props} />);
+      const tabs = getAllByRole("tab");
+      expect(tabs[0].getAttribute("tabindex")).toBe("0");
+      expect(tabs[1].getAttribute("tabindex")).toBe("-1");
+    });
+
+    test("arrow keys, Home and End move activation between tabs", () => {
+      const onSetActiveTabId = mock(() => {});
+      const props = createDefaultProps({ activeTabId: "tab-1", onSetActiveTabId });
+      const { getAllByRole } = render(<StudioTabBar {...props} />);
+      const tabs = getAllByRole("tab");
+      fireEvent.keyDown(tabs[0], { key: "ArrowRight" });
+      expect(onSetActiveTabId).toHaveBeenCalledWith("tab-2");
+      fireEvent.keyDown(tabs[1], { key: "ArrowLeft" });
+      expect(onSetActiveTabId).toHaveBeenCalledWith("tab-1");
+      fireEvent.keyDown(tabs[0], { key: "End" });
+      expect(onSetActiveTabId).toHaveBeenCalledWith("tab-2");
+      fireEvent.keyDown(tabs[1], { key: "Home" });
+      expect(onSetActiveTabId).toHaveBeenCalledWith("tab-1");
+    });
+
+    test("the tab accessible name is not contaminated by nested controls", () => {
+      const props = createDefaultProps();
+      const { getAllByRole } = render(<StudioTabBar {...props} />);
+      // Exact accessible-name match: fails if the close button's label leaks in
+      expect(getAllByRole("tab", { name: "Query 1" }).length).toBe(1);
+      expect(getAllByRole("tab", { name: "Query 2" }).length).toBe(1);
+      // The close control must not be a descendant of the tab element
+      const tab = getAllByRole("tab", { name: "Query 2" })[0];
+      expect(tab.querySelector("button")).toBeNull();
+    });
+
+    test("close buttons carry the tab name and stay visible on keyboard focus", () => {
+      const onCloseTab = mock(() => {});
+      const props = createDefaultProps({ onCloseTab });
+      const { getByRole } = render(<StudioTabBar {...props} />);
+      const close = getByRole("button", { name: "Close Query 2" });
+      expect(close.className).toContain("focus-visible:opacity-100");
+      fireEvent.click(close);
+      expect(onCloseTab).toHaveBeenCalledTimes(1);
+    });
+
+    test("rename input carries an accessible name identifying the tab", () => {
+      const props = createDefaultProps({ editingTabId: "tab-1", editingTabName: "Query 1" });
+      const { getByLabelText } = render(<StudioTabBar {...props} />);
+      expect(getByLabelText("Rename Query 1")).not.toBeNull();
+    });
+
+    test("tab buttons fill the wrapper height so the whole visible tab is clickable", () => {
+      const props = createDefaultProps();
+      const { getAllByRole } = render(<StudioTabBar {...props} />);
+      for (const tab of getAllByRole("tab")) {
+        expect(tab.className).toContain("h-full");
+      }
+    });
+
+    test("committing a rename with Enter restores focus to the tab", async () => {
+      const props = createDefaultProps({ editingTabId: "tab-1", editingTabName: "Renamed" });
+      const { getByLabelText, rerender } = render(<StudioTabBar {...props} />);
+      fireEvent.keyDown(getByLabelText("Rename Query 1"), { key: "Enter" });
+      // The parent clears editing state in response; simulate that re-render
+      rerender(<StudioTabBar {...createDefaultProps({ activeTabId: "tab-1" })} />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(document.activeElement?.getAttribute("data-tab-id")).toBe("tab-1");
+    });
+
+    test("closing a tab moves focus back to the selected tab", async () => {
+      const onCloseTab = mock(() => {});
+      const props = createDefaultProps({ activeTabId: "tab-1", onCloseTab });
+      const { getByRole, rerender } = render(<StudioTabBar {...props} />);
+      fireEvent.click(getByRole("button", { name: "Close Query 2" }));
+      // The parent removes the tab in response; simulate that re-render
+      const tab1 = createTab({ id: "tab-1", name: "Query 1" });
+      rerender(<StudioTabBar {...createDefaultProps({ tabs: [tab1], activeTabId: "tab-1", onCloseTab })} />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(document.activeElement?.getAttribute("data-tab-id")).toBe("tab-1");
+    });
   });
 });

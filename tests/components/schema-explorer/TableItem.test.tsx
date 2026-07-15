@@ -468,4 +468,33 @@ describe("TableItem", () => {
     expect(queryAllByText("Analyze Table").length).toBe(0);
     expect(queryAllByText("Vacuum Table").length).toBe(0);
   });
+
+  // ── A11y semantics (#100) ─────────────────────────────────────────────────
+
+  describe("a11y semantics", () => {
+    test("expand toggle is a button named after the table with aria-expanded", () => {
+      const onToggle = mock(() => {});
+      const { getByRole } = render(<TableItem table={largeTable} isExpanded={false} onToggle={onToggle} isAdmin />);
+      const toggle = getByRole("button", { name: "users" });
+      expect(toggle.getAttribute("aria-expanded")).toBe("false");
+      fireEvent.click(toggle);
+      expect(onToggle).toHaveBeenCalledTimes(1);
+    });
+
+    test("expanded state is reflected on the toggle button", () => {
+      const { getByRole } = render(
+        <TableItem table={largeTable} isExpanded={true} onToggle={mock(() => {})} isAdmin />,
+      );
+      expect(getByRole("button", { name: "users" }).getAttribute("aria-expanded")).toBe("true");
+    });
+
+    test("the toggle button owns the row's vertical padding (full-height hit target)", () => {
+      const { getByRole } = render(
+        <TableItem table={largeTable} isExpanded={false} onToggle={mock(() => {})} isAdmin />,
+      );
+      const toggle = getByRole("button", { name: "users" });
+      expect(toggle.className).toContain("py-1.5");
+      expect(toggle.parentElement?.className).not.toContain("py-1.5");
+    });
+  });
 });
