@@ -78,12 +78,6 @@ Env vars are documented with examples in [`.env.example`](.env.example). Non-obv
 
 Connections are typed by `type`; per-provider fields, query formats, and behaviours are in [`docs/providers/<type-id>.md`](docs/providers/) and [`docs/API_DOCS.md`](docs/API_DOCS.md).
 
-```typescript
-const sql   = { type: 'postgres', host: 'localhost', port: 5432, database: 'mydb', user: 'admin', password: 'secret' }; // also mysql | sqlite | oracle | mssql
-const mongo = { type: 'mongodb', connectionString: 'mongodb://localhost:27017/mydb' }; // query is JSON: { collection, operation, filter, options }
-const redis = { type: 'redis', host: 'localhost', port: 6379, database: '0' };         // query: 'HGETALL user:1' or { command, args }
-```
-
 Redis maps onto the SQL-oriented provider interface by convention: `getSchema()` uses a non-blocking `SCAN` (never `KEYS *`), grouping key prefixes as "tables"; health/metrics from `INFO`; slow queries / sessions from `SLOWLOG GET` / `CLIENT LIST`. See [`docs/providers/redis.md`](docs/providers/redis.md).
 
 ## Docker & Helm
