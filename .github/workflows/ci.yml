@@ -325,6 +325,9 @@ jobs:
             exit 0
           fi
           make -C operator bundle
+          # intent-to-add: without it, git diff ignores files the bundle
+          # generation CREATED (the exact drift this gate exists to catch).
+          git add --intent-to-add operator/
           if ! git diff -I '^ *createdAt:' --exit-code operator/; then
             echo "::error::operator/bundle or operator/config is stale. Run 'make -C operator bundle' and commit the result."
             exit 1

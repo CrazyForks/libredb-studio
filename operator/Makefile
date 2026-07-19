@@ -88,6 +88,7 @@ run: helm-operator helm-dep ## Run against the configured Kubernetes cluster in 
 
 .PHONY: helm-dep
 helm-dep: ## Vendor the embedded chart's declared dependencies (charts/*.tgz is gitignored).
+	helm repo add bitnami https://charts.bitnami.com/bitnami --force-update
 	helm dependency build helm-charts/libredb-studio
 
 .PHONY: docker-build

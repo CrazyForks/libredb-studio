@@ -147,5 +147,20 @@ rules:
   - patch
   - update
   - watch
+# (postgresql.metrics.serviceMonitor / prometheusRule flags; rules for CRDs
+# that may not exist on the cluster are harmless)
+- apiGroups:
+  - monitoring.coreos.com
+  resources:
+  - servicemonitors
+  - prometheusrules
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 
 # +kubebuilder:scaffold:rules
