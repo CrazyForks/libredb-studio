@@ -4,6 +4,12 @@ name: Operator Image Release
 # The image wraps the published Helm chart via the operator-sdk helm plugin.
 # It must be public: the community-operators CI installs it on a real cluster
 # and has no credentials for a private registry.
+#
+# ONE-TIME MANUAL STEP: the very first push creates the GHCR package as
+# PRIVATE. After the first successful release, make it public once:
+# github.com/orgs/libredb/packages -> libredb-studio-operator ->
+# Package settings -> Change visibility -> Public.
+# Community catalog submissions FAIL while the image is private.
 
 on:
   release:
@@ -33,6 +39,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Verify operator embedded chart is in sync
+        run: |
+          if ! diff -r --exclude=charts charts/libredb-studio operator/helm-charts/libredb-studio; then
+            echo "::error::operator/helm-charts/libredb-studio is out of sync with charts/libredb-studio. The operator image would ship a stale chart. Refresh it with: rm -rf operator/helm-charts/libredb-studio && cp -R charts/libredb-studio operator/helm-charts/libredb-studio"
+            exit 1
+          fi
 
       - name: Resolve version (no v prefix)
         id: version

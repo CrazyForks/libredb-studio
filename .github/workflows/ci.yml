@@ -302,6 +302,13 @@ jobs:
         with:
           version: v3.16.0
 
+      - name: Verify operator embedded chart is in sync
+        run: |
+          if ! diff -r --exclude=charts charts/libredb-studio operator/helm-charts/libredb-studio; then
+            echo "::error::operator/helm-charts/libredb-studio is out of sync with charts/libredb-studio. Refresh it with: rm -rf operator/helm-charts/libredb-studio && cp -R charts/libredb-studio operator/helm-charts/libredb-studio"
+            exit 1
+          fi
+
       - name: Add Bitnami repo
         run: helm repo add bitnami https://charts.bitnami.com/bitnami
 
