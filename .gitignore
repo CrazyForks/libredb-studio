@@ -29,6 +29,7 @@
 # production
 /build
 dist
+dist-rel/
 
 # misc
 .DS_Store
@@ -139,3 +140,6 @@ docs/summaries/
 # DO marketplace scripts fetched at build time (see deploy/digitalocean/README.md)
 deploy/digitalocean/droplet/scripts/90-cleanup.sh
 deploy/digitalocean/droplet/scripts/99-img-check.sh
+
+
+
