@@ -84,7 +84,7 @@ jobs:
         run: |
           PKG=$(node -p "require('./package.json').version")
           if [ "$VERSION" != "$PKG" ]; then
-            echo "Version '$VERSION' does not match package.json '$PKG' at the checked-out ref - dispatch with --ref refs/tags/v$VERSION (or the matching commit) instead" >&2
+            echo "Version '$VERSION' does not match package.json '$PKG' at the checked-out ref - dispatch with --ref refs/tags/$VERSION (or the matching commit) instead" >&2
             exit 1
           fi
 
