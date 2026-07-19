@@ -1,14 +1,40 @@
+apiVersion: v2
+name: libredb-studio
+description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, and Redis
+type: application
+version: 0.1.19
+appVersion: "0.9.59"
+kubeVersion: ">=1.26.0-0"
+home: https://github.com/libredb/libredb-studio
+icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+sources:
+  - https://github.com/libredb/libredb-studio
+keywords:
+  - sql
+  - ide
+  - database
+  - postgresql
+  - mysql
+  - mongodb
+  - redis
+  - sqlite
+  - oracle
+  - mssql
+  - web-ide
+maintainers:
+  - name: cevheri
+    url: https://github.com/cevheri
 annotations:
   artifacthub.io/category: database
-  artifacthub.io/changes: |
-    - Track app release 0.9.44 (appVersion bump; default image tag follows)
+  artifacthub.io/license: MIT
+  artifacthub.io/prerelease: "false"
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.9.44
+      image: ghcr.io/libredb/libredb-studio:0.9.59
       platforms:
         - linux/amd64
-  artifacthub.io/license: MIT
+        - linux/arm64
   artifacthub.io/links: |
     - name: Documentation
       url: https://github.com/libredb/libredb-studio#readme
@@ -16,36 +42,13 @@ annotations:
       url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
     - name: Source
       url: https://github.com/libredb/libredb-studio
-  artifacthub.io/prerelease: "true"
-apiVersion: v2
-appVersion: 0.9.44
+  artifacthub.io/changes: |
+    - "Expand values.schema.json coverage (serviceAccount, pod/container security contexts, imagePullSecrets, tolerations, affinity, topologySpreadConstraints, networkPolicy, service/persistence annotations, ingress hosts/tls, persistence accessModes, extraEnv/extraEnvFrom, podDisruptionBudget.maxUnavailable)"
+    - "Machine-enforce the documented jwtSecret length in values.schema.json - empty (zero-config) or at least 32 characters"
+    - "PodDisruptionBudget - an explicit minAvailable 0 now renders; minAvailable/maxUnavailable are mutually exclusive and exactly one is required when the PDB is enabled"
+    - "Autoscaling - the HPA is no longer rendered when the effective storage provider is sqlite (single-writer); the deployment falls back to replicaCount and the install notes warn"
 dependencies:
-- condition: postgresql.enabled
-  name: postgresql
-  repository: https://charts.bitnami.com/bitnami
-  version: 16.x.x
-description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
-  SQLite, Oracle, SQL Server, MongoDB, and Redis
-home: https://github.com/libredb/libredb-studio
-icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
-keywords:
-- sql
-- ide
-- database
-- postgresql
-- mysql
-- mongodb
-- redis
-- sqlite
-- oracle
-- mssql
-- web-ide
-kubeVersion: '>=1.26.0-0'
-maintainers:
-- name: cevheri
-  url: https://github.com/cevheri
-name: libredb-studio
-sources:
-- https://github.com/libredb/libredb-studio
-type: application
-version: 0.1.3
+  - name: postgresql
+    version: "16.x.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled

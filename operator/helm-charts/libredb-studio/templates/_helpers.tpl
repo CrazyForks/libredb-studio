@@ -100,6 +100,21 @@ Returns "true" if persistence.enabled OR storageProvider is sqlite.
 {{- end }}
 
 {{/*
+Determine if strict auth mode is active (config.authBootstrap disables the
+app's zero-config first run). values.schema.json accepts "", "on", "off" and
+the app's isBootstrapEnabled() synonyms ("true"/"false"/"1"/"0",
+case-insensitive, optionally whitespace-wrapped); this helper mirrors the
+same off-synonyms so any accepted spelling - or an install that bypasses
+schema validation (helm --skip-schema-validation) - stays strict in both the
+chart and the app instead of splitting into a half-strict state.
+*/}}
+{{- define "libredb-studio.authStrict" -}}
+{{- if has (.Values.config.authBootstrap | toString | trim | lower) (list "off" "false" "0") }}
+{{- true }}
+{{- end }}
+{{- end }}
+
+{{/*
 Return the effective storage provider.
 If postgresql subchart is enabled and storageProvider is "local", auto-switch to "postgres".
 */}}
@@ -108,6 +123,19 @@ If postgresql subchart is enabled and storageProvider is "local", auto-switch to
 {{- "postgres" }}
 {{- else }}
 {{- .Values.config.storageProvider }}
+{{- end }}
+{{- end }}
+
+{{/*
+Determine if autoscaling is effectively enabled. SQLite storage is
+single-writer, so a multi-replica HPA would corrupt the shared database
+file: autoscaling.enabled is ignored (the HPA is not rendered and the
+deployment falls back to replicaCount) when the effective storage provider
+is sqlite. NOTES.txt warns when this happens.
+*/}}
+{{- define "libredb-studio.autoscalingEnabled" -}}
+{{- if and .Values.autoscaling.enabled (ne (include "libredb-studio.storageProvider" .) "sqlite") }}
+{{- true }}
 {{- end }}
 {{- end }}
 
