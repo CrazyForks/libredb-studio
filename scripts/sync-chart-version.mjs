@@ -57,7 +57,9 @@ export function operatorCopyViolations(root) {
     return []; // no operator tree at all: pre-operator checkout or test fixture
   }
   if (!fs.existsSync(dstDir)) {
-    return [`${OPERATOR_CHART_DIR}: missing while ${path.dirname(dstDir)} exists - run 'bun run chart:bump' to recreate it`];
+    return [
+      `${OPERATOR_CHART_DIR}: missing while ${path.dirname(dstDir)} exists - run 'bun run chart:bump' to recreate it`,
+    ];
   }
   const violations = [];
   const srcFiles = listChartFiles(srcDir);
