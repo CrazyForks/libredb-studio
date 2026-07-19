@@ -324,6 +324,26 @@ channels:
       url: https://raw.githubusercontent.com/kubero-dev/kubero/main/services/libredb-studio/app.yaml
       extract: 'ghcr\.io/libredb/libredb-studio\s+tag:\s*(\d+\.\d+\.\d+)'
 
+  - id: operatorhub-community
+    name: OperatorHub / OpenShift community operator catalogs
+    status: pending
+    tier: 3
+    kind: operator-catalog
+    update:
+      method: upstream_pr
+      sla: every_release
+    links:
+      tracking_issue: https://github.com/libredb/libredb-studio/issues/152
+      first_pr: https://github.com/libredb/libredb-studio/pull/156
+      upstream_repo: https://github.com/redhat-openshift-ecosystem/community-operators-prod
+      docs: docs/DISTRIBUTION.md
+    pin:
+      strategy: local_file
+      files:
+        - operator/bundle/manifests/libredb-studio-operator.clusterserviceversion.yaml
+      extract: 'libredb-studio-operator:(\d+\.\d+\.\d+)'
+      note: Catalog submissions (k8s-operatorhub + community-operators-prod) start after the operator PR lands; the committed bundle is the source for both.
+
   # ---- Tier 4: partner and curated catalogs (not self-serve) --------------
 
   - id: rancher-partner
