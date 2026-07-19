@@ -119,5 +119,33 @@ rules:
   - patch
   - update
   - watch
+# The bundled PostgreSQL subchart can render these behind its own flags
+# (passwordUpdateJob -> Job, backup -> CronJob, rbac.create -> Role/RoleBinding)
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  - cronjobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - roles
+  - rolebindings
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 
 # +kubebuilder:scaffold:rules

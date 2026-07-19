@@ -83,7 +83,7 @@ help: ## Display this help.
 ##@ Build
 
 .PHONY: run
-run: helm-operator ## Run against the configured Kubernetes cluster in ~/.kube/config
+run: helm-operator helm-dep ## Run against the configured Kubernetes cluster in ~/.kube/config
 	$(HELM_OPERATOR) run
 
 .PHONY: helm-dep
@@ -106,7 +106,7 @@ docker-push: ## Push docker image with the manager.
 # To properly provided solutions that supports more than one platform you should use this option.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
 .PHONY: docker-buildx
-docker-buildx: ## Build and push docker image for the manager for cross-platform support
+docker-buildx: helm-dep ## Build and push docker image for the manager for cross-platform support
 	- $(CONTAINER_TOOL) buildx create --name project-v3-builder
 	$(CONTAINER_TOOL) buildx use project-v3-builder
 	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile .

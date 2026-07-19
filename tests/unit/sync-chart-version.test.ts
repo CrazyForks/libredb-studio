@@ -608,4 +608,14 @@ describe("operator embedded chart copy (PR #156)", () => {
   test("refreshOperatorCopy is a no-op without an operator tree", () => {
     expect(refreshOperatorCopy(makeRoot({ withOperator: false }))).toBe(false);
   });
+
+  test("a deleted copy under an existing operator tree is a violation, and bump recreates it", () => {
+    const root = makeRoot();
+    rmSync(join(root, "operator/helm-charts/libredb-studio"), { recursive: true });
+    const violations = operatorCopyViolations(root);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("missing while");
+    expect(refreshOperatorCopy(root)).toBe(true);
+    expect(operatorCopyViolations(root)).toEqual([]);
+  });
 });

@@ -21,7 +21,7 @@ metadata:
       ]
     capabilities: Basic Install
     categories: Database, Developer Tools
-    createdAt: "2026-07-19T13:57:32Z"
+    createdAt: "2026-07-19T17:57:03Z"
     operators.operatorframework.io/builder: operator-sdk-v1.42.3
     operators.operatorframework.io/project_layout: helm.sdk.operatorframework.io/v1
     repository: https://github.com/libredb/libredb-studio
@@ -163,6 +163,32 @@ spec:
           - policy
           resources:
           - poddisruptionbudgets
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
+          - batch
+          resources:
+          - jobs
+          - cronjobs
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
+          - rbac.authorization.k8s.io
+          resources:
+          - roles
+          - rolebindings
           verbs:
           - create
           - delete
