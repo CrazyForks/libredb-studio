@@ -3,7 +3,10 @@
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
 # - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-VERSION ?= 0.9.59
+# Derived from package.json — the repo's single source of truth for the app
+# version (kept honest by scripts/sync-chart-version.mjs, issue #138).
+# Override explicitly when building a historical version: make bundle VERSION=x.y.z
+VERSION ?= $(shell node -p "require('../package.json').version")
 
 # CHANNELS define the bundle channels used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
@@ -83,8 +86,12 @@ help: ## Display this help.
 run: helm-operator ## Run against the configured Kubernetes cluster in ~/.kube/config
 	$(HELM_OPERATOR) run
 
+.PHONY: helm-dep
+helm-dep: ## Vendor the embedded chart's declared dependencies (charts/*.tgz is gitignored).
+	helm dependency build helm-charts/libredb-studio
+
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
+docker-build: helm-dep ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build -t ${IMG} .
 
 .PHONY: docker-push

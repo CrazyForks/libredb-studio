@@ -60,24 +60,52 @@ jobs:
             VERSION="${RELEASE_TAG#v}"
           fi
           if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+            if [ "$EVENT_NAME" = "release" ]; then
+              # Helm chart releases publish tags like libredb-studio-0.1.19,
+              # which also emit 'release: published'. They are not operator
+              # versions - skip quietly instead of failing every chart release.
+              echo "Tag '$RELEASE_TAG' is not an app semver - skipping operator build"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "Version '$VERSION' is not a valid semver (no v prefix) - refusing to tag" >&2
             exit 1
           fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare image name (lowercase)
+        if: steps.version.outputs.skip != 'true'
         id: image
         run: |
           NAME=$(printf '%s' "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Helm
+        if: steps.version.outputs.skip != 'true'
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.16.0
+
+      - name: Vendor embedded chart dependencies
+        # charts/*.tgz is gitignored; without this the image ships the chart
+        # with its declared postgresql dependency missing, and helm silently
+        # installs without the subchart when postgresql.enabled=true.
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm dependency build operator/helm-charts/libredb-studio
+
       - name: Set up QEMU
+        if: steps.version.outputs.skip != 'true'
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
 
       - name: Set up Docker Buildx
+        if: steps.version.outputs.skip != 'true'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry
+        if: steps.version.outputs.skip != 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -85,6 +113,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push operator image
+        if: steps.version.outputs.skip != 'true'
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: operator
