@@ -7,7 +7,7 @@
  * hermetic local git fixtures for the base-comparison paths - no network.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,9 +15,12 @@ import {
   bumpPatch,
   checkChangesAnnotation,
   checkSync,
+  listChartFiles,
+  operatorCopyViolations,
   parseChart,
   parseImageTag,
   parseReadmeVersion,
+  refreshOperatorCopy,
   tagQueryNeeded,
 } from "../../scripts/sync-chart-version.mjs";
 
@@ -538,5 +541,71 @@ describe("CLI (--check against git fixtures, #151)", () => {
     const result = runCheck(root, { CHART_SYNC_STRICT: "1" });
     expect(result.exitCode).toBe(1);
     expect(result.stderr.toString()).toContain("could not query origin tags");
+  });
+});
+
+describe("operator embedded chart copy (PR #156)", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+
+  function makeRoot({ withOperator = true, drift = false }: { withOperator?: boolean; drift?: boolean } = {}): string {
+    const root = mkdtempSync(join(tmpdir(), "opchart-"));
+    roots.push(root);
+    const src = join(root, "charts/libredb-studio");
+    mkdirSync(join(src, "templates"), { recursive: true });
+    mkdirSync(join(src, "charts"), { recursive: true });
+    writeFileSync(join(src, "Chart.yaml"), "version: 0.1.19\n");
+    writeFileSync(join(src, "templates/deployment.yaml"), "kind: Deployment\n");
+    writeFileSync(join(src, "charts/postgresql-16.7.27.tgz"), "vendored");
+    if (withOperator) {
+      const dst = join(root, "operator/helm-charts/libredb-studio");
+      mkdirSync(join(dst, "templates"), { recursive: true });
+      writeFileSync(join(dst, "Chart.yaml"), drift ? "version: 0.1.3\n" : "version: 0.1.19\n");
+      writeFileSync(join(dst, "templates/deployment.yaml"), "kind: Deployment\n");
+    }
+    return root;
+  }
+
+  test("listChartFiles skips the vendored charts dir", () => {
+    const root = makeRoot();
+    expect(listChartFiles(join(root, "charts/libredb-studio"))).toEqual(["Chart.yaml", "templates/deployment.yaml"]);
+  });
+
+  test("identical copies produce no violations", () => {
+    expect(operatorCopyViolations(makeRoot())).toEqual([]);
+  });
+
+  test("missing operator tree is silently skipped", () => {
+    expect(operatorCopyViolations(makeRoot({ withOperator: false }))).toEqual([]);
+  });
+
+  test("content drift is reported per file", () => {
+    const violations = operatorCopyViolations(makeRoot({ drift: true }));
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("Chart.yaml: differs from charts/libredb-studio/Chart.yaml");
+  });
+
+  test("missing and extra files are both reported", () => {
+    const root = makeRoot();
+    rmSync(join(root, "operator/helm-charts/libredb-studio/templates/deployment.yaml"));
+    writeFileSync(join(root, "operator/helm-charts/libredb-studio/extra.yaml"), "x\n");
+    const violations = operatorCopyViolations(root);
+    expect(violations).toHaveLength(2);
+    expect(violations[0]).toContain("templates/deployment.yaml: missing from the operator copy");
+    expect(violations[1]).toContain("extra.yaml: not present in charts/libredb-studio");
+  });
+
+  test("refreshOperatorCopy rebuilds a drifted copy without the vendored charts dir", () => {
+    const root = makeRoot({ drift: true });
+    expect(refreshOperatorCopy(root)).toBe(true);
+    expect(operatorCopyViolations(root)).toEqual([]);
+    expect(existsSync(join(root, "operator/helm-charts/libredb-studio/charts"))).toBe(false);
+    expect(refreshOperatorCopy(root)).toBe(false); // second run: nothing to do
+  });
+
+  test("refreshOperatorCopy is a no-op without an operator tree", () => {
+    expect(refreshOperatorCopy(makeRoot({ withOperator: false }))).toBe(false);
   });
 });

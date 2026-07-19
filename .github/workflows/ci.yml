@@ -302,13 +302,6 @@ jobs:
         with:
           version: v3.16.0
 
-      - name: Verify operator embedded chart is in sync
-        run: |
-          if ! diff -r --exclude=charts charts/libredb-studio operator/helm-charts/libredb-studio; then
-            echo "::error::operator/helm-charts/libredb-studio is out of sync with charts/libredb-studio. Refresh it with: rm -rf operator/helm-charts/libredb-studio && cp -R charts/libredb-studio operator/helm-charts/libredb-studio"
-            exit 1
-          fi
-
       - name: Add Bitnami repo
         run: helm repo add bitnami https://charts.bitnami.com/bitnami
 
@@ -317,6 +310,25 @@ jobs:
 
       - name: Lint Helm chart
         run: helm lint charts/libredb-studio --strict
+
+      # The operator embeds a copy of the chart (checked by the required
+      # chart:check gate) and commits the OLM bundle generated from
+      # operator/config. This step catches bundle drift: config edited without
+      # re-running 'make bundle'. -I ignores the volatile createdAt stamp.
+      # Skipped when the PR does not touch operator/ (the tool download is
+      # not worth it on unrelated PRs).
+      - name: Verify operator bundle is up to date
+        run: |
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          if [ "${{ github.event_name }}" = "pull_request" ] && git diff --quiet origin/main...HEAD -- operator/; then
+            echo "operator/ unchanged - skipping bundle freshness check"
+            exit 0
+          fi
+          make -C operator bundle
+          if ! git diff -I '^ *createdAt:' --exit-code operator/; then
+            echo "::error::operator/bundle or operator/config is stale. Run 'make -C operator bundle' and commit the result."
+            exit 1
+          fi
 
   sonarcloud:
     name: SonarCloud Analysis
