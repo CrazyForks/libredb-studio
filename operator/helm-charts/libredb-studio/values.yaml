@@ -1,3 +1,20 @@
+global:
+  security:
+    # -- Required by the Bitnami common library because the postgresql
+    # subchart image is redirected to docker.io/bitnamilegacy (see
+    # postgresql.image below); without it the render fails with "Original
+    # containers have been substituted for unrecognized ones". Ignored by
+    # this chart's own templates and harmless when the subchart is disabled.
+    allowInsecureImages: true
+  compatibility:
+    openshift:
+      # -- OpenShift restricted-v2 SCC compatibility: "auto" drops the chart's
+      # fixed runAsUser/runAsGroup/fsGroup (letting the SCC assign range-valid
+      # IDs) when the API server is OpenShift, "force" always drops them,
+      # "disabled" never does. The Bitnami postgresql subchart honours the
+      # same value.
+      adaptSecurityContext: auto
+
 # -- Number of replicas. Note: SQLite storage mode only supports 1 replica.
 replicaCount: 1
 
@@ -250,6 +267,24 @@ podDisruptionBudget:
 postgresql:
   # -- Deploy a PostgreSQL instance for storage backend
   enabled: false
+  # Broadcom's August 2025 Bitnami catalog freeze removed the version-pinned
+  # postgresql images from docker.io/bitnami (the chart-pinned tag now 404s);
+  # they live on unchanged under docker.io/bitnamilegacy, which receives no
+  # further updates. This override keeps the subchart installable. For
+  # production, prefer an external database (secrets.storagePostgresUrl) or a
+  # dedicated operator such as CloudNativePG.
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/postgresql
+  # The subchart's optional helper images moved to bitnamilegacy the same way.
+  volumePermissions:
+    image:
+      registry: docker.io
+      repository: bitnamilegacy/os-shell
+  metrics:
+    image:
+      registry: docker.io
+      repository: bitnamilegacy/postgres-exporter
   auth:
     # -- PostgreSQL username
     username: "libredb"

@@ -40,7 +40,7 @@ helm install libredb libredb/libredb-studio \
 
 ```bash
 helm install libredb oci://ghcr.io/libredb/charts/libredb-studio \
-  --version 0.1.19 \
+  --version 0.1.20 \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
   --set secrets.adminPassword=MyAdmin123
 ```
@@ -79,6 +79,12 @@ helm install libredb libredb/libredb-studio \
 ```
 
 Storage provider is automatically set to `postgres` when the subchart is enabled.
+
+> **Note:** after Broadcom's August 2025 Bitnami catalog freeze the subchart's
+> pinned image is pulled from `docker.io/bitnamilegacy/postgresql`, which is
+> frozen and receives no further security updates. For production, prefer an
+> external database (below) or a dedicated operator such as
+> [CloudNativePG](https://cloudnative-pg.io/).
 
 ### PostgreSQL (external)
 
@@ -228,5 +234,18 @@ helm uninstall libredb
 | `podDisruptionBudget.maxUnavailable` | Max unavailable pods (unset minAvailable with `null` to use) | unset |
 | `networkPolicy.enabled` | Enable NetworkPolicy | `false` |
 | `postgresql.enabled` | Deploy PostgreSQL subchart | `false` |
+| `global.compatibility.openshift.adaptSecurityContext` | Drop fixed UID/GID fields for the OpenShift SCC: `auto`, `force`, or `disabled` | `auto` |
 
 See [values.yaml](values.yaml) for the complete list of configurable parameters.
+
+## OpenShift
+
+OpenShift's `restricted-v2` SCC assigns `runAsUser`/`fsGroup` from a
+per-namespace range and rejects pods that hard-code IDs outside it. With the
+default `global.compatibility.openshift.adaptSecurityContext: auto`, the chart
+detects OpenShift (via the `security.openshift.io/v1` API group) and omits its
+fixed `runAsUser`/`runAsGroup`/`fsGroup` so the SCC can assign valid IDs;
+`runAsNonRoot` and the seccomp profile are kept. The image supports arbitrary
+UIDs: every writable path is a volume mount. Set `force` to always adapt (for
+example when templating manifests offline for an OpenShift cluster) or
+`disabled` to keep the fixed IDs everywhere.

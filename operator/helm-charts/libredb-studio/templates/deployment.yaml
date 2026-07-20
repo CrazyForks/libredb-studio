@@ -6,6 +6,14 @@ the Service). Refuse the combination instead of shipping it broken.
 {{- if and (not (include "libredb-studio.authStrict" .)) (not .Values.secrets.jwtSecret) (not .Values.secrets.existingSecret) (or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1)) }}
 {{- fail "zero-config bootstrap generates a per-pod JWT secret, which breaks sessions across replicas: with replicaCount > 1 or autoscaling.enabled, set secrets.jwtSecret (or secrets.existingSecret), or use config.authBootstrap=off" }}
 {{- end }}
+{{- /*
+The seed ConfigMap is only rendered from inline config; with neither an
+inline config nor an existing ConfigMap the pod would mount a ConfigMap
+that does not exist and never start. Refuse the combination instead.
+*/}}
+{{- if and .Values.seedConnections.enabled (not .Values.seedConnections.config) (not .Values.seedConnections.existingConfigMap) }}
+{{- fail "seedConnections.enabled requires either seedConnections.config (inline) or seedConnections.existingConfigMap - with neither, the pod would mount a ConfigMap that does not exist" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,7 +47,7 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "libredb-studio.serviceAccountName" . }}
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- include "libredb-studio.podSecurityContext" . | nindent 8 }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:

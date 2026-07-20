@@ -64,6 +64,16 @@ securityContext:
 - `/tmp` — emptyDir; temporary files
 - `/app/data` — data directory (`auth-bootstrap.json`, sample database): emptyDir by default, the PVC when persistence is enabled
 
+**OpenShift adaptation**: OpenShift's `restricted-v2` SCC assigns
+`runAsUser`/`fsGroup` from a per-namespace range and rejects pods that
+hard-code IDs outside it. `global.compatibility.openshift.adaptSecurityContext`
+(default `auto`; same contract as the Bitnami subchart, so one value covers
+both) makes the `libredb-studio.podSecurityContext` helper omit
+`runAsUser`/`runAsGroup`/`fsGroup` when the API server exposes
+`security.openshift.io/v1`, keeping `runAsNonRoot` and the seccomp profile.
+Arbitrary UIDs are safe because every writable path is a volume mount and the
+entrypoint execs directly when not running as root.
+
 ### 2. Dockerfile Alignment
 
 The chart is tightly coupled to the Dockerfile:

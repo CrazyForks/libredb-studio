@@ -140,6 +140,37 @@ is sqlite. NOTES.txt warns when this happens.
 {{- end }}
 
 {{/*
+Whether the chart's fixed UID/GID fields must be dropped for OpenShift.
+OpenShift's restricted-v2 SCC assigns runAsUser/fsGroup from a per-namespace
+range, so a pod that hard-codes IDs outside that range is rejected at
+admission. Controlled by global.compatibility.openshift.adaptSecurityContext
+(the same contract the Bitnami postgresql subchart honours, so one value
+adapts both charts): "auto" adapts when the API server exposes
+security.openshift.io/v1, "force" always adapts, "disabled" never does.
+*/}}
+{{- define "libredb-studio.adaptOpenShiftSecurityContext" -}}
+{{- $mode := dig "compatibility" "openshift" "adaptSecurityContext" "auto" (.Values.global | default dict) }}
+{{- if or (eq $mode "force") (and (eq $mode "auto") (.Capabilities.APIVersions.Has "security.openshift.io/v1")) }}
+{{- true }}
+{{- end }}
+{{- end }}
+
+{{/*
+Pod security context with OpenShift adaptation applied: the fixed
+runAsUser/runAsGroup/fsGroup are omitted so the SCC can inject range-valid
+IDs (runAsNonRoot and seccompProfile are kept). The app image supports
+arbitrary UIDs: all writable paths are volume mounts and the entrypoint
+execs directly when not running as root.
+*/}}
+{{- define "libredb-studio.podSecurityContext" -}}
+{{- $psc := .Values.podSecurityContext }}
+{{- if include "libredb-studio.adaptOpenShiftSecurityContext" . }}
+{{- $psc = omit $psc "runAsUser" "runAsGroup" "fsGroup" }}
+{{- end }}
+{{- toYaml $psc }}
+{{- end }}
+
+{{/*
 Return the full image reference (repository:tag)
 */}}
 {{- define "libredb-studio.image" -}}

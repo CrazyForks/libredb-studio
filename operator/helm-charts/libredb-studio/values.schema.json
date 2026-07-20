@@ -2,6 +2,36 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
   "properties": {
+    "global": {
+      "type": "object",
+      "description": "Values shared with subcharts",
+      "properties": {
+        "security": {
+          "type": "object",
+          "properties": {
+            "allowInsecureImages": {
+              "type": "boolean",
+              "description": "Bitnami common library escape hatch, required for the bitnamilegacy postgresql image redirect"
+            }
+          }
+        },
+        "compatibility": {
+          "type": "object",
+          "properties": {
+            "openshift": {
+              "type": "object",
+              "properties": {
+                "adaptSecurityContext": {
+                  "type": "string",
+                  "enum": ["auto", "force", "disabled"],
+                  "description": "Drop fixed runAsUser/runAsGroup/fsGroup for OpenShift SCC compatibility: auto (detect), force, or disabled"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
@@ -403,6 +433,49 @@
         "enabled": {
           "type": "boolean",
           "description": "Deploy PostgreSQL subchart"
+        },
+        "image": {
+          "type": "object",
+          "properties": {
+            "registry": {
+              "type": "string",
+              "description": "PostgreSQL image registry"
+            },
+            "repository": {
+              "type": "string",
+              "description": "PostgreSQL image repository (bitnamilegacy after the Bitnami catalog freeze)"
+            }
+          }
+        },
+        "volumePermissions": {
+          "type": "object",
+          "properties": {
+            "image": {
+              "type": "object",
+              "properties": {
+                "registry": { "type": "string" },
+                "repository": {
+                  "type": "string",
+                  "description": "volumePermissions helper image repository (bitnamilegacy after the Bitnami catalog freeze)"
+                }
+              }
+            }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "image": {
+              "type": "object",
+              "properties": {
+                "registry": { "type": "string" },
+                "repository": {
+                  "type": "string",
+                  "description": "postgres-exporter image repository (bitnamilegacy after the Bitnami catalog freeze)"
+                }
+              }
+            }
+          }
         }
       }
     },
