@@ -1,0 +1,138 @@
+name: Operator Image Release
+
+# Builds and pushes the OpenShift operator (controller) image to GHCR.
+# The image wraps the published Helm chart via the operator-sdk helm plugin.
+# It must be public: the community-operators CI installs it on a real cluster
+# and has no credentials for a private registry.
+#
+# ONE-TIME MANUAL STEP: the very first push creates the GHCR package as
+# PRIVATE. After the first successful release, make it public once:
+# github.com/orgs/libredb/packages -> libredb-studio-operator ->
+# Package settings -> Change visibility -> Public.
+# Community catalog submissions FAIL while the image is private.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Operator version tag (e.g. 0.9.44 - no v prefix)"
+        required: true
+        type: string
+
+concurrency:
+  group: operator-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/libredb-studio-operator
+
+jobs:
+  build-and-push:
+    name: Build and Push Operator Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Verify operator embedded chart is in sync
+        run: |
+          if ! diff -r --exclude=charts charts/libredb-studio operator/helm-charts/libredb-studio; then
+            echo "::error::operator/helm-charts/libredb-studio is out of sync with charts/libredb-studio. The operator image would ship a stale chart. Refresh it with: rm -rf operator/helm-charts/libredb-studio && cp -R charts/libredb-studio operator/helm-charts/libredb-studio"
+            exit 1
+          fi
+
+      - name: Resolve version (no v prefix)
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${RELEASE_TAG#v}"
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+            if [ "$EVENT_NAME" = "release" ]; then
+              # Helm chart releases publish tags like libredb-studio-0.1.19,
+              # which also emit 'release: published'. They are not operator
+              # versions - skip quietly instead of failing every chart release.
+              echo "Tag '$RELEASE_TAG' is not an app semver - skipping operator build"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Version '$VERSION' is not a valid semver (no v prefix) - refusing to tag" >&2
+            exit 1
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Guard version against the checked-out ref
+        # A manual dispatch (typo'd or historical version) or a manually
+        # published release whose tag points at a commit with a different
+        # package.json would otherwise stamp mismatched content with an
+        # immutable tag. Run the guard for every non-skipped event; the
+        # checked-out ref carries the authoritative package.json version.
+        if: steps.version.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$VERSION" != "$PKG" ]; then
+            echo "Version '$VERSION' does not match package.json '$PKG' at the checked-out ref - run this workflow from refs/tags/$VERSION (or the matching commit) instead" >&2
+            exit 1
+          fi
+
+      - name: Prepare image name (lowercase)
+        if: steps.version.outputs.skip != 'true'
+        id: image
+        run: |
+          NAME=$(printf '%s' "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Helm
+        if: steps.version.outputs.skip != 'true'
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.16.0
+
+      - name: Vendor embedded chart dependencies
+        # charts/*.tgz is gitignored; without this the image ships the chart
+        # with its declared postgresql dependency missing, and helm silently
+        # installs without the subchart when postgresql.enabled=true.
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm dependency build operator/helm-charts/libredb-studio
+
+      - name: Set up QEMU
+        if: steps.version.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - name: Set up Docker Buildx
+        if: steps.version.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.version.outputs.skip != 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push operator image
+        if: steps.version.outputs.skip != 'true'
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: operator
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ steps.version.outputs.version }}
+          platforms: linux/amd64,linux/arm64

@@ -18,6 +18,84 @@ import { fileURLToPath } from "node:url";
 
 const CHART_YAML = "charts/libredb-studio/Chart.yaml";
 const CHART_README = "charts/libredb-studio/README.md";
+const SOURCE_CHART_DIR = "charts/libredb-studio";
+const OPERATOR_CHART_DIR = "operator/helm-charts/libredb-studio";
+
+/**
+ * The OpenShift operator embeds a verbatim copy of the chart (its docker build
+ * context is operator/, which cannot reach charts/). The copy must track the
+ * source exactly or the operator image ships a stale chart. The vendored
+ * dependency dir (charts/, gitignored *.tgz) is excluded: it is rebuilt by
+ * `helm dependency build` at image-build time, not committed.
+ *
+ * Walks dir recursively, returns sorted repo-style relative paths.
+ */
+export function listChartFiles(dir, prefix = "") {
+  const entries = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (prefix === "" && entry.name === "charts") {
+      continue; // vendored dependencies, rebuilt at image-build time
+    }
+    const rel = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      entries.push(...listChartFiles(path.join(dir, entry.name), rel));
+    } else {
+      entries.push(rel);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Returns violation messages (empty = copies identical). Skips silently when
+ * the operator tree does not exist (pre-operator checkouts, test fixtures).
+ */
+export function operatorCopyViolations(root) {
+  const srcDir = path.join(root, SOURCE_CHART_DIR);
+  const dstDir = path.join(root, OPERATOR_CHART_DIR);
+  const operatorRoot = path.join(root, "operator");
+  if (!fs.existsSync(operatorRoot)) {
+    return []; // no operator tree at all: pre-operator checkout or test fixture
+  }
+  if (!fs.existsSync(dstDir)) {
+    return [`${OPERATOR_CHART_DIR}: missing while ${operatorRoot} exists - run 'bun run chart:bump' to recreate it`];
+  }
+  const violations = [];
+  const srcFiles = listChartFiles(srcDir);
+  const dstFiles = listChartFiles(dstDir);
+  for (const file of srcFiles.filter((f) => !dstFiles.includes(f))) {
+    violations.push(`${OPERATOR_CHART_DIR}/${file}: missing from the operator copy`);
+  }
+  for (const file of dstFiles.filter((f) => !srcFiles.includes(f))) {
+    violations.push(`${OPERATOR_CHART_DIR}/${file}: not present in ${SOURCE_CHART_DIR}`);
+  }
+  for (const file of srcFiles.filter((f) => dstFiles.includes(f))) {
+    if (!fs.readFileSync(path.join(srcDir, file)).equals(fs.readFileSync(path.join(dstDir, file)))) {
+      violations.push(`${OPERATOR_CHART_DIR}/${file}: differs from ${SOURCE_CHART_DIR}/${file}`);
+    }
+  }
+  return violations;
+}
+
+/**
+ * Refreshes the operator copy from the source chart. Returns true when the
+ * copy changed (or was created), false when there was nothing to do.
+ */
+export function refreshOperatorCopy(root) {
+  const dstDir = path.join(root, OPERATOR_CHART_DIR);
+  if (!fs.existsSync(path.join(root, "operator"))) {
+    return false; // no operator tree in this checkout
+  }
+  if (operatorCopyViolations(root).length === 0) {
+    return false;
+  }
+  fs.rmSync(dstDir, { recursive: true, force: true });
+  fs.cpSync(path.join(root, SOURCE_CHART_DIR), dstDir, { recursive: true });
+  // The vendored dependency dir only holds gitignored *.tgz files; it is
+  // rebuilt by `helm dependency build` at image-build time, never committed.
+  fs.rmSync(path.join(dstDir, "charts"), { recursive: true, force: true });
+  return true;
+}
 
 export function parseChart(chartYaml) {
   const version = chartYaml.match(/^version:\s*(\S+)\s*$/m)?.[1];
@@ -287,6 +365,7 @@ function main(argv) {
       }
     }
     const violations = checkSync({ pkgVersion, chartYaml, readme, baseChart, chartTagExists });
+    violations.push(...operatorCopyViolations(root));
     if (violations.length > 0) {
       for (const violation of violations) console.error(`ERROR: ${violation}`);
       console.error("\nFix: run 'bun run chart:bump', review the diff, and commit it in this PR.");
@@ -300,13 +379,21 @@ function main(argv) {
   }
 
   const result = applyBump({ pkgVersion, chartYaml, readme });
-  if (!result.changed) {
+  if (result.changed) {
+    fs.writeFileSync(chartPath, result.chartYaml);
+    fs.writeFileSync(readmePath, result.readme);
+  }
+  const copyRefreshed = refreshOperatorCopy(root);
+  if (!result.changed && !copyRefreshed) {
     console.log(`OK: already in sync (chart ${result.version} / appVersion ${result.appVersion}) - nothing to write`);
     return;
   }
-  fs.writeFileSync(chartPath, result.chartYaml);
-  fs.writeFileSync(readmePath, result.readme);
-  console.log(`Bumped chart to ${result.version} / appVersion ${result.appVersion} - review the diff and commit.`);
+  if (copyRefreshed) {
+    console.log(`Refreshed ${OPERATOR_CHART_DIR} from ${SOURCE_CHART_DIR}.`);
+  }
+  if (result.changed) {
+    console.log(`Bumped chart to ${result.version} / appVersion ${result.appVersion} - review the diff and commit.`);
+  }
 }
 
 // CLI entry only when executed directly (the unit test imports this module).

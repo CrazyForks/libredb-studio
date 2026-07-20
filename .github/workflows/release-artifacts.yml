@@ -769,7 +769,12 @@ jobs:
           gh workflow run npm-publish.yml --ref "refs/tags/$TAG"
           gh workflow run docker-build-push.yml --ref "refs/tags/$TAG" \
             -f "version=$TAG" -f "publish_latest=true"
-          echo "Dispatched npm-publish and docker-build-push for '$TAG'."
+          # The operator image wraps the chart at the tagged commit; its
+          # release trigger never fires for GITHUB_TOKEN-published releases,
+          # so it joins the same explicit chain.
+          gh workflow run operator-release.yml --ref "refs/tags/$TAG" \
+            -f "version=$TAG"
+          echo "Dispatched npm-publish, docker-build-push and operator-release for '$TAG'."
 
   chocolatey:
     name: Push Chocolatey package

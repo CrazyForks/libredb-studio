@@ -1,0 +1,13 @@
+name: "LibreDB CodeQL config"
+
+# These operator subtrees are operator-sdk generated scaffold plus a vendored
+# copy of the published Helm chart (a codeless helm-operator: no first-party
+# source). The chart is published and scanned on its own, so scanning the
+# embedded copy only re-flags its placeholder defaults (e.g. the disabled
+# PostgreSQL subchart's empty password). The exclusions are scoped to the
+# generated/vendored subtrees on purpose: any future hand-written code under
+# operator/ stays scanned by default.
+paths-ignore:
+  - "operator/helm-charts/**"
+  - "operator/config/**"
+  - "operator/bundle/**"

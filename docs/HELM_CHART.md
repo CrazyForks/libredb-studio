@@ -64,6 +64,16 @@ securityContext:
 - `/tmp` — emptyDir; temporary files
 - `/app/data` — data directory (`auth-bootstrap.json`, sample database): emptyDir by default, the PVC when persistence is enabled
 
+**OpenShift adaptation**: OpenShift's `restricted-v2` SCC assigns
+`runAsUser`/`fsGroup` from a per-namespace range and rejects pods that
+hard-code IDs outside it. `global.compatibility.openshift.adaptSecurityContext`
+(default `auto`; same contract as the Bitnami subchart, so one value covers
+both) makes the `libredb-studio.podSecurityContext` helper omit
+`runAsUser`/`runAsGroup`/`fsGroup` when the API server exposes
+`security.openshift.io/v1`, keeping `runAsNonRoot` and the seccomp profile.
+Arbitrary UIDs are safe because every writable path is a volume mount and the
+entrypoint execs directly when not running as root.
+
 ### 2. Dockerfile Alignment
 
 The chart is tightly coupled to the Dockerfile:
@@ -189,7 +199,7 @@ Any change to configuration values triggers a rolling restart automatically.
 
 When `seedConnections.enabled=true`, the chart provisions a set of pre-defined database connections at startup:
 
-- You **must** supply the definitions via **either** inline `seedConnections.config` (rendered into `seed-configmap.yaml`) **or** an `existingConfigMap`. Enabling the feature with neither is a misconfiguration: the Deployment still mounts the `seed-config` volume referencing `<release>-seed-connections`, but that ConfigMap is never rendered and the volume is not marked `optional`, so **the pods fail to start**.
+- You **must** supply the definitions via **either** inline `seedConnections.config` (rendered into `seed-configmap.yaml`) **or** an `existingConfigMap`. Enabling the feature with neither **fails the render** with an explicit message (a template guard in `deployment.yaml`) — previously the Deployment shipped mounting a ConfigMap that was never rendered, and the pods failed at startup instead.
 - The deployment mounts the ConfigMap at `/app/config/<key>`, where `<key>` is `seedConnections.configMapKey` (default `seed-connections.yaml`), and sets `SEED_CONFIG_PATH` to that path (plus `SEED_CACHE_TTL_MS` from `seedConnections.cacheTTL`). These two env vars are set on the Deployment directly, not through the app ConfigMap.
 - Credentials referenced by the seed config resolve from environment/secret at runtime, so secrets stay out of the ConfigMap.
 
