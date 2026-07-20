@@ -53,13 +53,12 @@ export function listChartFiles(dir, prefix = "") {
 export function operatorCopyViolations(root) {
   const srcDir = path.join(root, SOURCE_CHART_DIR);
   const dstDir = path.join(root, OPERATOR_CHART_DIR);
-  if (!fs.existsSync(path.dirname(dstDir))) {
+  const operatorRoot = path.join(root, "operator");
+  if (!fs.existsSync(operatorRoot)) {
     return []; // no operator tree at all: pre-operator checkout or test fixture
   }
   if (!fs.existsSync(dstDir)) {
-    return [
-      `${OPERATOR_CHART_DIR}: missing while ${path.dirname(dstDir)} exists - run 'bun run chart:bump' to recreate it`,
-    ];
+    return [`${OPERATOR_CHART_DIR}: missing while ${operatorRoot} exists - run 'bun run chart:bump' to recreate it`];
   }
   const violations = [];
   const srcFiles = listChartFiles(srcDir);
@@ -84,7 +83,7 @@ export function operatorCopyViolations(root) {
  */
 export function refreshOperatorCopy(root) {
   const dstDir = path.join(root, OPERATOR_CHART_DIR);
-  if (!fs.existsSync(path.dirname(dstDir))) {
+  if (!fs.existsSync(path.join(root, "operator"))) {
     return false; // no operator tree in this checkout
   }
   if (operatorCopyViolations(root).length === 0) {

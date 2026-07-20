@@ -618,4 +618,15 @@ describe("operator embedded chart copy (PR #156)", () => {
     expect(refreshOperatorCopy(root)).toBe(true);
     expect(operatorCopyViolations(root)).toEqual([]);
   });
+
+  test("a deleted operator/helm-charts dir under an existing operator tree is a violation, and bump recreates it", () => {
+    const root = makeRoot();
+    rmSync(join(root, "operator/helm-charts"), { recursive: true });
+    writeFileSync(join(root, "operator/PROJECT"), "projectName: libredb-studio-operator\n");
+    const violations = operatorCopyViolations(root);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("missing while");
+    expect(refreshOperatorCopy(root)).toBe(true);
+    expect(operatorCopyViolations(root)).toEqual([]);
+  });
 });
