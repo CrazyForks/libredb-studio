@@ -4,6 +4,64 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "OpenShift compatibility - global.compatibility.openshift.adaptSecurityContext (auto/force/disabled, default auto) drops the fixed runAsUser/runAsGroup/fsGroup so pods pass the restricted-v2 SCC; the Bitnami postgresql subchart honours the same value"
+        - "PostgreSQL subchart - default image redirected to docker.io/bitnamilegacy/postgresql after the Bitnami catalog freeze removed the pinned tag from docker.io/bitnami; global.security.allowInsecureImages is set accordingly"
+        - "seedConnections.enabled without inline config or an existing ConfigMap now fails the render instead of shipping a Deployment that mounts a ConfigMap that does not exist"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.9.59
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.9.59
+    created: "2026-07-20T07:02:45.388444247Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: 90a84116c04d1d128c7252b07c5956a00c5018497afced9746c3953d082c4ac9
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.20/libredb-studio-0.1.20.tgz
+    version: 0.1.20
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "Expand values.schema.json coverage (serviceAccount, pod/container security contexts, imagePullSecrets, tolerations, affinity, topologySpreadConstraints, networkPolicy, service/persistence annotations, ingress hosts/tls, persistence accessModes, extraEnv/extraEnvFrom, podDisruptionBudget.maxUnavailable)"
         - "Machine-enforce the documented jwtSecret length in values.schema.json - empty (zero-config) or at least 32 characters"
         - "PodDisruptionBudget - an explicit minAvailable 0 now renders; minAvailable/maxUnavailable are mutually exclusive and exactly one is required when the PDB is enabled"
@@ -928,4 +986,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-07-15T22:54:10.961916599Z"
+generated: "2026-07-20T07:02:45.383787116Z"
