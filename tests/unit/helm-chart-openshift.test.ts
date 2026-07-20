@@ -20,7 +20,8 @@
  * `--api-versions security.openshift.io/v1`, which feeds
  * .Capabilities.APIVersions exactly like a live API server would.
  */
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { parseAllDocuments } from "yaml";
 
@@ -146,5 +147,90 @@ describe("charts/libredb-studio seedConnections source guard (#152)", () => {
     ).toBeUndefined();
     const volumes = docs.find((doc) => doc.kind === "Deployment")?.spec?.template?.spec?.volumes ?? [];
     expect(volumes.find((v) => v.name === "seed-config")?.configMap?.name).toBe("my-seeds");
+  });
+});
+
+/**
+ * The subchart-dependent contracts: the same global adapts the bundled
+ * PostgreSQL StatefulSet (the pinned subchart honours
+ * global.compatibility.openshift.adaptSecurityContext), and every subchart
+ * image is redirected to docker.io/bitnamilegacy (the docker.io/bitnami
+ * originals were removed by Broadcom's catalog freeze - a subchart update
+ * that reverts either contract must fail here, not as ImagePullBackOff or
+ * an SCC rejection on a user cluster).
+ *
+ * postgresql.enabled=true renders require the vendored dependency
+ * (charts/postgresql-*.tgz is gitignored), so it is vendored on demand -
+ * fails loudly when that is impossible rather than silently skipping.
+ */
+describe("charts/libredb-studio PostgreSQL subchart contracts (#152)", () => {
+  beforeAll(() => {
+    const vendored =
+      existsSync(join(CHART_DIR, "charts")) &&
+      readdirSync(join(CHART_DIR, "charts")).some((f) => f.startsWith("postgresql-") && f.endsWith(".tgz"));
+    if (vendored) {
+      return;
+    }
+    const repoAdd = Bun.spawnSync(
+      ["helm", "repo", "add", "bitnami", "https://charts.bitnami.com/bitnami", "--force-update"],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const depBuild = Bun.spawnSync(["helm", "dependency", "build", CHART_DIR], { stdout: "pipe", stderr: "pipe" });
+    if (repoAdd.exitCode !== 0 || depBuild.exitCode !== 0) {
+      throw new Error(
+        `could not vendor the postgresql subchart dependency: ${repoAdd.stderr.toString()} ${depBuild.stderr.toString()}`,
+      );
+    }
+  });
+
+  const PG_ARGS = ["--set", "postgresql.enabled=true", "--set", "postgresql.auth.password=test-pg-pass"];
+
+  function statefulSetSource(args: string[]): string {
+    const run = helmTemplate([...PG_ARGS, ...args]);
+    if (run.exitCode !== 0) {
+      throw new Error(`helm template failed (exit ${run.exitCode}): ${run.stderr}`);
+    }
+    const statefulSet = run.stdout
+      .split("---")
+      .find((doc) => doc.includes("kind: StatefulSet") && doc.includes("postgresql"));
+    if (!statefulSet) {
+      throw new Error("postgresql StatefulSet not found in render output");
+    }
+    return statefulSet;
+  }
+
+  test("force drops the subchart's fixed UID/GID fields too", () => {
+    const statefulSet = statefulSetSource(["--set", "global.compatibility.openshift.adaptSecurityContext=force"]);
+    expect(statefulSet).not.toContain("runAsUser:");
+    expect(statefulSet).not.toContain("fsGroup:");
+  });
+
+  test("auto drops the subchart's fixed UID/GID fields when the API server is OpenShift", () => {
+    const statefulSet = statefulSetSource(OPENSHIFT_API);
+    expect(statefulSet).not.toContain("runAsUser:");
+    expect(statefulSet).not.toContain("fsGroup:");
+  });
+
+  test("disabled keeps the subchart's fixed UID/GID fields", () => {
+    const statefulSet = statefulSetSource(["--set", "global.compatibility.openshift.adaptSecurityContext=disabled"]);
+    expect(statefulSet).toContain("runAsUser: 1001");
+    expect(statefulSet).toContain("fsGroup: 1001");
+  });
+
+  test("every subchart image is pulled from bitnamilegacy (none from the frozen bitnami namespace)", () => {
+    const run = helmTemplate([
+      ...PG_ARGS,
+      "--set",
+      "postgresql.volumePermissions.enabled=true",
+      "--set",
+      "postgresql.metrics.enabled=true",
+    ]);
+    expect(run.exitCode).toBe(0);
+    const images = [...run.stdout.matchAll(/image:\s*"?([^"\s]+)"?/g)].map((m) => m[1]);
+    const subchartImages = images.filter((image) => !image.startsWith("ghcr.io/libredb/"));
+    expect(subchartImages.length).toBeGreaterThanOrEqual(3); // postgresql, os-shell, postgres-exporter
+    for (const image of subchartImages) {
+      expect(image).toStartWith("docker.io/bitnamilegacy/");
+    }
   });
 });
