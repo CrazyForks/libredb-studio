@@ -5,6 +5,7 @@ metadata:
     alm-examples: '[]'
     capabilities: Basic Install
     categories: Database, Developer Tools
+    containerImage: ghcr.io/libredb/libredb-studio-operator:0.0.0
     repository: https://github.com/libredb/libredb-studio
     support: LibreDB
   labels:

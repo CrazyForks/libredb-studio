@@ -194,7 +194,18 @@ bundle: kustomize operator-sdk ## Generate bundle manifests and metadata, then v
 	$(OPERATOR_SDK) generate kustomize manifests -q
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
 	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
-	$(OPERATOR_SDK) bundle validate ./bundle
+	# Stamp the versioned controller image into the CSV's containerImage
+	# annotation (required OperatorHub display metadata; the base CSV holds a
+	# 0.0.0 placeholder and no bundle validator flags its absence).
+	# Two-step write instead of sed -i: BSD/macOS sed treats -i's argument as
+	# a backup suffix, which would leak a stray duplicate CSV into bundle/.
+	sed -e 's|containerImage: ghcr.io/libredb/libredb-studio-operator:.*|containerImage: $(IMG)|' \
+		bundle/manifests/libredb-studio-operator.clusterserviceversion.yaml > bundle/manifests/.csv.tmp
+	mv bundle/manifests/.csv.tmp bundle/manifests/libredb-studio-operator.clusterserviceversion.yaml
+	# The operatorframework suite is what the community-operator pipelines run
+	# (operator-pipelines static tests); default validators alone skip the
+	# OperatorHub metadata checks.
+	$(OPERATOR_SDK) bundle validate ./bundle --select-optional suite=operatorframework
 
 .PHONY: bundle-build
 bundle-build: ## Build the bundle image.
