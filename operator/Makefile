@@ -202,6 +202,11 @@ bundle: kustomize operator-sdk ## Generate bundle manifests and metadata, then v
 	sed -e 's|containerImage: ghcr.io/libredb/libredb-studio-operator:.*|containerImage: $(IMG)|' \
 		bundle/manifests/libredb-studio-operator.clusterserviceversion.yaml > bundle/manifests/.csv.tmp
 	mv bundle/manifests/.csv.tmp bundle/manifests/libredb-studio-operator.clusterserviceversion.yaml
+	# sed exits 0 on zero matches and no validator checks containerImage, so
+	# verify the stamp landed - a removed/reformatted base annotation must
+	# fail the build, not ship an unstamped CSV.
+	@grep -q 'containerImage: $(IMG)$$' bundle/manifests/libredb-studio-operator.clusterserviceversion.yaml || \
+		{ echo "ERROR: containerImage stamp failed - restore the containerImage annotation in config/manifests/bases"; exit 1; }
 	# The operatorframework suite is what the community-operator pipelines run
 	# (operator-pipelines static tests); default validators alone skip the
 	# OperatorHub metadata checks.

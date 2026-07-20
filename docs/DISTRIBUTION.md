@@ -748,12 +748,19 @@ until the first post-listing bump and is displayed, not auto-discovered.
 
 ### Manual steps still open
 
-- **Operator first image + visibility**: release 0.9.59 predates
-  `operator-release.yml`, so `ghcr.io/libredb/libredb-studio-operator:0.9.59`
-  must be built once by manual `workflow_dispatch` (version `0.9.59`), and the
-  new GHCR package must be flipped to **public** once (Org -> Packages ->
-  libredb-studio-operator -> Package settings) — community catalog CI cannot
-  pull private images. Both steps gate the first OperatorHub submission (#152).
+- **Operator first image + visibility**: release 0.9.59 predates the
+  operator, so `ghcr.io/libredb/libredb-studio-operator:0.9.59` must be built
+  once by manual `workflow_dispatch` (version `0.9.59`) **from the post-merge
+  `main` commit** — not from `refs/tags/0.9.59`: that tag contains neither
+  `operator/` nor the workflow file (GitHub only dispatches workflows that
+  exist on the chosen ref), while `main` still carries `package.json` 0.9.59,
+  so the workflow's version guard passes and the image wraps the merged
+  operator content. Afterwards the new GHCR package must be flipped to
+  **public** once (Org -> Packages -> libredb-studio-operator -> Package
+  settings) — community catalog CI cannot pull private images. From the next
+  app release on, the tag ref carries the operator and the normal
+  tag-pinned dispatch chain applies. Both steps gate the first OperatorHub
+  submission (#152).
 - **Snap Store listing screenshots**: the description and icon ship with the snap
   (`snap/snapcraft.yaml`, `public/logo.svg`), but screenshots are a manual upload in the
   Snap Store web UI (https://snapcraft.io/libredb-studio/listing). The snap name is registered
