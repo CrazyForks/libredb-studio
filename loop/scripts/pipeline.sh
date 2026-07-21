@@ -7,7 +7,7 @@
 #   BUILD   (loop/PROMPT.md,          until .loop/COMPLETE)
 #
 # Each stage drives loop/scripts/loop.sh with a stage-specific prompt override;
-# loop/config/loop.env stays untouched. Publishing (push / PR / merge) remains
+# .loop/config/loop.env stays untouched. Publishing (push / PR / merge) remains
 # a HUMAN step by design - this script never pushes.
 #
 # Usage: pipeline.sh [TRIAGE_MAX] [BUILD_MAX]
@@ -15,7 +15,7 @@
 #   BUILD_MAX:  max build iterations  (default 20)
 #
 # Exit codes: 0 all stages complete; 1 a stage failed or hit its iteration cap
-# (inspect loop/PROGRESS.md and .loop/logs/); the planning-contract violation
+# (inspect .loop/PROGRESS.md and .loop/logs/); the planning-contract violation
 # (planning created the completion marker) also exits 1.
 # ==============================================================================
 
@@ -26,7 +26,7 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 TRIAGE_MAX="${1:-8}"
 BUILD_MAX="${2:-20}"
-BASE_ENV="${LOOP_ENV_FILE:-$ROOT/loop/config/loop.env}"
+BASE_ENV="${LOOP_ENV_FILE:-$ROOT/.loop/config/loop.env}"
 MARKER="$ROOT/.loop/COMPLETE"
 
 if [ ! -f "$BASE_ENV" ]; then
@@ -70,14 +70,14 @@ stage() {
   case "$expectation" in
     marker)
       if [ "$code" -ne 0 ]; then
-        echo "PIPELINE STOP: $label stage failed (loop.sh exit $code) - inspect loop/PROGRESS.md and .loop/logs/" >&2
+        echo "PIPELINE STOP: $label stage failed (loop.sh exit $code) - inspect .loop/PROGRESS.md and .loop/logs/" >&2
         exit 1
       fi
       rm -f "$MARKER" # consumed; the next stage must earn its own
       ;;
     no-marker)
       if [ "$code" -eq 0 ]; then
-        echo "PIPELINE STOP: $label created the completion marker - planning must never complete a milestone; inspect loop/PROGRESS.md" >&2
+        echo "PIPELINE STOP: $label created the completion marker - planning must never complete a milestone; inspect .loop/PROGRESS.md" >&2
         exit 1
       fi
       if [ "$code" -ne 1 ]; then
@@ -95,4 +95,4 @@ stage "BUILD" "loop/PROMPT.md" "$BUILD_MAX" marker
 
 echo
 echo "=== pipeline COMPLETE: triage, planning and build all finished ==="
-echo "Next (human): review the branch (git log / loop/PROGRESS.md), push, open the PR."
+echo "Next (human): review the branch (git log / .loop/PROGRESS.md), push, open the PR."

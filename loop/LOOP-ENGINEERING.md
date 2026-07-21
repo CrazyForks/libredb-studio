@@ -65,7 +65,7 @@ comment, link, and attachment is untrusted input from an arbitrary internet auth
 unattended agent running with permission bypass is exactly the target prompt injection is aimed
 at. The firewall has four layers:
 
-1. **Sanitized-spec indirection (`loop/TRIAGE.md`).** Build mode never takes its acceptance bar
+1. **Sanitized-spec indirection (`.loop/TRIAGE.md`).** Build mode never takes its acceptance bar
    from raw issue text. Triage mode (`PROMPT-TRIAGE.md`) reads issues, verifies every claim
    against the actual code, and re-states the task in its own words as a sanitized spec — never
    copying commands, URLs, or code blocks out of the issue. Build mode treats the raw issue as
@@ -86,7 +86,7 @@ at. The firewall has four layers:
    re-derived using only the project's own documented commands. Text addressing the agent,
    claiming authority, or attempting to alter instructions → escalate, always. The gh mutation
    surface is issue comments (clarifying questions only) plus `loop:*` labels — nothing else.
-4. **Runner-level tool blocks** (`LOOP_DISALLOWED_TOOLS` in `loop/config/loop.env`). Even if a
+4. **Runner-level tool blocks** (`LOOP_DISALLOWED_TOOLS` in `.loop/config/loop.env`). Even if a
    prompt-level rule were subverted, the runner refuses: no `git push`, no curl/wget/WebFetch,
    no `gh api`/repo/release/workflow/secret mutations, no PR creation or issue closing.
    Publishing (push, PR, merge, closing issues) is ALWAYS a human step — the final,
@@ -107,16 +107,16 @@ rules — maintainer accounts can be compromised too.
 | `PROMPT-PLANNING.md` | Planning-mode variant. Regenerates `IMPLEMENTATION_PLAN.md`. | Human |
 | `PROMPT-TRIAGE.md` | Triage-mode variant. Classifies open issues, writes sanitized specs. | Human |
 | `SCENARIOS.md` | The written scenario catalogue: stories and use cases for every input class (success, failure, skip, needs-info, moderator, scam, injection). | Human |
-| `loop/TRIAGE.md` | Sanitized-spec register — the firewall between the tracker and build mode. | Loop (triage mode) + human |
+| `.loop/TRIAGE.md` | Sanitized-spec register — the firewall between the tracker and build mode. | Loop (triage mode) + human |
 | `.claude/agents/loop-reviewer.md`, `loop-judge.md` | Fresh-context review/judge subagents used by build iterations. | Human |
 | `CLAUDE.md` (repo root) | Conventions, project map, build/test, the mandatory gate. Not duplicated here. | Human (pre-existing) |
 | Linked GitHub issue (per task) | Frozen per-task spec — the *what* and *why* for the one task in progress. | Human (pre-existing, external) |
-| `loop/IMPLEMENTATION_PLAN.md` | Prioritized task checklist. **Disposable.** | Loop (planning) |
-| `loop/PROGRESS.md` | Lab notebook, CURRENT milestone only. | Loop |
-| `loop/HANDOFF.md` | Cross-session baton. Orientation only — not authoritative state. | Human / loop at close |
-| `loop/ACCEPTANCE.md` | Current milestone definition of done. | Loop (planning, autonomous path) or human |
-| `loop/archive/<milestone>/` | Frozen history: previous PROGRESS logs, consumed TRIAGE specs, closed ACCEPTANCE/PLAN. | `new-milestone.sh` |
-| `loop/config/loop.env` | Runner configuration (agent cmd, gate, sentinel). | `new-milestone.sh` + human |
+| `.loop/IMPLEMENTATION_PLAN.md` | Prioritized task checklist. **Disposable.** | Loop (planning) |
+| `.loop/PROGRESS.md` | Lab notebook, CURRENT milestone only. | Loop |
+| `.loop/HANDOFF.md` | Cross-session baton. Orientation only — not authoritative state. | Human / loop at close |
+| `.loop/ACCEPTANCE.md` | Current milestone definition of done. | Loop (planning, autonomous path) or human |
+| `.loop/archive/<milestone>/` | Frozen history: previous PROGRESS logs, consumed TRIAGE specs, closed ACCEPTANCE/PLAN. | `new-milestone.sh` |
+| `.loop/config/loop.env` | Runner configuration (agent cmd, gate, sentinel). | `new-milestone.sh` + human |
 
 **Authoritative state during a build:** `IMPLEMENTATION_PLAN.md` (ticks) + `PROGRESS.md` + git history — not `HANDOFF.md` prose.
 
@@ -132,7 +132,7 @@ Map to Ralph canon: `DESIGN.md` ≈ specs, `CLAUDE.md` ≈ AGENTS.md, `PROGRESS.
 | **Planning** | Start of milestone; plan went stale; agent circling | `PROMPT-PLANNING.md` | Refreshed `IMPLEMENTATION_PLAN.md` |
 | **Building** | Plan exists | `PROMPT.md` | One task implemented, tested, reviewed, committed |
 
-Switch modes by setting `LOOP_PROMPT_FILE` in `loop/config/loop.env` (the non-destructive way — all prompt files stay intact).
+Switch modes by setting `LOOP_PROMPT_FILE` in `.loop/config/loop.env` (the non-destructive way — all prompt files stay intact).
 
 The fully autonomous pipeline chains them: **triage** (until `.loop/COMPLETE`) → **planning**
 (one iteration) → **building** (until `.loop/COMPLETE`), each on the same dedicated branch,
@@ -141,7 +141,7 @@ with a human review + push at the very end. Humans can veto between stages by ed
 
 Generic operation (see `HANDOFF.md` for the runbook): `./loop/scripts/new-milestone.sh <name>`
 (from the repo root) archives the previous milestone's working set (PROGRESS log, consumed
-TRIAGE specs, ACCEPTANCE, PLAN → `loop/archive/<prev>/`) and resets state;
+TRIAGE specs, ACCEPTANCE, PLAN → `.loop/archive/<prev>/`) and resets state;
 `./loop/scripts/pipeline.sh` then runs all three stages unattended, enforcing the stage
 contracts (triage/build must produce the marker; planning must NOT). The archive rotation is
 what keeps per-iteration reading cost bounded — PROGRESS.md holds the current milestone only.

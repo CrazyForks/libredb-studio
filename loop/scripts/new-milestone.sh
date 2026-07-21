@@ -2,23 +2,26 @@
 # ==============================================================================
 # Open a new maintainer-loop milestone.
 #
-# Archives the previous milestone's working-set content (the fresh-context
-# loop re-reads PROGRESS.md every iteration, so an ever-growing log would
-# re-introduce the context rot the loop exists to avoid) and resets the loop
-# state files for a fresh queue:
+# Seeds (fresh) or resets (subsequent) the loop's LIVE working state under
+# .loop/ from the tracked templates in loop/. .loop/ is gitignored, so loop
+# bookkeeping never leaks into a feature/contributor PR; loop/*.template are the
+# single source of truth for a pristine milestone.
 #
-#   loop/archive/<prev>/PROGRESS.md   <- the previous "## Log" entries
-#   loop/archive/<prev>/TRIAGE.md     <- the previous "## Queue" specs
-#   loop/archive/<prev>/ACCEPTANCE.md <- the previous milestone criteria
-#   loop/archive/<prev>/IMPLEMENTATION_PLAN.md
+# Source (tracked)                  ->  Live (gitignored, seeded here)
+#   loop/PROGRESS.md.template            .loop/PROGRESS.md
+#   loop/TRIAGE.md.template              .loop/TRIAGE.md
+#   loop/ACCEPTANCE.md.template          .loop/ACCEPTANCE.md
+#   loop/IMPLEMENTATION_PLAN.md.template .loop/IMPLEMENTATION_PLAN.md
+#   loop/HANDOFF.md.template             .loop/HANDOFF.md   (seeded fresh only)
+#   loop/config/loop.env.example         .loop/config/loop.env
 #
-#   loop/PROGRESS.md   -> entry-anatomy template + empty log + archive pointer
-#   loop/TRIAGE.md     -> spec format + empty queue; "Not for the loop" is
-#                         PRESERVED (it is the anti-re-triage memory)
-#   loop/ACCEPTANCE.md -> stub; planning mode writes the real criteria
-#   loop/IMPLEMENTATION_PLAN.md -> stub; planning mode writes the task list
-#   loop/config/loop.env -> new sentinel, prompt set to TRIAGE mode
-#   .loop/COMPLETE     -> removed
+# On a RESET (a prior .loop/ exists), the previous milestone's working set is
+# first archived, then re-seeded from the templates:
+#   .loop/archive/<prev>/{PROGRESS,TRIAGE,ACCEPTANCE,IMPLEMENTATION_PLAN}.md
+# Two things carry across a reset rather than reverting to template:
+#   - TRIAGE.md's "## Not for the loop" section (the anti-re-triage memory)
+#   - .loop/HANDOFF.md (planning mode owns it; not reseeded on reset)
+# .loop/COMPLETE is removed. Templates use {{MILESTONE}}/{{SENTINEL}} placeholders.
 #
 # Mutates files only - review the diff and commit; this script never commits
 # and never touches git state.
@@ -38,106 +41,122 @@ fi
 
 NAME=$1
 ROOT="${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-LOOP_DIR="$ROOT/loop"
-ENV_FILE="$LOOP_DIR/config/loop.env"
+TPL_DIR="$ROOT/loop"          # tracked scaffold + templates (source of truth)
+LIVE_DIR="$ROOT/.loop"        # gitignored live working state (seeded here)
+LIVE_ENV="$LIVE_DIR/config/loop.env"
+ENV_EXAMPLE="$TPL_DIR/config/loop.env.example"
 
 if ! printf '%s' "$NAME" | grep -Eq '^[a-z0-9][a-z0-9-]*$'; then
   echo "Milestone name must be kebab-case (got: '$NAME')" >&2
   exit 1
 fi
 
-for f in "$LOOP_DIR/PROGRESS.md" "$LOOP_DIR/TRIAGE.md" "$LOOP_DIR/ACCEPTANCE.md" \
-  "$LOOP_DIR/IMPLEMENTATION_PLAN.md" "$ENV_FILE"; do
-  if [ ! -f "$f" ]; then
-    echo "Missing loop state file: $f" >&2
+for t in PROGRESS TRIAGE ACCEPTANCE IMPLEMENTATION_PLAN HANDOFF; do
+  if [ ! -f "$TPL_DIR/$t.md.template" ]; then
+    echo "Missing template: $TPL_DIR/$t.md.template" >&2
     exit 1
   fi
 done
-
-# The previous milestone's name comes from its completion sentinel.
-PREV=$(sed -n 's/^LOOP_COMPLETION_SENTINEL="LIBREDB-STUDIO-\(.*\)-DONE"$/\1/p' "$ENV_FILE" |
-  tr '[:upper:]' '[:lower:]')
-PREV="${PREV:-previous}"
-
-if [ "$PREV" = "$NAME" ]; then
-  echo "Milestone '$NAME' is already the current one (sentinel matches) - pick a new name" >&2
+if [ ! -f "$ENV_EXAMPLE" ]; then
+  echo "Missing template: $ENV_EXAMPLE" >&2
   exit 1
 fi
 
-ARCHIVE="$LOOP_DIR/archive/$PREV"
-if [ -e "$ARCHIVE" ]; then
-  echo "Archive already exists: $ARCHIVE - refusing to overwrite history" >&2
-  exit 1
-fi
-mkdir -p "$ARCHIVE"
-
-# --- PROGRESS.md: archive everything from "## Log" on; keep the template ----
-awk '/^## Log$/{found=1} found{print}' "$LOOP_DIR/PROGRESS.md" > "$ARCHIVE/PROGRESS.md"
-awk '/^## Log$/{exit} {print}' "$LOOP_DIR/PROGRESS.md" > "$LOOP_DIR/PROGRESS.md.tmp"
-cat >> "$LOOP_DIR/PROGRESS.md.tmp" << EOF
-## Log
-
-> Earlier milestones are archived under \`loop/archive/\` (one directory per
-> milestone). Consult them only when a task genuinely needs that history.
-
-### $(date -u +%Y-%m-%d) — Milestone $NAME opened (human)
-
-- State reset by \`loop/scripts/new-milestone.sh $NAME\`; previous milestone
-  ($PREV) archived to \`loop/archive/$PREV/\`.
-- Next: triage mode over the untriaged open issues.
-EOF
-mv "$LOOP_DIR/PROGRESS.md.tmp" "$LOOP_DIR/PROGRESS.md"
-
-# --- TRIAGE.md: archive the Queue; preserve "Not for the loop" --------------
-awk '/^## Queue$/{found=1} found && /^## Not for the loop$/{exit} found{print}' \
-  "$LOOP_DIR/TRIAGE.md" > "$ARCHIVE/TRIAGE.md"
-{
-  awk '/^## Queue$/{exit} {print}' "$LOOP_DIR/TRIAGE.md"
-  printf '## Queue\n\n(empty — populated by triage mode; previous queue archived to loop/archive/%s/)\n\n' "$PREV"
-  awk '/^## Not for the loop$/{found=1} found{print}' "$LOOP_DIR/TRIAGE.md"
-} > "$LOOP_DIR/TRIAGE.md.tmp"
-mv "$LOOP_DIR/TRIAGE.md.tmp" "$LOOP_DIR/TRIAGE.md"
-
-# --- ACCEPTANCE.md / IMPLEMENTATION_PLAN.md: archive whole, write stubs -----
-mv "$LOOP_DIR/ACCEPTANCE.md" "$ARCHIVE/ACCEPTANCE.md"
+DATE=$(date -u +%Y-%m-%d)
 SENTINEL="LIBREDB-STUDIO-$(printf '%s' "$NAME" | tr '[:lower:]' '[:upper:]')-DONE"
-cat > "$LOOP_DIR/ACCEPTANCE.md" << EOF
-# Acceptance Criteria — Milestone $NAME
 
-> STUB: planning mode (\`loop/PROMPT-PLANNING.md\`) rewrites this file from the
-> \`loop:queued\` queue and \`loop/TRIAGE.md\` sanitized specs — one functional
-> criterion per queued issue plus the standard Quality / Documentation /
-> Process sections. A human may instead list issues here by hand before
-> planning runs (the human-listed path).
->
-> The completion sentinel for this milestone is \`$SENTINEL\`;
-> the marker file \`.loop/COMPLETE\` remains the only authoritative signal.
-EOF
+# seed <template> <dest> — copy a template, substituting milestone placeholders.
+seed() {
+  sed -e "s|{{MILESTONE}}|$NAME|g" -e "s|{{SENTINEL}}|$SENTINEL|g" "$1" > "$2"
+}
 
-mv "$LOOP_DIR/IMPLEMENTATION_PLAN.md" "$ARCHIVE/IMPLEMENTATION_PLAN.md"
-cat > "$LOOP_DIR/IMPLEMENTATION_PLAN.md" << EOF
-# Implementation Plan — Milestone $NAME
+mkdir -p "$LIVE_DIR/config"
 
-> STUB: planning mode (\`loop/PROMPT-PLANNING.md\`) rewrites this file from the
-> milestone queue. Build mode must not run against this stub.
-EOF
+if [ ! -f "$LIVE_ENV" ]; then
+  # ---- FRESH: no prior live state to archive ----------------------------------
+  PREV=""
+  seed "$TPL_DIR/HANDOFF.md.template" "$LIVE_DIR/HANDOFF.md"
+else
+  # ---- RESET: derive previous milestone, archive its working set --------------
+  PREV=$(sed -n 's/^LOOP_COMPLETION_SENTINEL="LIBREDB-STUDIO-\(.*\)-DONE"$/\1/p' "$LIVE_ENV" |
+    tr '[:upper:]' '[:lower:]')
+  PREV="${PREV:-previous}"
 
-# --- loop.env: new sentinel, triage mode (tmp+mv, consistent with the file
-# --- rewrites above and portable across GNU/BSD sed) --------------------------
+  if [ "$PREV" = "$NAME" ]; then
+    echo "Milestone '$NAME' is already the current one (sentinel matches) - pick a new name" >&2
+    exit 1
+  fi
+
+  ARCHIVE="$LIVE_DIR/archive/$PREV"
+  if [ -e "$ARCHIVE" ]; then
+    echo "Archive already exists: $ARCHIVE - refusing to overwrite history" >&2
+    exit 1
+  fi
+  mkdir -p "$ARCHIVE"
+
+  # PROGRESS: archive everything from "## Log" on.
+  awk '/^## Log$/{found=1} found{print}' "$LIVE_DIR/PROGRESS.md" > "$ARCHIVE/PROGRESS.md"
+  # TRIAGE: archive the Queue section (stop before "Not for the loop").
+  awk '/^## Queue$/{found=1} found && /^## Not for the loop$/{exit} found{print}' \
+    "$LIVE_DIR/TRIAGE.md" > "$ARCHIVE/TRIAGE.md"
+  # ACCEPTANCE / IMPLEMENTATION_PLAN: archive whole.
+  cp "$LIVE_DIR/ACCEPTANCE.md" "$ARCHIVE/ACCEPTANCE.md"
+  cp "$LIVE_DIR/IMPLEMENTATION_PLAN.md" "$ARCHIVE/IMPLEMENTATION_PLAN.md"
+
+  # Preserve the live "Not for the loop" section (anti-re-triage memory).
+  awk '/^## Not for the loop$/{found=1} found{print}' "$LIVE_DIR/TRIAGE.md" > "$LIVE_DIR/.notforloop.tmp"
+fi
+
+# ---- (re)seed the live working set from the templates -------------------------
+seed "$TPL_DIR/PROGRESS.md.template" "$LIVE_DIR/PROGRESS.md"
+seed "$TPL_DIR/ACCEPTANCE.md.template" "$LIVE_DIR/ACCEPTANCE.md"
+seed "$TPL_DIR/IMPLEMENTATION_PLAN.md.template" "$LIVE_DIR/IMPLEMENTATION_PLAN.md"
+
+# TRIAGE: template up to "## Not for the loop"; then the preserved live section
+# on a reset, or the template's own section on a fresh seed.
+awk '/^## Not for the loop$/{exit} {print}' "$TPL_DIR/TRIAGE.md.template" > "$LIVE_DIR/TRIAGE.md.tmp"
+if [ -f "$LIVE_DIR/.notforloop.tmp" ]; then
+  cat "$LIVE_DIR/.notforloop.tmp" >> "$LIVE_DIR/TRIAGE.md.tmp"
+  rm -f "$LIVE_DIR/.notforloop.tmp"
+else
+  awk '/^## Not for the loop$/{found=1} found{print}' "$TPL_DIR/TRIAGE.md.template" >> "$LIVE_DIR/TRIAGE.md.tmp"
+fi
+mv "$LIVE_DIR/TRIAGE.md.tmp" "$LIVE_DIR/TRIAGE.md"
+
+# Append the milestone-opened entry to the fresh PROGRESS log.
+{
+  printf '\n### %s — Milestone %s opened (human)\n\n' "$DATE" "$NAME"
+  if [ -n "$PREV" ]; then
+    printf -- '- State reset by `loop/scripts/new-milestone.sh %s`; previous milestone (%s) archived to `.loop/archive/%s/`.\n' "$NAME" "$PREV" "$PREV"
+  else
+    printf -- '- State seeded by `loop/scripts/new-milestone.sh %s` (fresh; no previous milestone to archive).\n' "$NAME"
+  fi
+  printf -- '- Next: triage mode over the untriaged open issues.\n'
+} >> "$LIVE_DIR/PROGRESS.md"
+
+# loop.env: seed from the example (fresh) or keep the live one (reset), then
+# rotate the sentinel and set TRIAGE mode (tmp+mv, portable across GNU/BSD sed).
+if [ ! -f "$LIVE_ENV" ]; then
+  cp "$ENV_EXAMPLE" "$LIVE_ENV"
+fi
 sed \
   -e "s|^LOOP_COMPLETION_SENTINEL=.*|LOOP_COMPLETION_SENTINEL=\"$SENTINEL\"|" \
   -e "s|^LOOP_PROMPT_FILE=.*|LOOP_PROMPT_FILE=\"loop/PROMPT-TRIAGE.md\"|" \
-  "$ENV_FILE" > "$ENV_FILE.tmp"
-mv "$ENV_FILE.tmp" "$ENV_FILE"
+  "$LIVE_ENV" > "$LIVE_ENV.tmp"
+mv "$LIVE_ENV.tmp" "$LIVE_ENV"
 
-rm -f "$ROOT/.loop/COMPLETE"
+rm -f "$LIVE_DIR/COMPLETE"
 
+if [ -n "$PREV" ]; then
+  echo "Milestone '$NAME' opened (previous: '$PREV', archived to .loop/archive/$PREV/)."
+else
+  echo "Milestone '$NAME' opened (fresh seed; no previous milestone)."
+fi
 cat << EOF
-Milestone '$NAME' opened (previous: '$PREV', archived to loop/archive/$PREV/).
-Sentinel: $SENTINEL | mode: TRIAGE | stale completion marker removed.
+Sentinel: $SENTINEL | mode: TRIAGE | live state under .loop/ (gitignored).
 
 Next steps:
-  1. Review the diff and commit it (this script never commits).
+  1. Review the diff (loop/ scaffold only; .loop/ is gitignored) and commit if anything changed.
   2. Run the full pipeline unattended:  ./loop/scripts/pipeline.sh
   3. When it finishes: review the branch, push, open the PR (always human).
 EOF

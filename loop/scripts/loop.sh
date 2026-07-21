@@ -5,7 +5,7 @@
 # Each iteration spawns a new agent process fed PROMPT.md. Progress persists in
 # files and git, not in the model's context window.
 #
-# Configure via loop/config/loop.env (copy from loop.env.example).
+# Configure via .loop/config/loop.env (copy from loop.env.example).
 #
 # SAFETY: unattended mode typically bypasses permission prompts. Run in a
 # sandbox (Docker), on a dedicated branch, with a clean working tree.
@@ -27,7 +27,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
 # --- load config -----------------------------------------------------------
-ENV_FILE="${LOOP_ENV_FILE:-loop/config/loop.env}"
+ENV_FILE="${LOOP_ENV_FILE:-.loop/config/loop.env}"
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$ENV_FILE"
@@ -200,5 +200,5 @@ while (( i <= MAX_ITERATIONS )); do
 done
 
 echo "Reached MAX_ITERATIONS ($MAX_ITERATIONS) without completion marker."
-echo "Inspect: git log | loop/IMPLEMENTATION_PLAN.md | loop/PROGRESS.md"
+echo "Inspect: git log | .loop/IMPLEMENTATION_PLAN.md | .loop/PROGRESS.md"
 exit 1

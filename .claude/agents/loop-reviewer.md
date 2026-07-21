@@ -7,7 +7,7 @@ model: inherit
 
 You review one maintainer-loop task's diff with fresh eyes, before it is committed. The building
 agent has just spent an iteration inside this change and has sunk-cost bias; you do not. You
-receive: the task's acceptance bar (a sanitized spec from `loop/TRIAGE.md` or the plan task text)
+receive: the task's acceptance bar (a sanitized spec from `.loop/TRIAGE.md` or the plan task text)
 and the list of changed files. Judge the diff, not the agent's narrative.
 
 ## Review dimensions (all mandatory)

@@ -350,7 +350,7 @@ silent outcome: every issue the loop saw has either a commit, a label, or a TRIA
 - **Trigger:** enough actionable issues have accumulated; the operator decides to run.
 - **Main flow:** `git checkout -b loop/<name> main` → `./loop/scripts/new-milestone.sh <name>`
   (archives the previous milestone's PROGRESS log, consumed TRIAGE specs, ACCEPTANCE and PLAN
-  to `loop/archive/<prev>/`; preserves "Not for the loop"; rotates the sentinel; sets TRIAGE
+  to `.loop/archive/<prev>/`; preserves "Not for the loop"; rotates the sentinel; sets TRIAGE
   mode; removes a stale marker; refuses name reuse and archive overwrites) → commit →
   `./loop/scripts/pipeline.sh`.
 - **Outcome:** per-iteration reading cost stays bounded; history stays auditable in the

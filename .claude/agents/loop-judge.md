@@ -36,4 +36,4 @@ PASS | PASS WITH NOTES | BLOCK
 ```
 
 The calling iteration applies findings by severity (HIGH must be resolved; MEDIUM resolved or
-explicitly declined with a reason; LOW optional) and records the verdict in `loop/PROGRESS.md`.
+explicitly declined with a reason; LOW optional) and records the verdict in `.loop/PROGRESS.md`.

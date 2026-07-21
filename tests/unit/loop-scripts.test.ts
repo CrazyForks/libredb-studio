@@ -1,14 +1,18 @@
 /**
  * Unit tests for the maintainer-loop lifecycle scripts:
  *
- * - scripts under loop/scripts/: new-milestone.sh (archive rotation + state
- *   reset - the guard against PROGRESS.md/TRIAGE.md growing without bound and
- *   re-introducing context rot) and pipeline.sh (unattended
- *   triage -> planning -> build sequencing with its stage contracts).
+ * - scripts under loop/scripts/: new-milestone.sh (seed/reset of the LIVE working
+ *   state under .loop/ from the tracked loop/*.template sources — the guard
+ *   against PROGRESS.md/TRIAGE.md growing without bound and re-introducing context
+ *   rot, and against loop bookkeeping leaking into a tracked feature PR) and
+ *   pipeline.sh (unattended triage -> planning -> build sequencing with its stage
+ *   contracts).
  *
- * Both are exercised as real subprocesses against throwaway fixture roots,
- * per the packaging-test convention. The pipeline fixture stubs the agent
- * command (loop.sh's generic-agent path) so no real model runs.
+ * Both are exercised as real subprocesses against throwaway fixture roots, per the
+ * packaging-test convention. The tracked scaffold lives in loop/ (templates,
+ * prompts, scripts); the live working set lives in the gitignored .loop/. The
+ * pipeline fixture stubs the agent command (loop.sh's generic-agent path) so no
+ * real model runs.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -41,18 +45,93 @@ function run(cmd: string[], cwd?: string) {
 
 // --- new-milestone.sh --------------------------------------------------------
 
-function makeMilestoneFixture(): string {
-  const root = mkdtempSync(join(tmpdir(), "loop-milestone-"));
-  fixtureRoots.push(root);
+// The tracked templates (loop/*.template) — the single source of truth a fresh
+// milestone is seeded from. Kept minimal but structurally faithful to the real
+// files (section markers, {{MILESTONE}}/{{SENTINEL}} placeholders).
+function writeTemplates(root: string): void {
   write(
     root,
-    "loop/PROGRESS.md",
+    "loop/PROGRESS.md.template",
     [
       "# Progress Log (lab notebook)",
       "",
       "## Entry anatomy (follow this shape)",
       "",
       "- rules about entries",
+      "",
+      "---",
+      "",
+      "## Log",
+      "",
+      "> Earlier milestones are archived under `.loop/archive/` (one directory per milestone).",
+      "",
+    ].join("\n"),
+  );
+  write(
+    root,
+    "loop/TRIAGE.md.template",
+    [
+      "# Triage register",
+      "",
+      "## Spec format",
+      "",
+      "(the format)",
+      "",
+      "## Queue",
+      "",
+      "(empty — populated by triage mode.)",
+      "",
+      "## Not for the loop",
+      "",
+      "Issues triaged as benign but not loop work. One line each.",
+      "",
+    ].join("\n"),
+  );
+  write(
+    root,
+    "loop/ACCEPTANCE.md.template",
+    [
+      "# Acceptance Criteria — Milestone {{MILESTONE}}",
+      "",
+      "> STUB: planning mode rewrites this. Sentinel `{{SENTINEL}}`; `.loop/COMPLETE` is authoritative.",
+      "",
+    ].join("\n"),
+  );
+  write(
+    root,
+    "loop/IMPLEMENTATION_PLAN.md.template",
+    ["# Implementation Plan — Milestone {{MILESTONE}}", "", "> STUB: planning mode rewrites this.", ""].join("\n"),
+  );
+  write(root, "loop/HANDOFF.md.template", ["# Handoff", "", "No milestone is open (fresh scaffold).", ""].join("\n"));
+  write(
+    root,
+    "loop/config/loop.env.example",
+    [
+      'LOOP_PROMPT_FILE="loop/PROMPT.md"',
+      'LOOP_COMPLETION_SENTINEL="LIBREDB-STUDIO-MILESTONE-DONE"',
+      "LOOP_MAX_ITERATIONS=20",
+      "",
+    ].join("\n"),
+  );
+}
+
+// A repo mid-milestone: templates in loop/ PLUS a filled live working set in
+// .loop/ (as it looks after a run, before the next milestone opens).
+function makeMilestoneFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "loop-milestone-"));
+  fixtureRoots.push(root);
+  writeTemplates(root);
+  write(
+    root,
+    ".loop/PROGRESS.md",
+    [
+      "# Progress Log (lab notebook)",
+      "",
+      "## Entry anatomy (follow this shape)",
+      "",
+      "- rules about entries",
+      "",
+      "---",
       "",
       "## Log",
       "",
@@ -68,7 +147,7 @@ function makeMilestoneFixture(): string {
   );
   write(
     root,
-    "loop/TRIAGE.md",
+    ".loop/TRIAGE.md",
     [
       "# Triage register",
       "",
@@ -89,11 +168,12 @@ function makeMilestoneFixture(): string {
       "",
     ].join("\n"),
   );
-  write(root, "loop/ACCEPTANCE.md", "# Acceptance Criteria — Maintainer Sweep 2\n\n- [x] everything\n");
-  write(root, "loop/IMPLEMENTATION_PLAN.md", "# Implementation Plan — Maintainer Sweep 2\n\n- [x] all tasks\n");
+  write(root, ".loop/ACCEPTANCE.md", "# Acceptance Criteria — Maintainer Sweep 2\n\n- [x] everything\n");
+  write(root, ".loop/IMPLEMENTATION_PLAN.md", "# Implementation Plan — Maintainer Sweep 2\n\n- [x] all tasks\n");
+  write(root, ".loop/HANDOFF.md", "# Handoff\n\nSweep 2 complete.\n");
   write(
     root,
-    "loop/config/loop.env",
+    ".loop/config/loop.env",
     [
       'LOOP_PROMPT_FILE="loop/PROMPT.md"',
       'LOOP_COMPLETION_SENTINEL="LIBREDB-STUDIO-SWEEP-2-DONE"',
@@ -105,41 +185,74 @@ function makeMilestoneFixture(): string {
   return root;
 }
 
+// A repo with the tracked scaffold only and no .loop/ yet (a fresh clone).
+function makeFreshFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "loop-fresh-"));
+  fixtureRoots.push(root);
+  writeTemplates(root);
+  return root;
+}
+
 describe("loop/scripts/new-milestone.sh", () => {
-  test("archives the previous milestone and resets the working set", () => {
+  test("archives the previous milestone and resets the working set into .loop/", () => {
     const root = makeMilestoneFixture();
     const result = run(["bash", NEW_MILESTONE, "sweep-3", root]);
     expect(result.exitCode).toBe(0);
 
-    // Previous milestone name derived from the sentinel; whole set archived.
-    expect(read(root, "loop/archive/sweep-2/PROGRESS.md")).toContain("old entry B");
-    expect(read(root, "loop/archive/sweep-2/TRIAGE.md")).toContain("old consumed spec");
-    expect(read(root, "loop/archive/sweep-2/ACCEPTANCE.md")).toContain("Maintainer Sweep 2");
-    expect(read(root, "loop/archive/sweep-2/IMPLEMENTATION_PLAN.md")).toContain("all tasks");
+    // Previous milestone name derived from the sentinel; whole set archived under .loop/.
+    expect(read(root, ".loop/archive/sweep-2/PROGRESS.md")).toContain("old entry B");
+    expect(read(root, ".loop/archive/sweep-2/TRIAGE.md")).toContain("old consumed spec");
+    expect(read(root, ".loop/archive/sweep-2/ACCEPTANCE.md")).toContain("Maintainer Sweep 2");
+    expect(read(root, ".loop/archive/sweep-2/IMPLEMENTATION_PLAN.md")).toContain("all tasks");
 
-    // PROGRESS keeps the template, drops the old entries, points at the archive.
-    const progress = read(root, "loop/PROGRESS.md");
+    // PROGRESS reseeded from the template, drops the old entries, points at the archive.
+    const progress = read(root, ".loop/PROGRESS.md");
     expect(progress).toContain("Entry anatomy");
     expect(progress).not.toContain("old entry A");
-    expect(progress).toContain("loop/archive/");
+    expect(progress).toContain(".loop/archive/");
     expect(progress).toContain("Milestone sweep-3 opened");
 
-    // TRIAGE queue emptied; the anti-re-triage memory is preserved verbatim.
-    const triage = read(root, "loop/TRIAGE.md");
+    // TRIAGE queue emptied (template top); the anti-re-triage memory is preserved verbatim.
+    const triage = read(root, ".loop/TRIAGE.md");
     expect(triage).toContain("## Spec format");
     expect(triage).not.toContain("old consumed spec");
     expect(triage).toContain("- #100 — tracking issue, human splits it");
     expect(triage).toContain("- #108 — epic, human-owned");
 
-    // Stubs direct planning mode; env rotated to triage with the new sentinel.
-    expect(read(root, "loop/ACCEPTANCE.md")).toContain("STUB");
-    expect(read(root, "loop/IMPLEMENTATION_PLAN.md")).toContain("STUB");
-    const env = read(root, "loop/config/loop.env");
+    // Stubs direct planning mode; placeholders substituted; env rotated to triage with new sentinel.
+    const acceptance = read(root, ".loop/ACCEPTANCE.md");
+    expect(acceptance).toContain("STUB");
+    expect(acceptance).toContain("Milestone sweep-3");
+    expect(acceptance).toContain("LIBREDB-STUDIO-SWEEP-3-DONE");
+    expect(read(root, ".loop/IMPLEMENTATION_PLAN.md")).toContain("STUB");
+    const env = read(root, ".loop/config/loop.env");
     expect(env).toContain('LOOP_COMPLETION_SENTINEL="LIBREDB-STUDIO-SWEEP-3-DONE"');
     expect(env).toContain('LOOP_PROMPT_FILE="loop/PROMPT-TRIAGE.md"');
 
-    // Stale completion marker is gone.
+    // Stale completion marker is gone; the tracked loop/ scaffold is untouched.
     expect(existsSync(join(root, ".loop/COMPLETE"))).toBe(false);
+    expect(read(root, "loop/PROGRESS.md.template")).toContain("Entry anatomy");
+  });
+
+  test("seeds .loop/ from the templates on a fresh repo (no prior state, no archive)", () => {
+    const root = makeFreshFixture();
+    const result = run(["bash", NEW_MILESTONE, "sweep-1", root]);
+    expect(result.exitCode).toBe(0);
+
+    // Live working set created from templates.
+    const progress = read(root, ".loop/PROGRESS.md");
+    expect(progress).toContain("Entry anatomy");
+    expect(progress).toContain("Milestone sweep-1 opened");
+    expect(progress).toContain("fresh");
+    expect(read(root, ".loop/TRIAGE.md")).toContain("## Spec format");
+    expect(read(root, ".loop/ACCEPTANCE.md")).toContain("Milestone sweep-1");
+    expect(read(root, ".loop/HANDOFF.md")).toContain("Handoff");
+    const env = read(root, ".loop/config/loop.env");
+    expect(env).toContain('LOOP_COMPLETION_SENTINEL="LIBREDB-STUDIO-SWEEP-1-DONE"');
+    expect(env).toContain('LOOP_PROMPT_FILE="loop/PROMPT-TRIAGE.md"');
+
+    // Nothing to archive on a fresh seed.
+    expect(existsSync(join(root, ".loop/archive"))).toBe(false);
   });
 
   test("rejects a non-kebab-case milestone name", () => {
@@ -158,7 +271,7 @@ describe("loop/scripts/new-milestone.sh", () => {
 
   test("refuses to overwrite an existing archive", () => {
     const root = makeMilestoneFixture();
-    mkdirSync(join(root, "loop/archive/sweep-2"), { recursive: true });
+    mkdirSync(join(root, ".loop/archive/sweep-2"), { recursive: true });
     const result = run(["bash", NEW_MILESTONE, "sweep-3", root]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr.toString()).toContain("refusing to overwrite");
@@ -171,7 +284,8 @@ describe("loop/scripts/new-milestone.sh", () => {
  * Pipeline fixture: a tiny git repo with the REAL loop.sh + pipeline.sh, mode
  * prompts whose text identifies the stage, and a stub agent that emulates the
  * per-mode contract (triage/build create the completion marker, planning does
- * not - unless the planning-completes.flag violation fixture is planted).
+ * not - unless the planning-completes.flag violation fixture is planted). The
+ * live loop.env lives under the gitignored .loop/, matching production.
  */
 function makePipelineFixture({ planningViolation = false } = {}): string {
   const root = mkdtempSync(join(tmpdir(), "loop-pipeline-"));
@@ -200,7 +314,7 @@ function makePipelineFixture({ planningViolation = false } = {}): string {
   );
   write(
     root,
-    "loop/config/loop.env",
+    ".loop/config/loop.env",
     [
       'LOOP_PROMPT_FILE="loop/PROMPT.md"',
       'LOOP_COMPLETION_SENTINEL="FIXTURE-DONE"',
