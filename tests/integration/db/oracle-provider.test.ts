@@ -11,6 +11,7 @@ let mockConnCloseFn: () => Promise<void>;
 let mockBreakFn: () => Promise<void>;
 let mockPoolCloseFn: () => Promise<void>;
 let mockCreatePoolFn: () => Promise<unknown>;
+const mockInitOracleClientFn = mock((_opts?: Record<string, unknown>) => undefined);
 
 const createMockConnection = () => ({
   execute: (sql: string, params?: unknown[], opts?: unknown) => mockExecuteFn(sql, params, opts),
@@ -30,7 +31,7 @@ const createMockPool = () => ({
 mock.module("oracledb", () => {
   const oracledbMock = {
     OUT_FORMAT_OBJECT: 4002,
-    initOracleClient: undefined as unknown,
+    initOracleClient: mockInitOracleClientFn,
     outFormat: 0,
     autoCommit: false,
     createPool: () => mockCreatePoolFn(),
@@ -457,6 +458,26 @@ describe("OracleProvider", () => {
       };
 
       await expect(provider.connect()).rejects.toThrow(ConnectionError);
+      expect(provider.isConnected()).toBe(false);
+    });
+
+    test("connect wraps NJS-138 (pre-12.1 server) as a non-retryable DatabaseConfigError, not ConnectionError", async () => {
+      mockCreatePoolFn = async () => {
+        throw new Error(
+          "NJS-138: connections to this database server version are not supported by node-oracledb in Thin mode",
+        );
+      };
+
+      let caught: unknown;
+      try {
+        await provider.connect();
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(DatabaseConfigError);
+      expect(caught).not.toBeInstanceOf(ConnectionError);
+      expect((caught as Error).message).toContain("ORACLE_CLIENT_LIB_DIR");
       expect(provider.isConnected()).toBe(false);
     });
 
@@ -1328,6 +1349,62 @@ describe("OracleProvider", () => {
         expect(err.name).toBe("ConnectionError");
         expect(err.message).toContain("Oracle");
       }
+    });
+  });
+
+  // =========================================================================
+  // 21. Thick-mode opt-in (ORACLE_CLIENT_LIB_DIR)
+  // =========================================================================
+
+  describe("Thick-mode opt-in (ORACLE_CLIENT_LIB_DIR)", () => {
+    // The init mock records call counts across the whole file; clear them per
+    // test so these assertions don't depend on execution order. The provider's
+    // module-level "already initialized" flag is a process-wide singleton that
+    // cannot be reset, so the tests that expect init to actually run (the
+    // failing-load case and the at-most-once case) must stay ordered before any
+    // test that lets a successful init flip that flag permanently.
+    beforeEach(() => {
+      mockInitOracleClientFn.mockClear();
+    });
+
+    afterEach(() => {
+      delete process.env.ORACLE_CLIENT_LIB_DIR;
+    });
+
+    test("does not call initOracleClient when ORACLE_CLIENT_LIB_DIR is unset", () => {
+      // beforeEach already constructed one provider with the env var unset;
+      // construct another to be sure.
+      new OracleProvider(baseConfig);
+      expect(mockInitOracleClientFn).not.toHaveBeenCalled();
+    });
+
+    test("surfaces a failed Instant Client load as a DatabaseConfigError pointing at ORACLE_CLIENT_LIB_DIR", () => {
+      process.env.ORACLE_CLIENT_LIB_DIR = "/nonexistent/instantclient";
+      mockInitOracleClientFn.mockImplementationOnce(() => {
+        throw new Error("DPI-1047: Cannot locate a 64-bit Oracle Client library");
+      });
+
+      let caught: unknown;
+      try {
+        new OracleProvider(baseConfig);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(DatabaseConfigError);
+      expect((caught as Error).message).toContain("ORACLE_CLIENT_LIB_DIR");
+      expect((caught as Error).message).toContain("/nonexistent/instantclient");
+      expect((caught as Error).message).toContain("DPI-1047");
+    });
+
+    test("calls initOracleClient with libDir at most once, even across multiple providers", () => {
+      process.env.ORACLE_CLIENT_LIB_DIR = "/opt/oracle/instantclient";
+
+      new OracleProvider(baseConfig);
+      new OracleProvider(baseConfig);
+
+      expect(mockInitOracleClientFn).toHaveBeenCalledTimes(1);
+      expect(mockInitOracleClientFn).toHaveBeenCalledWith({ libDir: "/opt/oracle/instantclient" });
     });
   });
 });

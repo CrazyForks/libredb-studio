@@ -34,7 +34,7 @@ providers, with several Oracle-isms that are worth knowing before reading the co
 
 | Aspect | PostgreSQL | Oracle |
 |--------|------------|--------|
-| Driver mode | `pg` | `oracledb` **Thin** (no Instant Client) |
+| Driver mode | `pg` | `oracledb` **Thin** by default (Thick opt-in via `ORACLE_CLIENT_LIB_DIR`) |
 | Pagination | `LIMIT … OFFSET` | `FETCH FIRST n ROWS ONLY` / `OFFSET m ROWS FETCH NEXT n` |
 | Schema scope | all non-system schemas | the connecting **user's** schema (`OWNER = USER`) |
 | Schema queries | 1 `MATERIALIZED`-CTE round-trip | **5 bulk** `ALL_*` queries grouped in memory |
@@ -47,10 +47,14 @@ providers, with several Oracle-isms that are worth knowing before reading the co
 
 ### Thin mode
 
-The constructor ([oracle.ts:48](../../src/lib/db/providers/sql/oracle.ts)) forces pure-JS Thin mode
-(`initOracleClient = undefined`), sets `outFormat = OUT_FORMAT_OBJECT` (rows as objects), and
-`autoCommit = true` globally. Thin mode means **no native Oracle client** has to be installed in the
-container — a real deployment win.
+The constructor ([oracle.ts:186](../../src/lib/db/providers/sql/oracle.ts)) uses pure-JS Thin mode by
+default, sets `outFormat = OUT_FORMAT_OBJECT` (rows as objects), and `autoCommit = true` globally.
+Thin mode means **no native Oracle client** has to be installed in the container — a real deployment
+win.
+
+> ⚠️ **Thin mode only supports Oracle Database 12.1 and later.** Connecting to an older server (11.2
+> and earlier) fails with the driver's `NJS-138` error. For those servers, opt into Thick mode via
+> `ORACLE_CLIENT_LIB_DIR` — see [§4.4](#44-thick-mode-opt-in-oracle_client_lib_dir).
 
 ---
 
@@ -176,6 +180,68 @@ exposes `{ total: connectionsOpen, idle, active: connectionsInUse, waiting: 0 }`
 
 Not handled by the provider — see [§3.5](#35-no-ssl-config-path). Use a `tcps://` connect string or
 an Oracle wallet for encrypted transport.
+
+### 4.4 Thick-mode opt-in (`ORACLE_CLIENT_LIB_DIR`)
+
+| Env var | Required | Effect |
+|---------|----------|--------|
+| `ORACLE_CLIENT_LIB_DIR` | No (default: unset, Thin mode) | Absolute path to an installed Oracle Instant Client `lib` directory. When set, the constructor calls `oracledb.initOracleClient({ libDir })` and the driver runs in Thick mode instead of Thin. |
+
+```bash
+# Only needed against a pre-12.1 Oracle server (see the Thin-mode caveat above).
+# The version matters: use Instant Client 19c for an Oracle 11.2 server (see below).
+ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient_19_28
+```
+
+node-oracledb's Thin/Thick choice is a **process-wide singleton** — `initOracleClient()` throws if
+called more than once, or after any connection/pool already exists. This is why the setting is a
+process-level env var rather than a per-connection config field: every `OracleProvider` in the
+process shares one driver mode. The constructor guards the call with a module-level flag so it runs
+at most once regardless of how many `OracleProvider` instances (i.e. connections) are created. The
+Oracle Instant Client itself must already be installed at the given path — this provider does not
+download or bundle it. If the path is wrong (no client library there), the constructor fails fast
+with a `DatabaseConfigError` naming `ORACLE_CLIENT_LIB_DIR`, not a cryptic driver error.
+
+#### Pick the right Instant Client version
+
+Thick mode delegates to Oracle's native client, whose ability to reach an *older* server is bounded
+by [Oracle client/server interoperability](https://docs.oracle.com/en/database/oracle/oracle-database/19/mxcli/oracle-database-client-and-oracle-database-interoperability.html)
+(My Oracle Support Doc ID 207303.1). For the common "connect to Oracle 11g" case:
+
+| Target server | Instant Client to install |
+|---------------|---------------------------|
+| **Oracle 11.2** (11g) | **19c** — the newest client that still reaches 11.2 (11.2.0.3 / 11.2.0.4). **21c and 23ai cannot connect to 11.2.** |
+| Oracle 12.1+ | Any current Instant Client (19c / 21c / 23ai). Thin mode already covers these, so Thick is rarely needed. |
+
+#### Connecting to a pre-12.1 server (build your own image)
+
+The published image (`ghcr.io/libredb/libredb-studio`) ships **Thin only** — it does not bundle the
+Oracle Instant Client, because the native client is ~100 MB and only a minority of deployments need
+it. To reach an 11g server, build a derived image that layers Instant Client 19c on top and sets the
+env var. The runtime base is Debian 13 (`node:*-trixie-slim`), so install `libaio1t64` (trixie's
+renamed `libaio1`) and unpack the Basic package:
+
+```dockerfile
+FROM ghcr.io/libredb/libredb-studio:latest
+
+USER root
+# Instant Client 19c — reaches Oracle 11.2; 21c/23ai do not. Pin to a specific
+# 19.x build; check https://www.oracle.com/database/technologies/instant-client/linux-x86-64-downloads.html
+# for the current file name and update the version folder in ORACLE_CLIENT_LIB_DIR to match.
+RUN apt-get update && apt-get install -y --no-install-recommends libaio1t64 unzip curl \
+    && mkdir -p /opt/oracle && cd /opt/oracle \
+    && curl -fsSLO https://download.oracle.com/otn_software/linux/instantclient/1928000/instantclient-basic-linux.x64-19.28.0.0.0dbru.zip \
+    && unzip -q instantclient-basic-linux.x64-*.zip \
+    && rm instantclient-basic-linux.x64-*.zip \
+    && rm -rf /var/lib/apt/lists/*
+ENV ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient_19_28
+USER nextjs
+```
+
+Instead of rebuilding, you can also mount an Instant Client directory from the host into the stock
+image and point `ORACLE_CLIENT_LIB_DIR` at the mount — whichever your deployment prefers. A
+first-class, separately-published Thick-mode image variant is a possible future addition; until then
+the derived image above is the supported path.
 
 ---
 
@@ -322,6 +388,7 @@ global labels (*"Gather Stats"*, *"Rebuild All Indexes"*).
 | `ORA-01017` / *invalid username/password* | `AuthenticationError` |
 | `ORA-12541` / `ORA-12154` / `TNS:` | `ConnectionError` |
 | `ORA-00942` (table or view does not exist) | `QueryError` |
+| `NJS-138` (server predates Oracle 12.1, Thin-mode incompatible) | `DatabaseConfigError`, **not retryable** — see [§4.4](#44-thick-mode-opt-in-oracle_client_lib_dir) |
 | Driver message contains *timeout* / *timed out* | `TimeoutError` |
 | `connection.break()`-interrupted query | maps via the generic path (the driver's `ORA-01013` / "user requested cancel"); other `ORA-*` codes fall through to `QueryError`/`DatabaseError` with the original message |
 
@@ -401,6 +468,10 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
   per-query `fetchInfo`), and stream genuinely large LOBs instead of buffering.
 - **Large `NUMBER` precision loss** — returned as a JS `number`; `NUMBER` values beyond 2^53 should
   be fetched as strings to stay exact.
+- **`NJS-138` (pre-12.1 server) is a non-retryable configuration error, not a transient one.**
+  `mapDatabaseError()` maps it to `DatabaseConfigError` instead of the generic retryable
+  `ConnectionError` every other `connect()` failure produces — see [§4.4](#44-thick-mode-opt-in-oracle_client_lib_dir)
+  and [§11](#11-error-handling). The error message points the operator at `ORACLE_CLIENT_LIB_DIR`.
 - **`EXPLAIN` is intentionally disabled for Oracle until a dialect wrapper exists.**
   `getCapabilities().supportsExplain` is `false`, so the UI hides the *Explain* action. The UI's
   EXPLAIN builder only handles Postgres/MySQL; before the flag was flipped, the *Explain* action
