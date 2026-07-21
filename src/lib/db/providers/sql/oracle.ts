@@ -166,6 +166,13 @@ const STORAGE_USER_SEGMENTS_SQL = `SELECT TABLESPACE_NAME AS NAME,
 // Oracle Provider
 // ============================================================================
 
+// node-oracledb's Thin/Thick client mode is a process-wide singleton:
+// oracledb.initOracleClient() throws if called more than once, or after any
+// connection/pool already exists. Track it at module scope so it runs at most
+// once across every OracleProvider instance in this process, not once per
+// constructor call.
+let thickClientInitialized = false;
+
 export class OracleProvider extends SQLBaseProvider {
   private pool: oracledb.Pool | null = null;
 
@@ -178,8 +185,27 @@ export class OracleProvider extends SQLBaseProvider {
 
   constructor(config: DatabaseConnection, options: ProviderOptions = {}) {
     super(config, options);
-    // Use thin mode (pure JS, no Oracle Instant Client)
-    oracledb.initOracleClient = undefined as unknown as typeof oracledb.initOracleClient;
+    // Thin mode (pure JS, no Oracle Instant Client) is the unconditional default.
+    // Thick mode is an explicit opt-in for servers older than Oracle Database 12.1,
+    // which Thin mode cannot connect to (node-oracledb NJS-138).
+    const libDir = process.env.ORACLE_CLIENT_LIB_DIR;
+    if (libDir && !thickClientInitialized) {
+      try {
+        oracledb.initOracleClient({ libDir });
+      } catch (error) {
+        // A bad ORACLE_CLIENT_LIB_DIR (e.g. no Instant Client at that path) makes
+        // node-oracledb throw a raw driver error (DPI-1047). Surface it as a
+        // non-retryable configuration error that names the offending env var, so it
+        // is actionable rather than looking like a transient failure.
+        throw new DatabaseConfigError(
+          `Failed to load the Oracle Instant Client from ORACLE_CLIENT_LIB_DIR=${libDir}: ${String(error)}. ` +
+            "Verify the path points at an installed Oracle Instant Client 'lib' directory " +
+            "(Instant Client 19c is required to reach Oracle 11.2 servers).",
+          "oracle",
+        );
+      }
+      thickClientInitialized = true;
+    }
     oracledb.outFormat = oracledb.OUT_FORMAT_OBJECT;
     oracledb.autoCommit = true;
     this.validate();
@@ -267,6 +293,14 @@ export class OracleProvider extends SQLBaseProvider {
       this.setConnected(true);
     } catch (error) {
       this.setError(error instanceof Error ? error : new Error(String(error)));
+      // NJS-138 (server predates Oracle 12.1, incompatible with Thin mode) is a permanent
+      // configuration problem, not a transient connection failure — map it through
+      // mapDatabaseError() so it surfaces as a non-retryable DatabaseConfigError instead of
+      // the generic ConnectionError every other connect() failure falls back to below.
+      const mapped = mapDatabaseError(error, "oracle");
+      if (mapped instanceof DatabaseConfigError) {
+        throw mapped;
+      }
       throw new ConnectionError(
         `Failed to connect to Oracle: ${error instanceof Error ? error.message : error}`,
         "oracle",
