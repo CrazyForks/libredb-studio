@@ -378,7 +378,7 @@ channels:
 
   - id: digitalocean
     name: DigitalOcean Marketplace
-    status: pending
+    status: live
     tier: 4
     kind: marketplace
     update:
@@ -386,6 +386,8 @@ channels:
       sla: on_demand
     links:
       tracking_issue: https://github.com/libredb/libredb-studio/issues/72
+      first_pr: https://github.com/libredb/libredb-studio/pull/210
+      catalog: https://marketplace.digitalocean.com/apps/libredb-studio
       docs: deploy/digitalocean/README.md
     pin:
       strategy: none
