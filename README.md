@@ -23,14 +23,33 @@
 </p>
 
 <p align="center">
-  <a href="#live-test"><strong>Try Live Test</strong></a> •
-  <a href="#getting-started"><strong>Documentation</strong></a> •
+  <a href="#quick-start"><strong>Quick Start</strong></a> •
+  <a href="#live-test"><strong>Live Demo</strong></a> •
+  <a href="#getting-started"><strong>Install Options</strong></a> •
   <a href="#one-click-deploy"><strong>Deploy Your Own</strong></a>
 </p>
 
 <p align="center">
   <img src="public/screenshots/hero-editor.png" alt="LibreDB Studio - Professional SQL IDE" width="100%" />
 </p>
+
+---
+
+## Quick Start
+
+Run a full SQL IDE in one command — no clone, no build:
+
+```bash
+# Docker (recommended)
+docker run -d -p 3000:3000 ghcr.io/libredb/libredb-studio:latest
+
+# or with Node.js 20.9+ (no Docker)
+npx @libredb/studio
+```
+
+Then open **http://localhost:3000** — on first run the admin password is printed to the log (zero-config).
+
+> Need Helm, Homebrew, Snap, winget, or deb/rpm? See [all install options](#getting-started).
 
 ---
 
