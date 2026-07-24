@@ -719,7 +719,7 @@ pin or editing a channel entry is always a human commit.
 |---|---|---|
 | 0 | Core registries, published directly by release CI | GitHub Releases, GHCR, Docker Hub, npm |
 | 1 | Packaged formats owned by this repo, CI-published | Helm, Homebrew tap, Snap, .deb/.rpm |
-| 2 | LibreDB-owned copies and listings, bumped by hand | CapRover source/mirror, Railway, Koyeb button, Fly.io config |
+| 2 | LibreDB-owned copies and listings, bumped by hand | CapRover source/mirror, Railway, Koyeb button, Fly.io config, Render Blueprint |
 | 3 | Upstream community catalogs, bumped via PR | CapRover official, Dokploy, Cosmos, Kubero |
 | 4 | Partner or curated catalogs (not self-serve) | Rancher partner charts, Koyeb catalog, DO, winget |
 
@@ -745,6 +745,19 @@ scripting.
 schema is validated on every run). Set `links.first_pr` to the PR that landed the listing, and
 update `links.last_bump_pr` whenever a version-bump PR for that channel merges — it is `null`
 until the first post-listing bump and is displayed, not auto-discovered.
+
+**Root-level PaaS configs.** Two tier-2 channels ship their descriptor at the repo root rather
+than under `deploy/<provider>/`: [`fly.toml`](../fly.toml) (Fly.io) and
+[`render.yaml`](../render.yaml) (Render). This is deliberate, not a stray file — their tooling
+auto-detects the config at the working-directory root: `fly launch`/`fly deploy` read
+`./fly.toml` (see [docs/FLY.md](FLY.md)) and Render's Blueprint auto-detects `render.yaml`, so
+the documented "clone and deploy" flow only works from that location. Catalog-based channels
+(CapRover, Railway, Dokploy, Kubero, …) instead keep their source descriptor under
+`deploy/<provider>/`, because the consumable artifact lives in an external catalog and the
+in-repo file is only the source that gets pushed or PR'd upstream. Neither Fly.io nor Render has
+a marketplace or template gallery to publish into, which is why the repo file itself is the
+deliverable (`pin.strategy: local_file` for the version-pinned `fly.toml`; `none` for
+`render.yaml`, which builds from the repo Dockerfile and tracks whatever `main` builds).
 
 ### Manual steps still open
 

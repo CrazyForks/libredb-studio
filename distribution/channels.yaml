@@ -248,6 +248,21 @@ channels:
       extract: 'libredb-studio:(\d+\.\d+\.\d+)'
       note: Users deploy straight from the repo file; bump the tag here on release when convenient.
 
+  - id: render
+    name: Render Blueprint (repo render.yaml)
+    status: live
+    tier: 2
+    kind: paas-template
+    update:
+      method: commit
+      sla: on_demand
+    links:
+      catalog: https://render.com/deploy?repo=https://github.com/libredb/libredb-studio
+      docs: docs/DISTRIBUTION.md
+    pin:
+      strategy: none
+      note: Render builds from the repo Dockerfile (render.yaml dockerfilePath) on push, so there is no image tag to pin - the deployed version tracks whatever main builds. Like fly.toml, render.yaml is auto-detected at the repo root, so users deploy straight from the repo Blueprint.
+
   # ---- Tier 3: upstream community catalogs, bumped via PR -----------------
 
   - id: caprover-official
