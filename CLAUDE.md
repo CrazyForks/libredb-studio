@@ -11,8 +11,12 @@ Web-based SQL IDE for cloud-native teams: PostgreSQL, MySQL, SQLite, Oracle, SQL
 ## Branching & PRs
 
 > **Trunk-based: feature/work branches target `main` directly; releases are git tags.** Branch off `main` for new work and open every PR with base `main` (`gh pr create --base main`). `main` is the single protected integration trunk — PRs are required and the `Lint, Typecheck and Build` and `Unit & Integration Tests` checks must pass before merge (SonarCloud still runs on push and same-repo PRs but is not a required check: fork PRs cannot produce it, which used to hard-block them). Cut a release by tagging `main` (`vX.Y.Z`), which triggers the npm publish workflow. There is no `dev` branch and no long-lived `release/*` branches. A PR that bumps the
-> `package.json` version must also run `bun run chart:bump` and commit the result — the
-> required CI check enforces `Chart.yaml appVersion` == `package.json` version (#138).
+> `package.json` version must also run `bun run chart:bump` **and `make -C operator bundle`** and
+> commit both results — the required CI check enforces `Chart.yaml appVersion` == `package.json`
+> version (#138), and a second gate fails when `operator/bundle` / `operator/config` still carry the
+> previous version (the OLM CSV takes its version and controller image tag from `package.json`).
+> Tag only after both are committed: the tag ref is what the operator image and bundle are built
+> from, so a bundle refreshed later lives on `main` only.
 
 ## GitHub
 
