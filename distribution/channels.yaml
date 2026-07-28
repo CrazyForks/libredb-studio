@@ -476,6 +476,8 @@ channels:
     pin:
       strategy: none
       note: Desktop AppImage ships in every release from the desktop-appimage job; the manifest
-        template lives in packaging/flatpak and repacks that asset. Version bumps land as
-        External Data Checker PRs in flathub/org.libredb.Studio and are merged by hand. Flip to
-        live and add a pin once the first submission against flathub/flathub merges.
+        template lives in packaging/flatpak and repacks that asset. The first submission is open
+        as a draft (flathub/flathub#9538) and leaves draft once a release carries the AppImage it
+        references. Version bumps then land as External Data Checker PRs in
+        flathub/org.libredb.Studio and are merged by hand. Flip to live and add a pin once the
+        submission merges.
