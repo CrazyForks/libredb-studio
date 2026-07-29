@@ -141,6 +141,7 @@ deploy/rancher/results/
 
 .cursor/plans/
 .cursor/specs/
+.cursor/rules/
 docs/summaries/
 
 # Maintainer loop runtime artifacts (not source)
