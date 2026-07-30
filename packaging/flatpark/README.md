@@ -150,6 +150,35 @@ The steps below are the runbook for the next submission or a re-pin, and were fo
    404s), and `docs/discovery-pipeline.md` treats a stalled Flathub PR as FlatPark's opening - but
    say so plainly and let the maintainer judge.
 
+## When the listing goes live
+
+Three things outside this directory have to change, and nothing enforces them:
+
+1. `distribution/channels.yaml` - flip the `flatpark` entry from `pending` to `live` and add a pin.
+2. `docs/DISTRIBUTION.md` - drop the "**Not live yet**" sentence from the FlatPark section.
+3. `README.md` - the desktop rows there say the FlatPark listing is in submission. Replace that with
+   the real install command. It was deliberately left out until the remote actually serves the app,
+   so the README never advertises a 404.
+
+## Troubleshooting a local build
+
+**`server has no summary file` on install.** The local remote is pointing at a repo directory that
+no longer exists - typically because the last build ran from a different checkout. The script
+re-points it every run, so this only bites a hand-rolled `flatpak remote-add`. Fix:
+`flatpak --user remote-modify --url="file:///path/to/build/flatpark/repo" libredb-flatpark-local`.
+
+**Blank window.** WebKitGTK's DMABUF renderer. The wrapper sets `WEBKIT_DISABLE_DMABUF_RENDERER=1`;
+if a window still paints blank, check the wrapper actually made it into the build
+(`flatpak run --command=cat org.libredb.Studio//stable /app/bin/libredb-studio`).
+
+**`gtkiconhelper` assertion or `flatpak-spawn` failures at startup.** The installation is not
+registered in `/etc/flatpak/installations.d` - almost always the result of improvising isolation
+with `FLATPAK_USER_DIR`. Use `--installation <name>` against a registered installation instead.
+
+**Verifying an install actually works**, beyond the window opening: the connection list should show
+the embedded SQLite sample, and a query against it should return rows. App data must appear under
+`~/.var/app/org.libredb.Studio/` and nowhere else.
+
 ## After it merges, this copy drifts
 
 FlatPark's CI owns the pins from then on: its bot re-runs `resolve-update.sh` and rewrites the
