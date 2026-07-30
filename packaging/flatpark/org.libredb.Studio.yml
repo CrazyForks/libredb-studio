@@ -48,12 +48,11 @@ modules:
         only-arches:
           - x86_64
         url: https://github.com/libredb/libredb-studio/releases/download/0.9.62/libredb-studio-desktop_0.9.62_amd64.deb
-        # Placeholder: the GUI .deb first ships in 0.9.62. Replace the digest and
-        # the size together with the published values before opening the
-        # upstream PR - packaging/flatpark/README.md. Quoted because an all-digit
-        # digest would otherwise parse as a number rather than a string.
-        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-        size: 0
+        # Quoted because an all-digit digest would otherwise parse as a number
+        # rather than a string. FlatPark's bot rewrites this whole block from
+        # resolve-update.sh once the listing is merged.
+        sha256: "dc9ff0af242dd00afbda720291b7bd655886972056a9545fe90c144fbdfb3382"
+        size: 77678262
       # END MANAGED EXTRA-DATA
       - type: file
         path: apply_extra.sh
