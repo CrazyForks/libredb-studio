@@ -116,6 +116,17 @@ build unmodified" claim is kept verbatim, and the first paragraph says who maint
 This is the same situation as `io.github.todevelopers.GseProfiler` and `dev.adonm.zuko`, both
 recorded upstream as "approved by construction - submitted and maintained by its own developer".
 
+## Submission status
+
+The upstream PR is open: **[flatpark/flatpark#158](https://github.com/flatpark/flatpark/pull/158)**,
+branch `add/org.libredb.Studio`, pinned at the published 0.9.62 GUI `.deb`. All four mandatory
+upstream checks pass (`read-descriptor`, `audit-descriptor`, `build-app.sh` with
+`appstreamcli compose: Success!`, and `check-apply-extra.sh` unpacking as root with capabilities
+dropped), and `catalog.upstream_approved: true` is set with its matching row in their
+`docs/upstream-approvals.md`.
+
+The steps below are the runbook for the next submission or a re-pin, and were followed for this one.
+
 ## Before opening the upstream PR
 
 1. **The pin must be real.** The committed manifest points at `0.9.62` with a placeholder

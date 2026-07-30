@@ -514,6 +514,7 @@ channels:
     links:
       tracking_issue: https://github.com/libredb/libredb-studio/issues/241
       upstream_repo: https://github.com/flatpark/flatpark
+      first_pr: https://github.com/flatpark/flatpark/pull/158
       catalog: https://flatpark.org/
       docs: packaging/flatpark/README.md
     pin:
@@ -521,7 +522,8 @@ channels:
       note: Repackages the GUI .deb as Flatpak extra-data - the artifact is fetched on the user's
         machine at install time, not built by FlatPark, and AppImages are not accepted there. The
         descriptor set is staged in packaging/flatpark and copied into a flatpark/flatpark fork as
-        registry/org.libredb.Studio. Blocked until 0.9.62 publishes the GUI .deb the manifest pins.
+        registry/org.libredb.Studio. Submitted as flatpark/flatpark#158, pinned at the 0.9.62 GUI
+        .deb, carrying the developer-approved flag (LibreDB packages its own app).
         After the first merge FlatPark's own bot re-pins every release from resolve-update.sh, so
         the staged copy drifts by design and must stay out of release gates. Sequencing - FlatPark
         asks that an app not already be on Flathub, so revisit this listing if flathub/flathub#9538
