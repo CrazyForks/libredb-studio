@@ -4,6 +4,63 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "Application updated to 0.9.62 - the desktop build now also ships a GUI Debian package, and the bundled Node sidecar is named libredb-studio-node so it cannot collide with the distribution's nodejs package"
+        - "No chart template changes - the rendered manifests are identical to 0.1.22"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.9.62
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.9.62
+    created: "2026-07-30T01:36:47.15147222Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: 61a6da68e82fa1f03ee72d37b9a3c1bea41ceca9c6290821d03d0710732c1174
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.23/libredb-studio-0.1.23.tgz
+    version: 0.1.23
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "Application updated to 0.9.61 - AUTH_COOKIE_SECURE controls the Secure flag on the auth cookies, so a deployment the browser reaches over plain HTTP can hold a session; set it via extraEnv"
         - "No chart template changes - the rendered manifests are identical to 0.1.21"
       artifacthub.io/containsSecurityUpdates: "false"
@@ -1101,4 +1158,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-07-29T02:07:18.536618373Z"
+generated: "2026-07-30T01:36:47.139747859Z"
