@@ -706,9 +706,8 @@ release AppImage, so the desktop AppImage is a required release asset.
 
 ### FlatPark
 
-[FlatPark](https://flatpark.org/) is a second, signed Flatpak remote. **Not live yet** - tracked in
-[#241](https://github.com/libredb/libredb-studio/issues/241); once the listing lands the install
-flow is:
+[FlatPark](https://flatpark.org/) is a second, signed Flatpak remote, live since 0.9.62
+([#241](https://github.com/libredb/libredb-studio/issues/241)):
 
 ```bash
 flatpak --user remote-add --if-not-exists flatpark https://dl.flatpark.org/flatpark.flatpakrepo

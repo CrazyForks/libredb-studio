@@ -116,16 +116,22 @@ build unmodified" claim is kept verbatim, and the first paragraph says who maint
 This is the same situation as `io.github.todevelopers.GseProfiler` and `dev.adonm.zuko`, both
 recorded upstream as "approved by construction - submitted and maintained by its own developer".
 
-## Submission status
+## Status: live
 
-The upstream PR is open: **[flatpark/flatpark#158](https://github.com/flatpark/flatpark/pull/158)**,
-branch `add/org.libredb.Studio`, pinned at the published 0.9.62 GUI `.deb`. All four mandatory
-upstream checks pass (`read-descriptor`, `audit-descriptor`, `build-app.sh` with
-`appstreamcli compose: Success!`, and `check-apply-extra.sh` unpacking as root with capabilities
-dropped), and `catalog.upstream_approved: true` is set with its matching row in their
-`docs/upstream-approvals.md`.
+Merged as **[flatpark/flatpark#158](https://github.com/flatpark/flatpark/pull/158)** on 2026-07-30
+and serving from `dl.flatpark.org` since 0.9.62, with the developer-approved badge
+(`catalog.upstream_approved: true` plus its row in their `docs/upstream-approvals.md`).
 
-The steps below are the runbook for the next submission or a re-pin, and were followed for this one.
+Verified on the published path, not just locally: installed from the `flatpark` remote, version
+`0.9.62`, and the enforced sandbox has no `filesystems=` line at all. The maintainer independently
+re-derived the same result in a static review pass.
+
+**FlatPark's bot owns the pin from here on.** It re-runs `resolve-update.sh` after each of our
+releases and rewrites the managed block in *their* copy. Nothing in this repo needs to move on a
+release, and this directory drifts by design - see the last section.
+
+The steps below are the runbook for a fresh submission or a manual re-pin, and were followed for
+this one.
 
 ## Before opening the upstream PR
 
@@ -149,16 +155,6 @@ The steps below are the runbook for the next submission or a re-pin, and were fo
    "not *already* on Flathub", which we satisfy (`flathub.org/api/v2/appstream/org.libredb.Studio`
    404s), and `docs/discovery-pipeline.md` treats a stalled Flathub PR as FlatPark's opening - but
    say so plainly and let the maintainer judge.
-
-## When the listing goes live
-
-Three things outside this directory have to change, and nothing enforces them:
-
-1. `distribution/channels.yaml` - flip the `flatpark` entry from `pending` to `live` and add a pin.
-2. `docs/DISTRIBUTION.md` - drop the "**Not live yet**" sentence from the FlatPark section.
-3. `README.md` - the desktop rows there say the FlatPark listing is in submission. Replace that with
-   the real install command. It was deliberately left out until the remote actually serves the app,
-   so the README never advertises a 404.
 
 ## Troubleshooting a local build
 

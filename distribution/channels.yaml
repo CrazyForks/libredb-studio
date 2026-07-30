@@ -170,7 +170,7 @@ channels:
   - id: appimage
     # Quoted: an unquoted scalar containing ": " is a YAML mapping, not a string.
     name: "Desktop app (release assets: AppImage and GUI .deb, x64 + arm64)"
-    status: pending
+    status: live
     tier: 1
     kind: release-assets
     update:
@@ -183,10 +183,10 @@ channels:
     pin:
       strategy: none
       note: Both artifacts come per arch out of the one desktop-appimage job and are required by
-        publish-release, so they cannot drift from the tag. Flip to live with the first release that
-        ships them (0.9.59 predates the job). The AppImage is what the Flathub manifest repacks; the
-        GUI .deb (libredb-studio-desktop_<version>_<arch>.deb, distinct from the headless server
-        package) is what FlatPark pins as extra-data and ships from 0.9.62.
+        publish-release, so they cannot drift from the tag - hence no pin. The AppImage has shipped
+        since 0.9.60 and the GUI .deb since 0.9.62. The AppImage is what the Flathub manifest
+        repacks; the GUI .deb (libredb-studio-desktop_<version>_<arch>.deb, distinct from the
+        headless server package) is what FlatPark pins as extra-data.
 
   # ---- Tier 2: LibreDB-owned copies and listings, bumped by hand ----------
 
@@ -505,7 +505,7 @@ channels:
 
   - id: flatpark
     name: FlatPark signed Flatpak remote (org.libredb.Studio)
-    status: pending
+    status: live
     tier: 4
     kind: package-manager
     update:
@@ -522,9 +522,9 @@ channels:
       note: Repackages the GUI .deb as Flatpak extra-data - the artifact is fetched on the user's
         machine at install time, not built by FlatPark, and AppImages are not accepted there. The
         descriptor set is staged in packaging/flatpark and copied into a flatpark/flatpark fork as
-        registry/org.libredb.Studio. Submitted as flatpark/flatpark#158, pinned at the 0.9.62 GUI
-        .deb, carrying the developer-approved flag (LibreDB packages its own app).
-        After the first merge FlatPark's own bot re-pins every release from resolve-update.sh, so
-        the staged copy drifts by design and must stay out of release gates. Sequencing - FlatPark
-        asks that an app not already be on Flathub, so revisit this listing if flathub/flathub#9538
-        is accepted. Flip to live and add a pin once the submission merges.
+        registry/org.libredb.Studio. Live since 0.9.62 (flatpark/flatpark#158 merged 2026-07-30),
+        carrying the developer-approved flag - LibreDB packages its own app. FlatPark's bot now
+        re-pins every release from resolve-update.sh, so the staged copy drifts by design and must
+        stay out of release gates; a released version reaching the catalog is their CI's job, not
+        ours, which is why there is no pin here. Sequencing - FlatPark asks that an app not already
+        be on Flathub, so revisit this listing if flathub/flathub#9538 is accepted.
