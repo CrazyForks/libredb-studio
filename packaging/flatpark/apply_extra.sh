@@ -25,6 +25,13 @@ set -eu
 # *build* time: extra-data is fetched later on the user's machine, so anything
 # Flatpak has to export cannot come from here.
 
+# The apply_extra sandbox has no locale configured, and bsdtar prints
+# "Failed to set default locale" twice on every install without this. Harmless,
+# but it is the only output a user sees from this script, so it reads like a
+# packaging fault.
+LC_ALL=C
+export LC_ALL
+
 extra_root="${EXTRA_ROOT:-/app/extra}"
 cd "$extra_root"
 

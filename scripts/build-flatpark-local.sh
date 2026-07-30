@@ -195,6 +195,13 @@ fi
 echo "==> Installing into ${INSTALLATION:-the per-user installation}"
 flatpak "${FLATPAK_TARGET[@]}" remote-add --if-not-exists --no-gpg-verify \
   libredb-flatpark-local "$BUILD_DIR/repo"
+# --if-not-exists keeps whatever URL the remote already had, which is wrong the
+# moment this repo is built from a different checkout: the remote then points at
+# a path that may no longer exist and the install dies with "server has no
+# summary file", which reads like a corrupt build rather than a stale pointer.
+# Re-point it every run.
+flatpak "${FLATPAK_TARGET[@]}" remote-modify --no-gpg-verify \
+  --url="file://${BUILD_DIR}/repo" libredb-flatpark-local
 # extra-data is downloaded HERE, from the loopback origin above, and apply_extra
 # runs immediately afterwards inside the sandbox. An install that succeeds is
 # the real proof that the bsdtar unpack works.
