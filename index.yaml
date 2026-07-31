@@ -4,6 +4,63 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "Application updated to 0.9.64 - a JWT_SECRET shorter than 32 characters now stops the container at startup with an explanatory banner instead of answering healthy while every login fails"
+        - "No chart template changes - the rendered manifests are identical to 0.1.25"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.9.64
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.9.64
+    created: "2026-07-31T13:30:45.790371336Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: 47bda0284b7ae82bf24d7ebf35c04044bbc62d64d8e40df2ea3c317aa2911199
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.26/libredb-studio-0.1.26.tgz
+    version: 0.1.26
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "Strict mode no longer demands secrets.adminPassword when authProvider=oidc, and an OIDC existingSecret no longer needs an admin-password key"
         - "The admin-email Secret key is written only when secrets.adminEmail is set, like every sibling key"
         - "New persistence.emptyDirSizeLimit caps the /app/data emptyDir used when persistence is disabled (empty keeps it unlimited)"
@@ -1274,4 +1331,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-07-31T09:37:51.25228801Z"
+generated: "2026-07-31T13:30:45.783574583Z"
