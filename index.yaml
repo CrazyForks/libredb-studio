@@ -4,6 +4,63 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "Application updated to 0.9.63 - every release download now carries a signed provenance attestation, the npx launcher verifies it before starting, and the SQL editor serves its own Monaco assets so the workspace opens with no internet access"
+        - "No chart template changes - the rendered manifests are identical to 0.1.23"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.9.63
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.9.63
+    created: "2026-07-31T08:03:47.69792283Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: 541948d653434d7b063d63e76b13eee14dc79e1f48b0ed55eff924ee53743f3f
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.24/libredb-studio-0.1.24.tgz
+    version: 0.1.24
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "Application updated to 0.9.62 - the desktop build now also ships a GUI Debian package, and the bundled Node sidecar is named libredb-studio-node so it cannot collide with the distribution's nodejs package"
         - "No chart template changes - the rendered manifests are identical to 0.1.22"
       artifacthub.io/containsSecurityUpdates: "false"
@@ -1158,4 +1215,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-07-30T01:36:47.139747859Z"
+generated: "2026-07-31T08:03:47.691220301Z"
