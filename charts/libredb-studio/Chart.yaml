@@ -2,8 +2,8 @@ apiVersion: v2
 name: libredb-studio
 description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, and Redis
 type: application
-version: 0.1.25
-appVersion: "0.9.63"
+version: 0.1.26
+appVersion: "0.9.64"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
 icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
@@ -31,7 +31,7 @@ annotations:
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.9.63
+      image: ghcr.io/libredb/libredb-studio:0.9.64
       platforms:
         - linux/amd64
         - linux/arm64
@@ -43,10 +43,8 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "Strict mode no longer demands secrets.adminPassword when authProvider=oidc, and an OIDC existingSecret no longer needs an admin-password key"
-    - "The admin-email Secret key is written only when secrets.adminEmail is set, like every sibling key"
-    - "New persistence.emptyDirSizeLimit caps the /app/data emptyDir used when persistence is disabled (empty keeps it unlimited)"
-    - "New persistence.fixPermissions chowns a mounted volume in a root init container, for hostPath and static PVs the kubelet does not apply fsGroup to"
+    - "Application updated to 0.9.64 - a JWT_SECRET shorter than 32 characters now stops the container at startup with an explanatory banner instead of answering healthy while every login fails"
+    - "No chart template changes - the rendered manifests are identical to 0.1.25"
 dependencies:
   - name: postgresql
     version: "16.x.x"
