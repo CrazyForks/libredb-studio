@@ -442,24 +442,29 @@ channels:
 
   - id: winget
     name: winget community repository (LibreDB.Studio)
-    status: pending
+    status: live
     tier: 4
     kind: package-manager
     update:
       method: ci_publish
       sla: every_release
-      # No listing to update yet: the first submission (winget-pkgs#402985) is
-      # still under review, and wingetcreate update cannot create one.
-      ci_enabled: false
+      # The first listing merged 2026-07-31, so wingetcreate update now has a
+      # manifest to carry forward and every release submits an update PR.
+      ci_enabled: true
     links:
       tracking_issue: https://github.com/libredb/libredb-studio/issues/114
+      first_pr: https://github.com/microsoft/winget-pkgs/pull/402985
+      catalog: https://github.com/microsoft/winget-pkgs/tree/master/manifests/l/LibreDB/Studio
       upstream_repo: https://github.com/microsoft/winget-pkgs
       docs: docs/DISTRIBUTION.md
     pin:
       strategy: none
-      note: win32 zip ships in every release since 0.9.59. CI submits update PRs via wingetcreate
-        (WINGETCREATE_GITHUB_TOKEN gate); the FIRST listing is submitted and under review
-        (microsoft/winget-pkgs#402985). Flip to live and add a winget-pkgs pin once it merges.
+      note: Listed since 0.9.59 (winget install LibreDB.Studio). Deliberately unpinned - winget
+        publishes no floating "latest" document. The winget-pkgs contents listing and the
+        storefront REST source both enumerate every published version, and this checker requires
+        all matches in a source to agree, so any regex over them would report ambiguity forever.
+        The release job's own pre-check (package listed / version already merged / update PR
+        already open) is the real guard; listed versions live under manifests/l/LibreDB/Studio/.
 
   - id: chocolatey
     name: Chocolatey community repository (libredb-studio)

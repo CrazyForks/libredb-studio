@@ -594,26 +594,28 @@ Full variable reference: [`.env.example`](../.env.example). OIDC setup details:
 ## Windows (winget / Chocolatey / portable zip)
 
 The win32-x64 standalone zip is built and attached to every
-[GitHub release](https://github.com/libredb/libredb-studio/releases) since 0.9.59. The
-winget/Chocolatey CI automation is in place and gated; the first winget listing
-([microsoft/winget-pkgs#402985](https://github.com/microsoft/winget-pkgs/pull/402985)) and the
-first Chocolatey push are in community review (see the
-[first-listing checklist](#windows-first-listing-checklist) — track
+[GitHub release](https://github.com/libredb/libredb-studio/releases) since 0.9.59.
+**winget is live**: the first listing
+([microsoft/winget-pkgs#402985](https://github.com/microsoft/winget-pkgs/pull/402985)) merged on
+2026-07-31, so `winget install LibreDB.Studio` resolves from the community repository and every
+release now submits its update PR automatically. The first Chocolatey push is still in community
+moderation (see the [first-listing checklist](#windows-first-listing-checklist) — track
 [issue #114](https://github.com/libredb/libredb-studio/issues/114)).
 
-> **Both Windows package channels are switched off in the inventory until their reviews clear**
+> **Chocolatey stays switched off in the inventory until its moderation clears**
 > (`update.ci_enabled: false` in [`distribution/channels.yaml`](../distribution/channels.yaml) —
 > see [Turning a channel's automation off](#turning-a-channels-automation-off)). Chocolatey is the
 > reason the switch exists: `push.chocolatey.org` answers `403 Forbidden` for *every* version
 > while an account's first submission is unapproved, which failed the 0.9.60 and 0.9.61 release
 > runs even though both releases published correctly. **To re-enable:** set `ci_enabled: true` and
-> flip `status` to `live` in the same edit. The next release publishes the channel; do not
-> re-dispatch `release-artifacts` for an already-published version to backfill the feed, because
-> its asset steps would fight the immutable release — push a back version by hand with the same
-> choco container the job uses if the feed needs it.
+> flip `status` to `live` in the same edit — exactly what winget got once its listing merged. The
+> next release publishes the channel; do not re-dispatch `release-artifacts` for an
+> already-published version to backfill the feed, because its asset steps would fight the
+> immutable release — push a back version by hand (the same choco container the job uses for
+> Chocolatey; the [manual manifest recipe](#windows-first-listing-checklist) for winget).
 
 ```powershell
-# winget (after the first listing merges in microsoft/winget-pkgs)
+# winget
 winget install LibreDB.Studio
 
 # Chocolatey (after the first push clears community moderation)
@@ -1007,33 +1009,44 @@ and Chocolatey is secret-gated and ready — both `CHOCO_API_KEY` (API key of th
 account on community.chocolatey.org) and `WINGETCREATE_GITHUB_TOKEN` are configured in the
 repo's Actions secrets. The FIRST listing in each community catalog is a one-time human step
 (same pattern as the Snap Store name registration). Both first submissions were made with
-0.9.59 — the Chocolatey push is in moderation and the winget listing is
-[microsoft/winget-pkgs#402985](https://github.com/microsoft/winget-pkgs/pull/402985); step 3
-below remains once each goes live:
+0.9.59: **winget merged on 2026-07-31** and is `live` with `ci_enabled: true`, while the
+Chocolatey push is still in moderation.
 
 1. **Chocolatey** — the release's chocolatey job packs and pushes automatically. The first push
    enters [human moderation](https://docs.chocolatey.org/en-us/community-repository/moderation/);
    while a version sits in the moderation queue, pushing further versions can be rejected —
    if a release-time push fails during that window, re-run the job after approval.
-2. **winget** — the first manifest cannot be submitted by `wingetcreate update` (the package id
-   does not exist yet; the release job detects this and skips with a notice). Render the
-   manifests locally from the release's `SHA256SUMS` and submit once by hand:
+2. **winget** — DONE:
+   [microsoft/winget-pkgs#402985](https://github.com/microsoft/winget-pkgs/pull/402985) (the
+   Microsoft CLA is signed on that first PR). The first manifest could not be submitted by
+   `wingetcreate update` — the package id did not exist yet, and the release job detects that and
+   skips with a notice — so it was rendered from the in-repo templates and opened by hand. Later
+   releases submit update PRs automatically; the same manual recipe still covers a **back
+   version** (a release published while the channel was switched off, since re-dispatching
+   `release-artifacts` for a published version is not an option):
 
    ```bash
-   gh release download <version> --pattern SHA256SUMS --dir dist
+   VERSION=<version>
+   gh release download "$VERSION" --pattern SHA256SUMS --dir dist
    for t in packaging/winget/*.tmpl; do
-     out="manifests/l/LibreDB/Studio/<version>/$(basename "${t%.tmpl}")"
-     node scripts/render-windows-packaging.mjs "$t" dist/SHA256SUMS <version> "$out"
+     out="manifests/l/LibreDB/Studio/$VERSION/$(basename "${t%.tmpl}")"
+     node scripts/render-windows-packaging.mjs "$t" dist/SHA256SUMS "$VERSION" "$out"
    done
-   wingetcreate submit --token <classic-PAT> manifests/l/LibreDB/Studio/<version>
    ```
 
-   (or open the PR against [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs)
-   manually; sign the Microsoft CLA on that first PR). Once it merges, later releases submit
-   update PRs automatically.
+   Then either `wingetcreate submit --token <classic-PAT> manifests/l/LibreDB/Studio/$VERSION`
+   (Windows only — wingetcreate ships a win-x64 binary), or, from any OS, commit the three files
+   to a branch on a `microsoft/winget-pkgs` fork and open the PR with `gh` — the whole submission
+   is "add `manifests/l/LibreDB/Studio/<version>/`", nothing else changes. Title convention:
+   `New package: <id> version <version>` for a first listing, `New version: <id> version
+   <version>` for an update. Upstream's validation pipeline downloads the `InstallerUrl` and
+   verifies `InstallerSha256`, so the release must already be published.
 3. After each catalog goes live: flip its `distribution/channels.yaml` entry to `status: live`,
-   set `links.first_pr`, and add a measurable pin (winget-pkgs raw manifest / Chocolatey
-   community API).
+   set `links.first_pr`, and add a measurable pin where one exists (Chocolatey community API).
+   **winget is deliberately unpinned** (`pin.strategy: none`): it publishes no floating "latest"
+   document — the winget-pkgs contents listing and the storefront REST source both enumerate
+   every published version, and the checker requires all matches in a source to agree, so any
+   regex over them would report ambiguity forever.
 
 ### Channel inventory and drift check
 
@@ -1111,10 +1124,12 @@ Three deliberate constraints:
   the optional channels skip while the release publishes normally. A forgotten re-enable surfaces
   in the weekly drift table rather than in a broken release.
 
-Do not confuse it with `status`: `status` describes the channel's listing (`winget` is `pending`
-because its first listing PR has not merged, while the zip it points at is built and required on
-every release), whereas `ci_enabled` describes only whether release CI may publish it. A channel
-whose listing will never happen is `deprecated`, not `pending` — `flathub` is the worked example.
+Do not confuse it with `status`: `status` describes the channel's listing (`chocolatey` is
+`pending` because its first push has not cleared moderation, while the zip it points at is built
+and required on every release), whereas `ci_enabled` describes only whether release CI may
+publish it. The two move together when a listing lands — `winget` went `pending`/`false` to
+`live`/`true` in a single edit once #402985 merged. A channel whose listing will never happen is
+`deprecated`, not `pending` — `flathub` is the worked example.
 
 **Adding a channel** = one new entry in `channels.yaml` (copy a neighbour of the same tier; the
 schema is validated on every run). Set `links.first_pr` to the PR that landed the listing, and
@@ -1159,9 +1174,10 @@ deliverable (`pin.strategy: local_file` for the version-pinned `fly.toml`; `none
 - **Website install docs**: the libredb-website documentation must be updated with the new
   channels (npx, Homebrew, .deb/.rpm, Snap) — a cross-repo step and part of issue #111's
   "README and website docs" acceptance criterion (and implicitly of #110/#112/#113).
-- **Windows first listings**: the `win32-x64` zip, launcher, winget/Chocolatey release
-  automation, and both gating secrets are in place; the one-time first submissions to both
-  community catalogs follow the
+- **Windows first listings**: winget is done —
+  [microsoft/winget-pkgs#402985](https://github.com/microsoft/winget-pkgs/pull/402985) merged on
+  2026-07-31 and the channel is `live` with release-CI updates enabled. Only the Chocolatey first
+  push is still outstanding (human moderation), per the
   [Windows first-listing checklist](#windows-first-listing-checklist) —
   tracked in [issue #114](https://github.com/libredb/libredb-studio/issues/114).
 - **Flathub submission — closed, not shipping.**
