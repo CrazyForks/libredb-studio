@@ -2,8 +2,8 @@ apiVersion: v2
 name: libredb-studio
 description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, and Redis
 type: application
-version: 0.1.26
-appVersion: "0.9.64"
+version: 0.1.27
+appVersion: "0.9.65"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
 icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
@@ -31,7 +31,7 @@ annotations:
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.9.64
+      image: ghcr.io/libredb/libredb-studio:0.9.65
       platforms:
         - linux/amd64
         - linux/arm64
@@ -43,8 +43,8 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "Application updated to 0.9.64 - a JWT_SECRET shorter than 32 characters now stops the container at startup with an explanatory banner instead of answering healthy while every login fails"
-    - "No chart template changes - the rendered manifests are identical to 0.1.25"
+    - "Application updated to 0.9.65 - clicking Explain on a statement the dialect cannot explain no longer runs that statement for real with the dangerous-query confirmation bypassed; the run is refused with the reason instead"
+    - "No chart template changes - the rendered manifests are identical to 0.1.26"
 dependencies:
   - name: postgresql
     version: "16.x.x"
