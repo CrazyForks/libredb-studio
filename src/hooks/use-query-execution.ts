@@ -34,6 +34,21 @@ interface UseQueryExecutionParams {
   queryEditorRef: RefObject<QueryEditorRef | null>;
 }
 
+/**
+ * Why an explain run cannot proceed, phrased for the user. Absent metadata means
+ * "not loaded yet", not "unsupported" — blaming the database type there would be
+ * misleading.
+ */
+function explainRefusal(metadata: ProviderMetadata | null, hasStrategy: boolean) {
+  if (!metadata) {
+    return { title: "Not Ready", description: "Connection metadata is still loading. Try again in a moment." };
+  }
+  if (hasStrategy && metadata.capabilities.supportsExplain) {
+    return { title: "Not Supported", description: "Only SELECT statements can be explained." };
+  }
+  return { title: "Not Supported", description: "EXPLAIN is not available for this database type." };
+}
+
 export function useQueryExecution({
   activeConnection,
   metadata,
@@ -138,20 +153,23 @@ export function useQueryExecution({
       );
       setBottomPanelMode(isExplain ? "explain" : "results");
 
-      // Check EXPLAIN support via capabilities
-      if (isExplain && metadata && !metadata.capabilities.supportsExplain) {
-        toast({
-          title: "Not Supported",
-          description: "EXPLAIN is not available for this database type.",
-          variant: "destructive",
-        });
+      const explainStrategy = getExplainStrategy(metadata?.capabilities.explainFormat);
+
+      // An explain run skips the dangerous-query gate above, so it may only ever
+      // send SQL the dialect actually built for it — whether the provider denies
+      // EXPLAIN outright, ships no strategy, or the statement is not a SELECT.
+      // Falling back to the original statement would execute e.g. an UPDATE
+      // unguarded (#201).
+      const explainSupported = !metadata || metadata.capabilities.supportsExplain;
+      const directExplainSql =
+        isExplain && explainSupported ? (explainStrategy?.buildSql(queryToExecute, "analyze") ?? null) : null;
+      if (isExplain && !directExplainSql) {
+        toast({ ...explainRefusal(metadata, Boolean(explainStrategy)), variant: "destructive" });
         setTabs((prev) =>
           prev.map((t) => (t.id === targetTabId ? { ...t, isExecuting: false, isLoadingMore: false } : t)),
         );
         return;
       }
-
-      const explainStrategy = getExplainStrategy(metadata?.capabilities.explainFormat);
 
       const startTime = Date.now();
       // Set up abort controller for query cancellation
@@ -176,13 +194,7 @@ export function useQueryExecution({
         }
 
         // If isExplain mode, run the dialect's EXPLAIN query instead
-        let queryToRun = queryToExecute;
-        if (isExplain && explainStrategy) {
-          const explainSql = explainStrategy.buildSql(queryToExecute, "analyze");
-          if (explainSql) {
-            queryToRun = explainSql;
-          }
-        }
+        const queryToRun = directExplainSql || queryToExecute;
 
         // Detect multi-statement queries (not for EXPLAIN or load-more or transaction)
         const useMultiQuery =
