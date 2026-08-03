@@ -9,6 +9,11 @@
  * `--strict` exits 1 only for owned local_file pins whose update SLA is
  * every_release - remote catalogs are upstream-owned and never gate.
  *
+ * `--matrix` is this file's second job: it regenerates the marker regions of
+ * docs/CHANNELS.md (the audience coverage matrix) from the same channel
+ * inventory. `--check` alongside it verifies those regions are up to date
+ * without writing, for use as a freshness gate.
+ *
  * The checker only ever READS channels.yaml; version bumps in pin files and
  * inventory edits are human work (see docs/DISTRIBUTION.md). Mirrors the
  * style of scripts/sync-chart-version.mjs; the pure functions below are unit
@@ -25,6 +30,81 @@ const STATUSES = ["live", "pending", "deprecated"];
 const STRATEGIES = ["local_file", "remote_file", "probe", "none"];
 const METHODS = ["ci_publish", "commit", "upstream_pr", "manual_ui"];
 const SLAS = ["every_release", "minor_plus", "major_only", "on_demand"];
+
+/** Business-facing buckets for docs/CHANNELS.md (not the maintainer tier axis). */
+export const CHANNEL_CATEGORIES = [
+  "registries-releases",
+  "containers",
+  "kubernetes-operators",
+  "package-managers",
+  "os-desktop",
+  "paas-catalogs",
+  "deploy-recipes",
+  "cloud-marketplaces",
+];
+
+export const CATEGORY_LABELS = {
+  "registries-releases": "Registries & releases",
+  containers: "Containers",
+  "kubernetes-operators": "Kubernetes & operators",
+  "package-managers": "Package managers",
+  "os-desktop": "OS / desktop packages",
+  "paas-catalogs": "PaaS catalogs (listed)",
+  "deploy-recipes": "Deploy recipes",
+  "cloud-marketplaces": "Cloud marketplaces",
+};
+
+/**
+ * Technical shape of the artefact a channel actually is - independent of
+ * `category` (the audience-facing bucket several kinds can share). Neither
+ * axis determines the other: `kubernetes-operators` (category) spans
+ * `helm-chart`, `operator-catalog` and `partner-catalog` (kind), while
+ * `paas-template` (kind) spans both `paas-catalogs` and `deploy-recipes`
+ * (category). Exactly the 13 values in use across the inventory - a closed
+ * enum so a typo becomes a startup error instead of an unvalidated label
+ * that nothing ever reads.
+ */
+export const CHANNEL_KINDS = [
+  "release-assets",
+  "container-image",
+  "package-registry",
+  "helm-chart",
+  "package-manager",
+  "os-package",
+  "one-click-template",
+  "paas-template",
+  "deploy-button",
+  "operator-catalog",
+  "partner-catalog",
+  "curated-catalog",
+  "marketplace",
+];
+
+/**
+ * Platforms a channel serves. This order is canonical: the matrix renders and
+ * counts in it regardless of the order written in yaml, so output is stable.
+ * Not derivable from `kind` - `package-manager` alone spans Homebrew (macOS +
+ * Linux), Snap (Linux) and winget (Windows).
+ */
+export const PLATFORMS = ["linux", "macos", "windows", "container", "kubernetes", "cloud"];
+
+export const PLATFORM_LABELS = {
+  linux: "Linux",
+  macos: "macOS",
+  windows: "Windows",
+  container: "Container",
+  kubernetes: "Kubernetes",
+  cloud: "Cloud",
+};
+
+const SLA_LABELS = {
+  every_release: "Every release",
+  minor_plus: "Minor+",
+  major_only: "Major only",
+  on_demand: "On demand",
+};
+
+const STATUS_ORDER = { live: 0, pending: 1, deprecated: 2 };
 
 /**
  * Channels whose release-CI publish step may be switched off from this file via
@@ -285,6 +365,20 @@ export function parseChannels(yamlText) {
     if (!STATUSES.includes(channel.status)) {
       throw new Error(`${CHANNELS_YAML}: ${id}: status must be one of ${STATUSES.join("|")}`);
     }
+    if (!CHANNEL_CATEGORIES.includes(channel.category)) {
+      throw new Error(`${CHANNELS_YAML}: ${id}: category must be one of ${CHANNEL_CATEGORIES.join("|")}`);
+    }
+    if (!CHANNEL_KINDS.includes(channel.kind)) {
+      throw new Error(`${CHANNELS_YAML}: ${id}: kind must be one of ${CHANNEL_KINDS.join("|")}`);
+    }
+    if (!Array.isArray(channel.platforms) || channel.platforms.length === 0) {
+      throw new Error(`${CHANNELS_YAML}: ${id}: platforms must be a non-empty list`);
+    }
+    for (const platform of channel.platforms) {
+      if (!PLATFORMS.includes(platform)) {
+        throw new Error(`${CHANNELS_YAML}: ${id}: platforms entries must be one of ${PLATFORMS.join("|")}`);
+      }
+    }
     if (!channel.update || !METHODS.includes(channel.update.method)) {
       throw new Error(`${CHANNELS_YAML}: ${id}: update.method must be one of ${METHODS.join("|")}`);
     }
@@ -499,6 +593,181 @@ export function renderTable(rows, pkgVersion) {
   return `${lines.join("\n")}\n`;
 }
 
+export function humanizeSla(sla) {
+  return SLA_LABELS[sla] ?? sla;
+}
+
+/** Resolve a channels.yaml docs path for links from docs/CHANNELS.md. */
+export function docsHref(docsPath) {
+  if (!docsPath) {
+    return "DISTRIBUTION.md";
+  }
+  if (docsPath.startsWith("docs/")) {
+    return docsPath.slice("docs/".length);
+  }
+  return `../${docsPath}`;
+}
+
+/** Table display name: the short one when the inventory name is too long to scan. */
+function displayName(channel) {
+  return channel.short_name ?? channel.name ?? channel.id;
+}
+
+/**
+ * Where a user actually obtains this channel. Undefined when the inventory has
+ * nothing to point at - deliberately not a heuristic, because a fallback chain
+ * invented here would be a rule nobody reading channels.yaml can see.
+ *
+ * A deprecated channel is never a place to get the product - a link there
+ * would tell a user to go install something that is not being shipped - so it
+ * renders as plain text even when the inventory still records where its
+ * submission went (e.g. Flathub's upstream_repo). That is a property of the
+ * status, not of any one channel, so it is a status guard here rather than a
+ * data deletion in channels.yaml.
+ */
+export function channelHref(channel) {
+  if (channel.status === "deprecated") {
+    return undefined;
+  }
+  return channel.links?.get ?? channel.links?.catalog ?? channel.links?.upstream_repo;
+}
+
+/** Platform labels in canonical order, whatever order the yaml used. */
+export function platformCell(platforms) {
+  return PLATFORMS.filter((platform) => platforms.includes(platform))
+    .map((platform) => PLATFORM_LABELS[platform])
+    .join(", ");
+}
+
+/** Who bumps this channel and how fast. A dash for retired channels. */
+export function updateSummary(channel) {
+  if (channel.status === "deprecated") {
+    return "—";
+  }
+  const automation =
+    channel.update.method === "ci_publish"
+      ? channel.update.ci_enabled === false
+        ? "Automated (paused)"
+        : "Automated"
+      : "Manual";
+  return `${automation}, ${humanizeSla(channel.update.sla).toLowerCase()}`;
+}
+
+/** Guide column label: the href without its relative prefix. */
+export function guideLabel(href) {
+  return href.startsWith("../") ? href.slice("../".length) : href;
+}
+
+function sortedMatrixChannels(channels) {
+  return [...channels].sort((a, b) => {
+    const cat = CHANNEL_CATEGORIES.indexOf(a.category) - CHANNEL_CATEGORIES.indexOf(b.category);
+    if (cat !== 0) {
+      return cat;
+    }
+    const status = (STATUS_ORDER[a.status] ?? 99) - (STATUS_ORDER[b.status] ?? 99);
+    if (status !== 0) {
+      return status;
+    }
+    return a.id.localeCompare(b.id);
+  });
+}
+
+/** Live channels per platform, canonical order, zero-count platforms dropped. */
+function livePlatformCounts(channels) {
+  const live = channels.filter((c) => c.status === "live");
+  return PLATFORMS.map((platform) => ({
+    label: PLATFORM_LABELS[platform],
+    count: live.filter((c) => c.platforms.includes(platform)).length,
+  })).filter((entry) => entry.count > 0);
+}
+
+/** Coverage scorecard for docs/CHANNELS.md: users, developers and buyers in one snapshot. */
+export function renderScorecard(channels) {
+  const total = channels.length;
+  const live = channels.filter((c) => c.status === "live").length;
+  const pending = channels.filter((c) => c.status === "pending").length;
+  const deprecated = channels.filter((c) => c.status === "deprecated").length;
+
+  const lines = [
+    "## Coverage snapshot",
+    "",
+    `**${total} channels · ${live} live · ${pending} pending · ${deprecated} deprecated**`,
+    "",
+  ];
+
+  // A multi-platform channel is counted once per platform, so these overlap and
+  // do not sum to the total. Live only: pending and declined are not coverage.
+  const platforms = livePlatformCounts(channels)
+    .map((entry) => `${entry.label} ${entry.count}`)
+    .join(" · ");
+  if (platforms) {
+    lines.push(`Live channels by platform: **${platforms}**`, "");
+  }
+
+  lines.push("| Category | Live | Pending | Deprecated |", "| --- | ---: | ---: | ---: |");
+  for (const category of CHANNEL_CATEGORIES) {
+    const inCat = channels.filter((c) => c.category === category);
+    if (inCat.length === 0) {
+      continue;
+    }
+    lines.push(
+      `| ${CATEGORY_LABELS[category]} | ${inCat.filter((c) => c.status === "live").length} | ` +
+        `${inCat.filter((c) => c.status === "pending").length} | ` +
+        `${inCat.filter((c) => c.status === "deprecated").length} |`,
+    );
+  }
+
+  lines.push("");
+  return `${lines.join("\n")}\n`;
+}
+
+/** Full channel inventory table for docs/CHANNELS.md. */
+export function renderChannelMatrix(channels) {
+  const lines = [
+    "| Channel | Category | Platform | Status | Updates | Guide |",
+    "| --- | --- | --- | --- | --- | --- |",
+  ];
+  for (const channel of sortedMatrixChannels(channels)) {
+    const href = channelHref(channel);
+    const name = displayName(channel);
+    const guide = docsHref(channel.links?.docs);
+    lines.push(
+      `| ${href ? `[${name}](${href})` : name} | ${CATEGORY_LABELS[channel.category]} | ` +
+        `${platformCell(channel.platforms)} | ${channel.status} | ${updateSummary(channel)} | ` +
+        `[${guideLabel(guide)}](${guide}) |`,
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+const SCORECARD_BEGIN = "<!-- BEGIN:CHANNEL-SCORECARD -->";
+const SCORECARD_END = "<!-- END:CHANNEL-SCORECARD -->";
+const TABLE_BEGIN = "<!-- BEGIN:CHANNEL-TABLE -->";
+const TABLE_END = "<!-- END:CHANNEL-TABLE -->";
+
+function replaceMarkerRegion(doc, begin, end, body) {
+  const start = doc.indexOf(begin);
+  const stop = doc.indexOf(end);
+  if (start === -1 || stop === -1 || stop < start) {
+    throw new Error(`docs/CHANNELS.md is missing markers ${begin} / ${end}`);
+  }
+  const before = doc.slice(0, start + begin.length);
+  const after = doc.slice(stop);
+  const trimmed = body.replace(/^\n+/, "").replace(/\n+$/, "");
+  return `${before}\n\n${trimmed}\n\n${after}`;
+}
+
+/** Rewrite scorecard + table marker regions; leave narrative untouched. */
+export function applyMatrixMarkers(doc, scorecard, table) {
+  let next = replaceMarkerRegion(doc, SCORECARD_BEGIN, SCORECARD_END, scorecard);
+  next = replaceMarkerRegion(next, TABLE_BEGIN, TABLE_END, table);
+  return next;
+}
+
+export function buildChannelsDoc(doc, channels) {
+  return applyMatrixMarkers(doc, renderScorecard(channels), renderChannelMatrix(channels));
+}
+
 async function fetchText(url, timeoutMs) {
   const headers = githubAuthHeaders(url);
   try {
@@ -515,6 +784,8 @@ async function fetchText(url, timeoutMs) {
 async function main(argv) {
   const strict = argv.includes("--strict");
   const json = argv.includes("--json");
+  const matrix = argv.includes("--matrix");
+  const checkOnly = argv.includes("--check");
   const rootIdx = argv.indexOf("--root");
   const rootArg = rootIdx === -1 ? undefined : argv[rootIdx + 1];
   if (rootIdx !== -1 && (rootArg === undefined || rootArg.startsWith("--"))) {
@@ -523,6 +794,29 @@ async function main(argv) {
   }
   const root = rootIdx === -1 ? process.cwd() : path.resolve(rootArg);
   const timeoutMs = Number(process.env.DISTRIBUTION_CHECK_TIMEOUT_MS ?? 10_000);
+
+  if (checkOnly && !matrix) {
+    console.error("ERROR: --check requires --matrix (use: bun run distribution:matrix --check)");
+    process.exit(2);
+  }
+
+  if (matrix) {
+    const docPath = path.join(root, "docs/CHANNELS.md");
+    const channels = parseChannels(fs.readFileSync(path.join(root, CHANNELS_YAML), "utf8"));
+    const current = fs.readFileSync(docPath, "utf8");
+    const next = buildChannelsDoc(current, channels);
+    if (checkOnly) {
+      if (current !== next) {
+        console.error("ERROR: docs/CHANNELS.md is stale; run: bun run distribution:matrix");
+        process.exit(1);
+      }
+      console.log("docs/CHANNELS.md matrix regions are up to date");
+      return;
+    }
+    fs.writeFileSync(docPath, next);
+    console.log("Updated docs/CHANNELS.md matrix regions");
+    return;
+  }
 
   // The release workflow's automation gates. They answer from the inventory
   // alone - no package.json read, no network - so a gate check can never fail

@@ -8,7 +8,23 @@
 # check").
 #
 # Field summary:
-#   id/name/status/tier/kind  identity; status: live | pending | deprecated
+#   id/name/status/tier       identity; status: live | pending | deprecated
+#   kind                      the technical shape of the artefact (what it
+#                             literally is), independent of category (the audience-facing
+#                             bucket several kinds can share): one of release-assets |
+#                             container-image | package-registry | helm-chart |
+#                             package-manager | os-package | one-click-template |
+#                             paas-template | deploy-button | operator-catalog |
+#                             partner-catalog | curated-catalog | marketplace
+#   category                  business bucket for docs/CHANNELS.md:
+#                             registries-releases | containers | kubernetes-operators |
+#                             package-managers | os-desktop | paas-catalogs |
+#                             deploy-recipes | cloud-marketplaces
+#   platforms                 REQUIRED, non-empty list. Rendered and counted in
+#                             this canonical order in docs/CHANNELS.md:
+#                             linux | macos | windows | container | kubernetes | cloud
+#   short_name                optional; the display name docs/CHANNELS.md uses when
+#                             `name` is too long to scan. Falls back to `name`.
 #   update.method             ci_publish | commit | upstream_pr | manual_ui
 #   update.sla                every_release | minor_plus | major_only | on_demand
 #   update.ci_enabled         REQUIRED on, and allowed ONLY on, the switchable
@@ -21,7 +37,11 @@
 #                             required release assets have no flag on purpose.
 #   links                     tracking_issue / first_pr / last_bump_pr (nullable
 #                             until the first post-listing bump) / catalog /
-#                             upstream_repo / docs
+#                             upstream_repo / docs / get (user-facing "where do I
+#                             get it"; docs/CHANNELS.md resolves it as
+#                             get > catalog > upstream_repo, except a deprecated
+#                             channel renders no link at all, whatever these
+#                             fields hold)
 #   pin.strategy              local_file | remote_file | probe | none
 #   pin.probe                 required when strategy == probe; one of the probe ids
 #                             defined in scripts/distribution-check.mjs
@@ -39,7 +59,10 @@ channels:
 
   - id: github-release
     name: GitHub Releases (standalone tarballs, deb/rpm, snap assets)
+    short_name: GitHub Releases
     status: live
+    category: registries-releases
+    platforms: [linux, macos, windows]
     tier: 0
     kind: release-assets
     update:
@@ -56,7 +79,10 @@ channels:
 
   - id: docker-ghcr
     name: Docker image (GHCR, canonical)
+    short_name: Docker image (GHCR)
     status: live
+    category: containers
+    platforms: [container]
     tier: 0
     kind: container-image
     update:
@@ -75,7 +101,10 @@ channels:
 
   - id: docker-hub-mirror
     name: Docker Hub mirror (discoverability only)
+    short_name: Docker Hub mirror
     status: live
+    category: containers
+    platforms: [container]
     tier: 0
     kind: container-image
     update:
@@ -94,7 +123,10 @@ channels:
 
   - id: npm
     name: npm package @libredb/studio (library + npx launcher)
+    short_name: npm @libredb/studio
     status: live
+    category: registries-releases
+    platforms: [linux, macos, windows]
     tier: 0
     kind: package-registry
     update:
@@ -114,7 +146,10 @@ channels:
 
   - id: helm
     name: Helm chart (libredb.org repo + GHCR OCI + ArtifactHub)
+    short_name: Helm chart
     status: live
+    category: kubernetes-operators
+    platforms: [kubernetes]
     tier: 1
     kind: helm-chart
     update:
@@ -134,7 +169,10 @@ channels:
 
   - id: homebrew
     name: Homebrew tap (libredb/tap/libredb-studio)
+    short_name: Homebrew tap
     status: live
+    category: package-managers
+    platforms: [macos, linux]
     tier: 1
     kind: package-manager
     update:
@@ -153,7 +191,10 @@ channels:
 
   - id: snap
     name: Snap Store (stable channel, amd64+arm64)
+    short_name: Snap Store
     status: live
+    category: package-managers
+    platforms: [linux]
     tier: 1
     kind: package-manager
     update:
@@ -177,7 +218,10 @@ channels:
 
   - id: linux-deb-rpm
     name: Linux .deb / .rpm packages (release assets)
+    short_name: Linux .deb / .rpm
     status: live
+    category: os-desktop
+    platforms: [linux]
     tier: 1
     kind: os-package
     update:
@@ -186,6 +230,7 @@ channels:
     links:
       tracking_issue: https://github.com/libredb/libredb-studio/issues/112
       first_pr: https://github.com/libredb/libredb-studio/pull/122
+      get: https://github.com/libredb/libredb-studio/releases/latest
     pin:
       strategy: none
       note: Built by nfpm from the tag in release-artifacts.yml; nothing to drift.
@@ -193,7 +238,10 @@ channels:
   - id: appimage
     # Quoted: an unquoted scalar containing ": " is a YAML mapping, not a string.
     name: "Desktop app (release assets: AppImage and GUI .deb, x64 + arm64)"
+    short_name: Desktop app (AppImage, .deb)
     status: live
+    category: os-desktop
+    platforms: [linux]
     tier: 1
     kind: release-assets
     update:
@@ -202,6 +250,7 @@ channels:
     links:
       tracking_issue: https://github.com/libredb/libredb-studio/issues/232
       first_pr: https://github.com/libredb/libredb-studio/pull/235
+      get: https://github.com/libredb/libredb-studio/releases/latest
       docs: desktop/README.md
     pin:
       strategy: none
@@ -214,27 +263,12 @@ channels:
 
   # ---- Tier 2: LibreDB-owned copies and listings, bumped by hand ----------
 
-  - id: caprover-local
-    name: CapRover one-click template (in-repo source of truth)
-    status: live
-    tier: 2
-    kind: one-click-template
-    update:
-      method: commit
-      sla: on_demand
-    links:
-      tracking_issue: https://github.com/libredb/libredb-studio/issues/56
-      first_pr: https://github.com/libredb/libredb-studio/pull/57
-      docs: deploy/caprover/README.md
-    pin:
-      strategy: local_file
-      files:
-        - deploy/caprover/libredb-studio.yml
-      extract: "defaultValue: '(\\d+\\.\\d+\\.\\d+)'"
-
   - id: caprover-mirror
     name: CapRover 3rd-party repo (libredb.org/caprover-one-click-apps)
-    status: live
+    short_name: CapRover 3rd-party repo
+    status: deprecated
+    category: paas-catalogs
+    platforms: [cloud]
     tier: 2
     kind: one-click-template
     update:
@@ -245,13 +279,17 @@ channels:
       catalog: https://libredb.org/caprover-one-click-apps
       upstream_repo: https://github.com/libredb/caprover-one-click-apps
     pin:
-      strategy: remote_file
-      url: https://raw.githubusercontent.com/libredb/caprover-one-click-apps/main/public/v4/apps/libredb-studio.yml
-      extract: "defaultValue: '(\\d+\\.\\d+\\.\\d+)'"
+      strategy: none
+      note: This was a LibreDB-owned CapRover repo, published while the official catalog submission
+        (#56) was in review. The official listing (caprover-official) is now live, so this
+        fallback is retired. The libredb.org/caprover-one-click-apps path it was served from is not
+        currently published.
 
   - id: railway-template
     name: Railway one-click template
     status: live
+    category: paas-catalogs
+    platforms: [cloud]
     tier: 2
     kind: paas-template
     update:
@@ -273,13 +311,17 @@ channels:
 
   - id: koyeb-deploy-button
     name: Koyeb deploy button (repo README)
+    short_name: Koyeb deploy button
     status: live
+    category: deploy-recipes
+    platforms: [cloud]
     tier: 2
     kind: deploy-button
     update:
       method: commit
       sla: on_demand
     links:
+      get: https://github.com/libredb/libredb-studio/tree/main/deploy/koyeb
       docs: deploy/koyeb/README.md
     pin:
       strategy: none
@@ -287,7 +329,10 @@ channels:
 
   - id: fly-io
     name: Fly.io launch config (repo fly.toml)
+    short_name: Fly.io launch config
     status: live
+    category: deploy-recipes
+    platforms: [cloud]
     tier: 2
     kind: paas-template
     update:
@@ -296,6 +341,7 @@ channels:
     links:
       tracking_issue: https://github.com/libredb/libredb-studio/issues/218
       first_pr: https://github.com/libredb/libredb-studio/pull/219
+      get: https://github.com/libredb/libredb-studio/blob/main/fly.toml
       docs: docs/FLY.md
     pin:
       strategy: local_file
@@ -306,14 +352,17 @@ channels:
 
   - id: render
     name: Render Blueprint (repo render.yaml)
+    short_name: Render Blueprint
     status: live
+    category: deploy-recipes
+    platforms: [cloud]
     tier: 2
     kind: paas-template
     update:
       method: commit
       sla: on_demand
     links:
-      catalog: https://render.com/deploy?repo=https://github.com/libredb/libredb-studio
+      get: https://github.com/libredb/libredb-studio/blob/main/render.yaml
       docs: docs/DISTRIBUTION.md
     pin:
       strategy: none
@@ -323,7 +372,10 @@ channels:
 
   - id: caprover-official
     name: CapRover official one-click apps
+    short_name: CapRover official
     status: live
+    category: paas-catalogs
+    platforms: [cloud]
     tier: 3
     kind: one-click-template
     update:
@@ -341,6 +393,8 @@ channels:
   - id: dokploy
     name: Dokploy template catalog
     status: live
+    category: paas-catalogs
+    platforms: [cloud]
     tier: 3
     kind: paas-template
     update:
@@ -361,6 +415,8 @@ channels:
   - id: cosmos
     name: Cosmos servapp marketplace
     status: live
+    category: paas-catalogs
+    platforms: [cloud]
     tier: 3
     kind: one-click-template
     update:
@@ -379,6 +435,8 @@ channels:
   - id: kubero
     name: Kubero template catalog
     status: live
+    category: paas-catalogs
+    platforms: [cloud]
     tier: 3
     kind: paas-template
     update:
@@ -397,7 +455,10 @@ channels:
 
   - id: operatorhub-community
     name: OperatorHub / OpenShift community operator catalogs
+    short_name: OperatorHub / OpenShift
     status: pending
+    category: kubernetes-operators
+    platforms: [kubernetes]
     tier: 3
     kind: operator-catalog
     update:
@@ -420,6 +481,8 @@ channels:
   - id: rancher-partner
     name: Rancher Partner Charts
     status: pending
+    category: kubernetes-operators
+    platforms: [kubernetes]
     tier: 4
     kind: partner-catalog
     update:
@@ -435,7 +498,10 @@ channels:
 
   - id: koyeb-catalog
     name: Koyeb One-Click Apps catalog (curated by Koyeb)
+    short_name: Koyeb One-Click Apps catalog
     status: pending
+    category: cloud-marketplaces
+    platforms: [cloud]
     tier: 4
     kind: curated-catalog
     update:
@@ -450,6 +516,8 @@ channels:
   - id: digitalocean
     name: DigitalOcean Marketplace
     status: live
+    category: cloud-marketplaces
+    platforms: [cloud]
     tier: 4
     kind: marketplace
     update:
@@ -465,7 +533,10 @@ channels:
 
   - id: winget
     name: winget community repository (LibreDB.Studio)
+    short_name: winget
     status: live
+    category: package-managers
+    platforms: [windows]
     tier: 4
     kind: package-manager
     update:
@@ -493,7 +564,10 @@ channels:
 
   - id: chocolatey
     name: Chocolatey community repository (libredb-studio)
+    short_name: Chocolatey
     status: pending
+    category: package-managers
+    platforms: [windows]
     tier: 4
     kind: package-manager
     update:
@@ -515,7 +589,10 @@ channels:
 
   - id: flathub
     name: Flathub community catalog (org.libredb.Studio)
+    short_name: Flathub
     status: deprecated
+    category: package-managers
+    platforms: [linux]
     tier: 4
     kind: package-manager
     update:
@@ -542,7 +619,10 @@ channels:
 
   - id: flatpark
     name: FlatPark signed Flatpak remote (org.libredb.Studio)
+    short_name: FlatPark (Flatpak)
     status: live
+    category: package-managers
+    platforms: [linux]
     tier: 4
     kind: package-manager
     update:

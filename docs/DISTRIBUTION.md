@@ -1050,8 +1050,13 @@ Chocolatey push is still in moderation.
 
 ### Channel inventory and drift check
 
+For the **coverage matrix** (live counts by category and platform, full channel
+table), see [`docs/CHANNELS.md`](CHANNELS.md). Regenerate it with
+`bun run distribution:matrix` after editing the inventory; `bun run distribution:matrix --check`
+fails when the generated regions are stale.
+
 [`distribution/channels.yaml`](../distribution/channels.yaml) is the machine-readable inventory
-of every distribution channel: identity, update policy, provenance links, and (where measurable)
+of every distribution channel: identity, business `category`, update policy, provenance links, and (where measurable)
 where its pinned version lives. `bun run distribution:check`
 ([`scripts/distribution-check.mjs`](../scripts/distribution-check.mjs)) compares every live
 channel's pin against `package.json` and prints a markdown drift table; the weekly
@@ -1066,9 +1071,37 @@ pin or editing a channel entry is always a human commit.
 |---|---|---|
 | 0 | Core registries, published directly by release CI | GitHub Releases, GHCR, Docker Hub, npm |
 | 1 | Packaged formats owned by this repo, CI-published | Helm, Homebrew tap, Snap, .deb/.rpm, desktop AppImage |
-| 2 | LibreDB-owned copies and listings, bumped by hand | CapRover source/mirror, Railway, Koyeb button, Fly.io config, Render Blueprint |
+| 2 | LibreDB-owned copies and listings, bumped by hand | CapRover mirror (deprecated), Railway, Koyeb button, Fly.io config, Render Blueprint |
 | 3 | Upstream community catalogs, bumped via PR | CapRover official, Dokploy, Cosmos, Kubero |
 | 4 | Partner or curated catalogs (not self-serve) | Rancher partner charts, Koyeb catalog, DO, winget, Chocolatey, Flathub |
+
+**Categories** (`category` on every channel) are the business-facing buckets rendered in
+[`docs/CHANNELS.md`](CHANNELS.md): `registries-releases`, `containers`,
+`kubernetes-operators`, `package-managers`, `os-desktop`, `paas-catalogs`,
+`deploy-recipes`, `cloud-marketplaces`. They are independent of tier (who
+publishes). `paas-catalogs` and `deploy-recipes` look similar but answer different
+questions: `paas-catalogs` means the platform itself lists LibreDB Studio in its own
+catalog, so a user browsing that platform discovers it without visiting this repo;
+`deploy-recipes` means we publish a config file or instructions and the platform does
+not list us anywhere, so discovery only happens through our repo. There is no `closed`
+category: a declined or retired channel is `status: deprecated` with its `category`
+unchanged (Flathub is `category: package-managers`, `status: deprecated`) — `category`
+describes what the channel technically is, `status` describes its lifecycle, and an
+earlier revision that conflated the two (Flathub filed under a `closed` category) is
+what produced a false coverage claim in the scorecard.
+
+**Kind** (`kind` on every channel) is the technical shape of the artefact — a Helm
+chart, a container image, a curated marketplace listing — and is validated against a
+fixed enum in `scripts/distribution-check.mjs` (`CHANNEL_KINDS`). It is independent of
+`category`: `kubernetes-operators` (category) spans `helm-chart`, `operator-catalog`
+and `partner-catalog` (kind), and `paas-template` (kind) spans both `paas-catalogs` and
+`deploy-recipes` (category). Neither axis determines the other, so both are kept and
+validated separately rather than collapsed into one.
+
+**Platforms** (`platforms` on every channel, at least one) are the user-facing axis rendered
+in [`docs/CHANNELS.md`](CHANNELS.md): `linux`, `macos`, `windows`, `container`, `kubernetes`,
+`cloud`. They are independent of both tier (who publishes) and category (which business
+bucket). A channel may list several; the matrix always renders them in that canonical order.
 
 **SLAs** (`update.sla`) state how quickly a channel is expected to follow a release:
 `every_release` (bumped as part of releasing), `minor_plus` (bumped for minor releases and
