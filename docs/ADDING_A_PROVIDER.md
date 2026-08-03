@@ -19,11 +19,12 @@ Three decisions. The first is the consequential one, which is why it is first.
 
 1. **Does it need a driver at all?** Score the engine against the rubric below. A database with a
    first-class HTTP API can be supported with no dependency at all, and that is worth real effort to
-   establish before you start. Two shipped providers need no driver: SQLite uses the built-in
-   `bun:sqlite`/`node:sqlite` via `sqlite-driver.ts`, and Couchbase talks to the cluster over
-   documented REST endpoints with `fetch`/`node:https` ([couchbase.md](./providers/couchbase.md)).
-   If it does need one, it will be something like `pg`, `mysql2`, `mongodb`, `ioredis`, `oracledb`
-   or `mssql`.
+   establish before you start. Three shipped providers need no driver: SQLite uses the built-in
+   `bun:sqlite`/`node:sqlite` via `sqlite-driver.ts`, Couchbase talks to the cluster over
+   documented REST endpoints with `fetch`/`node:https` ([couchbase.md](./providers/couchbase.md)),
+   and ClickHouse speaks SQL over its HTTP interface the same way
+   ([clickhouse.md](./providers/clickhouse.md)). If it does need one, it will be something like `pg`,
+   `mysql2`, `mongodb`, `ioredis`, `oracledb` or `mssql`.
 
 2. **Which base class?**
    - **SQL databases → extend `SQLBaseProvider`.** It is
@@ -184,6 +185,7 @@ is kept in sync with its per-provider doc). Don't copy a skeleton from this guid
 |-------------------|--------|------------------|-----------|
 | Pooled SQL (wire-protocol DB) | `SQLBaseProvider` | `postgres.ts` / `mysql.ts` | [postgres.md](./providers/postgres.md) · [mysql.md](./providers/mysql.md) |
 | Embedded / file SQL | `SQLBaseProvider` | `sqlite.ts` | [sqlite.md](./providers/sqlite.md) |
+| SQL database reached over HTTP (no driver) | `SQLBaseProvider` | `sql/clickhouse/` | [clickhouse.md](./providers/clickhouse.md) |
 | Document store | `BaseDatabaseProvider` | `mongodb.ts` | [mongodb.md](./providers/mongodb.md) |
 | Document store reached over HTTP/REST (no driver) | `BaseDatabaseProvider` | `document/couchbase/` | [couchbase.md](./providers/couchbase.md) |
 | Key-value store | `BaseDatabaseProvider` | `redis.ts` | [redis.md](./providers/redis.md) |
@@ -514,7 +516,7 @@ For the authoritative, code-verified reference for each shipped provider (extend
 driver, pooling, capabilities, labels, `prepareQuery` behaviour, and limitations), see the prime
 docs — they are the single source of truth and are kept in sync with the code:
 
-**[docs/providers/](./providers/README.md)** → postgres · mysql · oracle · mssql · sqlite · redis · mongodb · couchbase · libredb
+**[docs/providers/](./providers/README.md)** → postgres · mysql · oracle · mssql · sqlite · redis · mongodb · couchbase · clickhouse · libredb
 
 When implementing a new provider, the closest existing analogue is the best template: a pooled SQL
 provider (postgres/mysql), an embedded SQL provider (sqlite), a non-SQL provider (mongodb/redis), or
@@ -526,7 +528,6 @@ Assessed against the rubric in [Prerequisites](#prerequisites). Anything not lis
 
 | Candidate | Verdict |
 |---|---|
-| **ClickHouse** ([#264](https://github.com/libredb/libredb-studio/issues/264)) | Scores on all seven, and easier than Couchbase was: a real declared schema so no inference step, a two-level model needing no flattening, and column types carried in the response |
 | **Apache Druid** ([#265](https://github.com/libredb/libredb-studio/issues/265)) | Strong, and it returns errors with real HTTP status codes. `EXPLAIN PLAN FOR` returns a native-query translation rather than an operator tree, so it does not fit the existing tree render model |
 | **Trino / Starburst** | Highest strategic value — one provider fronts S3, Iceberg, Delta and Hive. Unscheduled on purpose: a catalog is another *system*, so what a connection pins is a product question. Also a `nextUri` polling protocol and a fragmented auth matrix |
 | **OpenSearch / Elasticsearch** | HTTP is the only protocol. Needs a dialect decision first: the SQL endpoint is a subset, the native DSL is JSON. OpenSearch is Apache 2.0 and the cleaner primary target |
@@ -544,11 +545,43 @@ reviewable PR.
 The integration points, all of which need an entry. This is the list the Strategy Pattern does
 *not* spare you — provider logic stays self-contained, registration does not:
 
-- [ ] `src/lib/types.ts` — Add to `DatabaseType` union (if not already there)
-- [ ] `src/lib/db/providers/<category>/<name>.ts` — **New file:** provider class
-- [ ] `src/lib/db/factory.ts` — Add `case` with dynamic import
-- [ ] `src/lib/db-ui-config.ts` — Add UI config entry
-- [ ] `src/hooks/use-connection-form.ts` — Add to `selectableTypes` array
-- [ ] `package.json` — Install driver (`bun add <driver>`; SQLite needs none — uses `bun:sqlite`/`node:sqlite`)
+**Always:**
 
-**No other files should need changes.** If you find yourself editing routes, components, or utilities — you're likely bypassing the abstraction. Use `getCapabilities()` and `getLabels()` instead.
+- [ ] `src/lib/types.ts` — add to the `DatabaseType` union
+- [ ] `src/lib/db/providers/<family>/<type-id>.ts` (or a directory) — **new:** the provider class
+- [ ] `src/lib/db/factory.ts` — add a `case` with a **dynamic** import
+- [ ] `src/lib/db-ui-config.ts` — icon, colour, label, default port, connection fields
+- [ ] `src/hooks/use-connection-form.ts` — **append** to `selectableTypes` (do not retype the array)
+- [ ] `src/components/icons/db-icons.tsx` — the engine's mark (`strokeWidth={1.5}`, no HTML size attrs)
+- [ ] `src/lib/seed/types.ts` — the seed-config `type` enum, or seeded connections fail validation
+- [ ] `package.json` — the driver, **if** it needs one. A driver-free provider leaves it untouched
+- [ ] `database-compose.yml` — a service, so the next person can repeat the live pass
+
+**Conditionally, and each one is easy to miss because the code still compiles without it:**
+
+- [ ] `src/lib/db/types.ts` — add to the **`ExplainFormat`** union whenever `supportsExplain` is true.
+      The `Record<ExplainFormat, …>` registry is exhaustive, so this and the next item must land
+      together or neither compiles
+- [ ] `src/lib/explain/index.ts` — register the strategy
+- [ ] `src/lib/connection-string-parser.ts` — the scheme(s), if `supportsConnectionString`
+- [ ] `src/lib/query-generators.ts` — only if the dialect needs its own branch; the default is
+      PostgreSQL-shaped, so check before assuming it fits
+
+**And the tests for every exhaustive map**, which are the real checklist — several are exhaustive
+*by construction* (`Record<DatabaseType, …>` in `db-ui-config`, `PICKER_COVERAGE` in the
+connection-form test), so the compiler and those tests refuse to pass until each is updated:
+`tests/unit/db/factory.test.ts`, `tests/unit/lib/db-ui-config.test.ts`,
+`tests/unit/lib/db-icons.test.tsx`, `tests/unit/lib/connection-string-parser.test.ts`,
+`tests/unit/lib/query-generators.test.ts`, `tests/unit/seed/types.test.ts`,
+`tests/hooks/use-connection-form.test.ts`.
+
+> **`git grep -l <the-previous-provider-type-id> -- src/ tests/` is the authoritative checklist.**
+> This list is maintained by hand and has been wrong before: it long claimed "no other files should
+> need changes", while Couchbase (#263) and ClickHouse (#264) each touched 27 files under `src/` and
+> `tests/`. Trust the grep over this list.
+
+What the Strategy Pattern *does* spare you is **provider logic**: no route, no shared component and no
+existing provider needs to know your engine exists. If you find yourself adding a `=== '<type-id>'`
+check in a route, a component or a utility, that is the abstraction being bypassed — express it as a
+capability or a label instead. Registration is the part it does not spare you, and the grep above is
+how you find all of it.
