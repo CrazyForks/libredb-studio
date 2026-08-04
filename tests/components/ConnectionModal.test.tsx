@@ -676,4 +676,48 @@ describe("ConnectionModal", () => {
     expect(queryByText("Database Name")).not.toBeNull();
     expect(queryByText("Bucket Name")).toBeNull();
   });
+
+  // ── 35. Browser autofill stays out of the credential fields ───────────────
+  // These are server credentials, not the user's own login: Chrome's heuristic
+  // sees "Username" + type=password and injects saved site passwords. Only
+  // autocomplete="new-password" suppresses that ("off" is ignored on password
+  // inputs by design), and it must be on the password field for the username
+  // fill to drop too.
+
+  test("connection credential inputs opt out of browser autofill", () => {
+    const props = createDefaultProps();
+    const { container } = render(React.createElement(ConnectionModal, props));
+
+    expect(container.querySelector("#user")?.getAttribute("autocomplete")).toBe("off");
+    expect(container.querySelector("#password")?.getAttribute("autocomplete")).toBe("new-password");
+    expect(container.querySelector("#host")?.getAttribute("autocomplete")).toBe("off");
+    expect(container.querySelector("#port")?.getAttribute("autocomplete")).toBe("off");
+  });
+
+  test("SSH password input opts out of browser autofill", () => {
+    mockFormOverrides = { showSSH: true, sshEnabled: true, sshAuthMethod: "password" };
+    const props = createDefaultProps();
+    const { container } = render(React.createElement(ConnectionModal, props));
+
+    const passwordInputs = Array.from(container.querySelectorAll('input[type="password"]'));
+    expect(passwordInputs.length).toBe(2);
+    for (const input of passwordInputs) {
+      expect(input.getAttribute("autocomplete")).toBe("new-password");
+    }
+
+    // SSH Username sits next to a password field — same heuristic as the DB pair.
+    const sshUsername = container.querySelector('input[placeholder="ubuntu"]');
+    expect(sshUsername?.getAttribute("autocomplete")).toBe("off");
+    const sshHost = container.querySelector('input[placeholder="bastion.example.com"]');
+    expect(sshHost?.getAttribute("autocomplete")).toBe("off");
+  });
+
+  test("SSH passphrase input opts out of browser autofill", () => {
+    mockFormOverrides = { showSSH: true, sshEnabled: true, sshAuthMethod: "privateKey" };
+    const props = createDefaultProps();
+    const { container } = render(React.createElement(ConnectionModal, props));
+
+    const passphraseInput = container.querySelector('input[placeholder="Key passphrase (if encrypted)"]');
+    expect(passphraseInput?.getAttribute("autocomplete")).toBe("new-password");
+  });
 });

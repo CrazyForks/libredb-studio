@@ -386,12 +386,14 @@ export function ConnectionModal({
                         value={host}
                         onChange={(e) => setHost(e.target.value)}
                         placeholder="localhost"
+                        autoComplete="off"
                         className="md:col-span-3 h-10 bg-zinc-900/50 border-white/5 focus:border-blue-500/50 transition-all text-xs"
                       />
                       <Input
                         id="port"
                         value={port}
                         onChange={(e) => setPort(e.target.value)}
+                        autoComplete="off"
                         className="h-10 bg-zinc-900/50 border-white/5 focus:border-blue-500/50 transition-all text-xs font-mono"
                       />
                     </div>
@@ -409,7 +411,8 @@ export function ConnectionModal({
                         id="user"
                         value={user}
                         onChange={(e) => setUser(e.target.value)}
-                        placeholder="postgres"
+                        placeholder="user"
+                        autoComplete="off"
                         className="h-10 bg-zinc-900/50 border-white/5 focus:border-blue-500/50 transition-all text-xs"
                       />
                     </div>
@@ -425,7 +428,10 @@ export function ConnectionModal({
                         type="password"
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
-                        placeholder="••••••••"
+                        placeholder="***"
+                        // Server credential, not the user's own login: "new-password" is the only
+                        // value Chrome honours to keep saved site passwords out of the field.
+                        autoComplete="new-password"
                         className="h-10 bg-zinc-900/50 border-white/5 focus:border-blue-500/50 transition-all text-xs"
                       />
                     </div>
@@ -442,7 +448,7 @@ export function ConnectionModal({
                       id="database"
                       value={database}
                       onChange={(e) => setDatabase(e.target.value)}
-                      placeholder="production_db"
+                      placeholder="db"
                       className="h-10 bg-zinc-900/50 border-white/5 focus:border-blue-500/50 transition-all text-xs font-mono"
                     />
                   </div>
@@ -644,6 +650,7 @@ export function ConnectionModal({
                                 value={sshHost}
                                 onChange={(e) => setSSHHost(e.target.value)}
                                 placeholder="bastion.example.com"
+                                autoComplete="off"
                                 className="h-9 bg-zinc-900/50 border-white/5 focus:border-purple-500/50 text-xs"
                               />
                             </div>
@@ -652,6 +659,7 @@ export function ConnectionModal({
                               <Input
                                 value={sshPort}
                                 onChange={(e) => setSSHPort(e.target.value)}
+                                autoComplete="off"
                                 className="h-9 bg-zinc-900/50 border-white/5 focus:border-purple-500/50 text-xs font-mono"
                               />
                             </div>
@@ -662,6 +670,7 @@ export function ConnectionModal({
                               value={sshUsername}
                               onChange={(e) => setSSHUsername(e.target.value)}
                               placeholder="ubuntu"
+                              autoComplete="off"
                               className="h-9 bg-zinc-900/50 border-white/5 focus:border-purple-500/50 text-xs"
                             />
                           </div>
@@ -702,6 +711,7 @@ export function ConnectionModal({
                                 value={sshPassword}
                                 onChange={(e) => setSSHPassword(e.target.value)}
                                 placeholder="••••••••"
+                                autoComplete="new-password"
                                 className="h-9 bg-zinc-900/50 border-white/5 focus:border-purple-500/50 text-xs"
                               />
                             </div>
@@ -724,6 +734,7 @@ export function ConnectionModal({
                                   value={sshPassphrase}
                                   onChange={(e) => setSSHPassphrase(e.target.value)}
                                   placeholder="Key passphrase (if encrypted)"
+                                  autoComplete="new-password"
                                   className="h-9 bg-zinc-900/50 border-white/5 focus:border-purple-500/50 text-xs"
                                 />
                               </div>
