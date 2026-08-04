@@ -75,6 +75,44 @@ describe("PerformanceTab", () => {
     expect(queryByText("Attention")).not.toBeNull();
   });
 
+  test("renders the measured cache hit ratio with a bar and a rating", () => {
+    const { queryByText } = render(<PerformanceTab data={makeData()} loading={false} />);
+    const card = queryByText("Cache Hit")!.closest('[data-slot="card"]')!;
+    expect(card.textContent).toContain("98.2");
+    expect(card.textContent).toContain("%");
+    expect(card.querySelectorAll('[data-slot="progress"]').length).toBe(1);
+    expect(card.textContent).toContain("Excellent");
+    expect(card.querySelector("svg")?.getAttribute("class")).toContain("text-green-500");
+  });
+
+  test("reports an unmeasured cache hit ratio as unavailable instead of 0%", () => {
+    const data = {
+      ...makeData(),
+      performance: { bufferPoolUsage: 65, deadlocks: 0, checkpointWriteTime: "12ms" },
+    } as MonitoringData;
+    const { queryByText, container } = render(<PerformanceTab data={data} loading={false} />);
+
+    // The card, its title and the 3-card grid all stay put.
+    expect(queryByText("Cache Hit")).not.toBeNull();
+    expect(container.querySelectorAll('[data-slot="card"]').length).toBe(5);
+
+    const card = queryByText("Cache Hit")!.closest('[data-slot="card"]')!;
+    expect(card.textContent).toContain("N/A");
+    expect(card.textContent).toContain("Not measured");
+    // No fabricated measurement: no percentage, no bar, no rating.
+    expect(card.textContent).not.toContain("%");
+    expect(card.querySelectorAll('[data-slot="progress"]').length).toBe(0);
+    for (const rating of ["Excellent", "Good", "Fair", "Poor"]) {
+      expect(card.textContent).not.toContain(rating);
+    }
+    // Absence is not a fault: no red icon, no red or yellow border, no advice.
+    expect(card.querySelector("svg")?.getAttribute("class")).toContain("text-muted-foreground");
+    expect(card.className).not.toContain("red");
+    expect(card.className).not.toContain("yellow");
+    expect(queryByText("Low Cache Hit")).toBeNull();
+    expect(queryByText("Performing well!")).toBeNull();
+  });
+
   test("shows trend charts when history has at least 2 points", () => {
     const { queryByText, queryAllByTestId } = render(
       <PerformanceTab data={makeData()} loading={false} history={makeHistory()} />,
@@ -83,5 +121,39 @@ describe("PerformanceTab", () => {
     expect(queryByText("Buffer Pool Trend")).not.toBeNull();
     expect(queryByText("Deadlock Trend")).not.toBeNull();
     expect(queryAllByTestId("metric-chart").length).toBeGreaterThanOrEqual(3);
+  });
+
+  // An engine that cannot measure a cache hit ratio (Druid) reports none on every
+  // sample. Mapping those to 0 plotted a measured 0% trend - the same fabricated
+  // metric the current-value card withholds - so missing samples are dropped and the
+  // card says so instead of drawing a floor.
+  test("renders the cache trend as not measured when no history sample carries a ratio", () => {
+    const history = [
+      { timestamp: new Date("2026-02-15T12:00:00Z"), data: makeData({ cacheHitRatio: undefined }) },
+      { timestamp: new Date("2026-02-15T12:01:00Z"), data: makeData({ cacheHitRatio: undefined }) },
+    ] as unknown as TimeSeriesPoint<MonitoringData>[];
+
+    const { queryByText, queryAllByText, queryAllByTestId, container } = render(
+      <PerformanceTab data={makeData({ cacheHitRatio: undefined })} loading={false} history={history} />,
+    );
+
+    expect(queryByText("Cache Hit Trend")).not.toBeNull();
+    // Twice: the current-value card and the trend card both decline to show a number.
+    expect(queryAllByText("Not measured")).toHaveLength(2);
+    // The other two trends still draw, so only the unmeasurable one is withheld.
+    expect(queryAllByTestId("metric-chart").length).toBe(2);
+    // And nothing anywhere claims a measured zero.
+    expect(container.textContent).not.toContain("0.0%");
+  });
+
+  test("still plots the cache trend from the samples that do carry a ratio", () => {
+    const history = [
+      { timestamp: new Date("2026-02-15T12:00:00Z"), data: makeData({ cacheHitRatio: undefined }) },
+      { timestamp: new Date("2026-02-15T12:01:00Z"), data: makeData({ cacheHitRatio: 96.1 }) },
+    ] as unknown as TimeSeriesPoint<MonitoringData>[];
+
+    const { queryAllByTestId } = render(<PerformanceTab data={makeData()} loading={false} history={history} />);
+
+    expect(queryAllByTestId("metric-chart").length).toBe(3);
   });
 });
