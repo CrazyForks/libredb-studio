@@ -40,3 +40,19 @@ in lockstep with the code (see the tri-sync rule in [`../../CLAUDE.md`](../../CL
   and the traps of talking to one over HTTP. Couchbase is the worked example.
 - **HTTP API contract** (request/response for `/api/db/query`, schema, maintenance, …):
   [`../API_DOCS.md`](../API_DOCS.md).
+
+
+## database compose connection tests
+  ┌──────────┬───────────────┬─────────────┬──────────────┐
+  │          │   Couchbase   │ ClickHouse  │ Apache Druid │
+  ├──────────┼───────────────┼─────────────┼──────────────┤
+  │ Host     │ localhost     │ localhost   │ localhost    │
+  ├──────────┼───────────────┼─────────────┼──────────────┤
+  │ Port     │ 8091          │ 8123        │ 8888         │
+  ├──────────┼───────────────┼─────────────┼──────────────┤
+  │ User     │ Administrator │ libredb     │ null         │
+  ├──────────┼───────────────┼─────────────┼──────────────┤
+  │ Password │ password123   │ password123 │ null         │
+  ├──────────┼───────────────┼─────────────┼──────────────┤
+  │ Database │ travel        │ demo        │ null         │
+  └──────────┴───────────────┴─────────────┴──────────────┘
