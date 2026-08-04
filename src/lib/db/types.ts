@@ -13,6 +13,7 @@ export type {
   IndexSchema,
   ForeignKeySchema,
   QueryResult,
+  QueryWarning,
 } from "../types";
 
 import type { DatabaseType, DatabaseConnection, TableSchema, TableRelations, QueryResult } from "../types";
@@ -116,6 +117,22 @@ export interface ProviderCapabilities {
   explainFormat?: ExplainFormat;
   supportsExternalQueryLimiting: boolean;
   supportsCreateTable: boolean;
+  /**
+   * Whether this engine accepts the single-table row update the results grid's
+   * inline editor builds — `UPDATE <table> SET <col> = <val> WHERE <pk> = <val>`
+   * (`src/hooks/use-inline-editing.ts`). False hides the editing affordance
+   * entirely rather than offering a control that can only produce an error
+   * (issue #269): ClickHouse spells a row mutation `ALTER TABLE ... UPDATE`,
+   * Druid SQL has no row-level DML, and the JSON-language providers have no
+   * `UPDATE` statement at all.
+   *
+   * Optional because this interface is published (`src/exports/types.ts`) and a
+   * required field added after the fact stops every external implementer from
+   * compiling. Every provider in this repo declares it; the UI gates on
+   * `=== true`, so an absent flag reads as unsupported rather than inheriting a
+   * permissive default.
+   */
+  supportsInlineRowEdit?: boolean;
   supportsMaintenance: boolean;
   maintenanceOperations: MaintenanceType[];
   supportsConnectionString: boolean;

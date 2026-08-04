@@ -594,6 +594,7 @@ that is how the rest of the application calls every provider uniformly.
 | — | `rowCount` | `rows.length` when there are rows; otherwise `mutationCount` from `X-ClickHouse-Summary`, verbatim, zero included ([§3.6](#36-writes-return-an-empty-200-body-the-row-count-lives-in-a-header)) |
 | `X-ClickHouse-Summary.elapsed_ns` | `executionTime` | The server's own duration, preferred because it excludes network latency; falls back to the envelope's `statistics.elapsed` (seconds), then to the measured wall clock when neither source reported anything |
 | a non-JSON `X-ClickHouse-Format` | `rows` / `fields` | One synthetic row `{ __text: "<raw body>" }` under the single column `__text` ([§3.4](#34-default_formatjson-as-a-url-parameter-never-appended-to-the-sql)) |
+| `meta` array | `columnTypes` | The declared type per column, keyed by its name in `fields` and spelled exactly as ClickHouse spells it — `Nullable(String)`, `LowCardinality(String)`, `Enum8('x' = 1)` — because the wrapper is what tells the user the column is nullable or low-cardinality. **Absent** when the envelope described no columns: a write, a format the user chose, or a statement with no result set. For a computed column such as `count()` this is the only source of a type at all, since no catalog entry exists for it (issue #273) |
 
 ### 5.3 EXPLAIN
 
@@ -697,8 +698,10 @@ a target; `analyze` does not.
 | `kill` | `KILL QUERY WHERE query_id = '<target>' SYNC` | `SYNC` so the result is reported after the query has actually stopped, not after the kill was merely queued |
 
 `vacuum`, `reindex` and `check` have no ClickHouse equivalent, so they are absent from
-`maintenanceOperations` and the UI never offers them; calling `runMaintenance` with one directly
-throws a `QueryError` naming the three supported operations. A target is qualified through
+`maintenanceOperations` and the monitoring Tables tab never offers them (#272); the admin Operations
+tab still does not read capabilities ([#282](https://github.com/libredb/libredb-studio/issues/282)).
+Calling `runMaintenance` with one directly throws a `QueryError` naming the three supported
+operations. A target is qualified through
 `escapeIdentifier()` (`"database"."table"`, defaulting the database to the pinned one when the
 target names none), so a hostile or oddly-named table cannot break out of the generated statement.
 
@@ -715,6 +718,7 @@ target names none), so a hostile or oddly-named table cannot break out of the ge
 | `explainFormat` | `clickhouse-json` |
 | `supportsExternalQueryLimiting` | `true` |
 | `supportsCreateTable` | `false` |
+| `supportsInlineRowEdit` | `false` — a bare `UPDATE ... SET` is code `48` `NOT_IMPLEMENTED` here ([§13](#13-known-limitations--future-work)) |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['optimize', 'analyze', 'kill']` |
 | `supportsConnectionString` | `true` |
@@ -886,19 +890,38 @@ database-wide statistics. Transaction and cancel routes do not apply — see
 - **`ALTER TABLE ... UPDATE` and lightweight `DELETE FROM` report zero rows changed even on
   success.** This is the server's own number, not a provider limitation to fix — see
   [§3.6](#36-writes-return-an-empty-200-body-the-row-count-lives-in-a-header).
-- **Two shared SQL-generating features are not dialect-aware, and neither is fixed here.** Both live
-  outside this provider's files, both are pre-existing rather than introduced by it, and both are
-  tracked in [#269](https://github.com/libredb/libredb-studio/issues/269):
-  - The results grid's **inline row editing** generates a bare `UPDATE ... SET ... WHERE`, which
+- **Two shared SQL-generating features were not dialect-aware.** Both live outside this provider's
+  files, both were pre-existing rather than introduced by it, and both were tracked in
+  [#269](https://github.com/libredb/libredb-studio/issues/269):
+  - The results grid's **inline row editing** generated a bare `UPDATE ... SET ... WHERE`, which
     ClickHouse rejects outright (`NOT_IMPLEMENTED`, code `48`, HTTP `501`) rather than running as an
-    `ALTER TABLE ... UPDATE`. It also emits several statements separated by `;`, which the server
-    rejects on its own (see the multi-statement note at the end of this section). Use
-    `ALTER TABLE ... UPDATE` in the editor instead.
-  - The **schema-diff migration generator** has no ClickHouse branch, so a nullability or type change
-    emits PostgreSQL's `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` where ClickHouse wants
-    `ALTER TABLE ... MODIFY COLUMN <col> Nullable(T)`. Identifier quoting is already correct (both
-    dialects use `"`); only the statement shape is wrong. Oracle falls through the same branch and is
-    approximate for the same reason, so this is a gap in that generator rather than in this provider.
+    `ALTER TABLE ... UPDATE`. Since #269 this provider declares `supportsInlineRowEdit: false`, so the
+    control is no longer offered here at all — neither the EDIT toggle nor an editable cell — instead
+    of offering an edit that can only fail. Use `ALTER TABLE ... UPDATE` in the editor instead. (The
+    same change also stopped the hook joining several row updates into one request, which this server
+    rejected on its own; see the multi-statement note at the end of this section.)
+  - The **schema-diff migration generator** emitted PostgreSQL's
+    `ALTER TABLE ... ALTER COLUMN ... TYPE` / `SET NOT NULL` for a modified column, because every type
+    id without its own branch fell into that generator's PostgreSQL `else`. Since #269 it has a
+    ClickHouse branch: a modified column becomes
+    `ALTER TABLE "t" MODIFY COLUMN "c" <declared type>[ <default clause>]`, and a dropped default
+    becomes a second `MODIFY COLUMN "c" REMOVE <kind>`. A nullability change needs no separate
+    statement — nullability lives inside the type here (`Nullable(T)`), which is what
+    [§3.9](#39-column-types-are-the-declared-strings-verbatim) reports for the column, so restating the
+    declared type carries it. Identifier quoting was already correct (both dialects use `"`).
+    Live-probed against the pinned build while that branch was written, all four worth knowing:
+    a computed column's default is carried kind-first (`MATERIALIZED toYear(d)`, as this provider reads
+    `system.columns.default_kind` / `default_expression` into one string), so the generator emits that
+    clause verbatim — `DEFAULT MATERIALIZED toYear(d)` is a syntax error
+    (code `62`); `MODIFY COLUMN` with no default clause leaves the previous default in place, which is
+    why the explicit `REMOVE` is emitted at all; `REMOVE` accepts `DEFAULT`, `MATERIALIZED` and `ALIAS`
+    but not `EPHEMERAL`, so an ephemeral property carrying an expression is reported in a comment instead
+    (a bare `x String EPHEMERAL` has no expression, so it reaches the diff as no default at all and the
+    generator never sees it); and `REMOVE DEFAULT`
+    against a column that has none is itself an error (code `36`), so it is emitted only for a default
+    that existed. Still approximate: the generator wraps its output in `BEGIN` / `COMMIT`, which this
+    server has no transaction model for, so drop those two lines before running a generated migration
+    here.
 - **No native protocol.** Port `9000` and everything that needs it — the native wire format, some
   server-side settings only exposed there — is out of scope; see
   [§3.1](#31-http-transport-only--no-native-dependency).

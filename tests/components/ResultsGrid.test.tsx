@@ -667,6 +667,32 @@ describe("ResultsGrid", () => {
       expect(findEditInput(container)).not.toBeUndefined();
     });
 
+    test("double-clicking a cell does nothing when editing is disabled (#269)", () => {
+      // With the provider declaring no inline row editing, Studio passes
+      // editingEnabled false — and then a cell must not open an editor at all. It
+      // used to open one whose edit was silently discarded on Enter, which is the
+      // dead affordance the capability gate exists to remove.
+      const onCellChange = mock(() => {});
+      const { container } = render(
+        React.createElement(ResultsGrid, {
+          result: mockResult,
+          editingEnabled: false,
+          onCellChange,
+          pendingChanges: [],
+        }),
+      );
+
+      // The grid renders the value in both the desktop table and the mobile one, so
+      // every cell showing it is double-clicked rather than guessing which is which.
+      const labels = Array.from(container.querySelectorAll("span")).filter((s) => s.textContent === "Alice");
+      expect(labels.length).toBeGreaterThan(0);
+      for (const label of labels) fireEvent.doubleClick(label.parentElement!);
+
+      expect(findEditInput(container)).toBeUndefined();
+      expect(onCellChange).not.toHaveBeenCalled();
+      expect(container.querySelectorAll(".cursor-text").length).toBe(0);
+    });
+
     test("Enter key commits edit and calls onCellChange", () => {
       const onCellChange = mock(() => {});
       const { container } = render(
@@ -880,6 +906,99 @@ describe("ResultsGrid", () => {
       const revealButton = container.querySelector('button[title="Reveal value (10s)"]');
       expect(revealButton).toBeNull();
     });
+  });
+
+  // ── Declared column types (#273) ──────────────────────────────────────────
+
+  describe("declared column types", () => {
+    test("shows the type the engine declared for a column beside its name", () => {
+      const result: QueryResult = { ...mockResult, columnTypes: { name: "Nullable(String)" } };
+      const { getAllByRole, container } = render(React.createElement(ResultsGrid, { result }));
+
+      // The type is part of the header's accessible name, not sighted-only.
+      const header = getAllByRole("button", { name: "name, Nullable(String)" })[0];
+      expect(header.textContent).toContain("Nullable(String)");
+      // Reachable in both headers: the desktop span and the compact mobile one,
+      // which carries the type as a tooltip only (its columns are content-width).
+      expect(container.querySelectorAll('[title="Nullable(String)"]').length).toBe(2);
+    });
+
+    test("leaves a column the engine declared no type for exactly as it was", () => {
+      const result: QueryResult = { ...mockResult, columnTypes: { name: "Nullable(String)" } };
+      const { getAllByRole } = render(React.createElement(ResultsGrid, { result }));
+
+      expect(getAllByRole("button", { name: "id" })[0].textContent).toBe("id");
+    });
+
+    test("does not read a declared type off the prototype chain", () => {
+      // A column name is arbitrary SQL output and `SELECT 1 AS constructor` is
+      // legal. `columnTypes` is a plain object, so a direct lookup answers with
+      // `Object.prototype.constructor` - a FUNCTION handed to React as header
+      // content. Reported by review on PR #289.
+      const result: QueryResult = {
+        ...mockResult,
+        rows: [{ id: 1, constructor: "x", toString: "y" }],
+        fields: ["id", "constructor", "toString"],
+        columnTypes: { id: "BIGINT" },
+      };
+      const { getAllByRole, container } = render(React.createElement(ResultsGrid, { result }));
+
+      // Accessible name is the bare field, and no inherited value is rendered.
+      expect(getAllByRole("button", { name: "constructor" })[0].textContent).toBe("constructor");
+      expect(getAllByRole("button", { name: "toString" })[0].textContent).toBe("toString");
+      expect(container.textContent).not.toContain("function");
+      expect(container.textContent).not.toContain("[object");
+      // The column that DOES declare a type is unaffected.
+      expect(getAllByRole("button", { name: "id, BIGINT" })[0].textContent).toContain("BIGINT");
+    });
+
+    test("makes the compact header's declared type reachable without a pointer", () => {
+      // The compact table carries the type as a tooltip only, because visible
+      // text there desyncs header and body widths. `title` on a non-focusable
+      // element is unavailable to touch and unreliable for assistive tech, so the
+      // type also ships as screen-reader text. Reported by review on PR #289.
+      const result: QueryResult = { ...mockResult, columnTypes: { name: "Nullable(String)" } };
+      const { container } = render(React.createElement(ResultsGrid, { result }));
+
+      const srOnly = Array.from(container.querySelectorAll(".sr-only")).map((n) => n.textContent);
+      expect(srOnly.some((text) => text?.includes("Nullable(String)"))).toBe(true);
+    });
+
+    test("renders headers unchanged when the result declares no types at all", () => {
+      const { getAllByRole, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+
+      expect(getAllByRole("button", { name: "name" })[0].textContent).toBe("name");
+      // No header gains a tooltip it did not have before ("Filter column" is pre-existing).
+      expect(container.querySelectorAll('[title]:not([title="Filter column"])').length).toBe(0);
+    });
+  });
+
+  // ── Engine warnings on a result with no rows (#273) ───────────────────────
+
+  test("surfaces the engine's warnings when the result has no rows", () => {
+    // An analytics engine can answer 200 with EVERY segment unavailable: zero rows
+    // plus a warning. Reporting "no data" alone would call missing data absent data.
+    const result: QueryResult = {
+      ...mockEmptyResult,
+      warnings: [{ message: "2 segments of the queried data were unavailable." }],
+    };
+    const { container } = render(React.createElement(ResultsGrid, { result }));
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Query returned no data");
+    expect(text).toContain("2 segments of the queried data were unavailable.");
+    // The warning has to come before the "operation was successful" reassurance -
+    // a reader who stops at the reassurance is back to being told the data is absent.
+    expect(text.indexOf("2 segments of the queried data were unavailable.")).toBeLessThan(
+      text.indexOf("The operation was successful"),
+    );
+  });
+
+  test("keeps the empty state unchanged when the engine reported no warnings", () => {
+    const { container } = render(React.createElement(ResultsGrid, { result: mockEmptyResult }));
+
+    expect(container.textContent).toContain("Query returned no data");
+    expect(container.querySelector("ul")).toBeNull();
   });
 
   // ── A11y semantics (#100): keyboard-reachable interactive elements ────────

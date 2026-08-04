@@ -313,6 +313,7 @@ actions for Redis via `getLabels()` (e.g. *"Memory Doctor"*, *"Run Info"*).
 | `supportsExplain` | `false` |
 | `supportsExternalQueryLimiting` | `false` |
 | `supportsCreateTable` | `false` |
+| `supportsInlineRowEdit` | `false` — Redis commands are not SQL, so there is no `UPDATE ... SET` for the results grid's inline editor to emit |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['analyze']` |
 | `supportsConnectionString` | `false` |
@@ -439,6 +440,11 @@ request/response contract.
   Redis ACL / user role, not the provider.
 - **Binary values** are stringified via `String(...)`; non-UTF8 binary payloads may not render
   faithfully in the grid.
+- **No column modification in a generated migration.** Since
+  [#269](https://github.com/libredb/libredb-studio/issues/269) the schema-diff migration generator
+  answers a modified column per dialect; keys are not tables and carry no column definitions, so it
+  emits `-- Redis: Cannot alter column "<name>". ...` where it previously emitted PostgreSQL
+  `ALTER TABLE ... ALTER COLUMN` DDL that means nothing here.
 
 ---
 

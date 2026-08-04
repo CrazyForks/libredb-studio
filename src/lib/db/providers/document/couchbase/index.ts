@@ -305,6 +305,15 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
       // Collections are schemaless and CREATE COLLECTION takes no columns, so a
       // column-list modal could only ever emit invalid SQL++ (decision 7).
       supportsCreateTable: false,
+      // SQL++ does have `UPDATE <keyspace> SET ... WHERE ...`, but the statement the
+      // shared inline row editor builds cannot address a document with it: the
+      // collection-open query projects the key as `META(d).id AS __id`
+      // (`src/lib/query-generators.ts`), the editor's primary-key heuristic picks
+      // `__id` because it ends in `_id`, and the resulting `WHERE __id = '<key>'`
+      // filters on a field no document actually has - so it would match nothing and
+      // report success. Addressing a document needs `META(d).id` or `USE KEYS`, i.e.
+      // per-dialect statement building, which is issue #279.
+      supportsInlineRowEdit: false,
       supportsMaintenance: true,
       maintenanceOperations: ["analyze", "reindex", "kill"],
       supportsConnectionString: true,
@@ -457,6 +466,11 @@ export class CouchbaseProvider extends BaseDatabaseProvider {
       // A mutation returns no rows; its row count is what it changed.
       rowCount: rows.length > 0 ? rows.length : result.mutationCount,
       executionTime: reportedMs > 0 ? reportedMs : measuredMs,
+      // A statement the cluster completed can still carry advice about itself
+      // (#273). The neutral warning is already `{ code, message }`, so nothing is
+      // reshaped here. The field stays ABSENT for a clean run rather than
+      // becoming an empty array: absence is what tells the UI to render nothing.
+      ...(result.warnings.length > 0 ? { warnings: result.warnings } : {}),
     };
   }
 

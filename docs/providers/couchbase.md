@@ -195,7 +195,7 @@ interface CouchbaseQueryResult {
   fieldNames: string[] | null;   // null when the source cannot tell (SELECT *)
   executionTimeMs: number;
   mutationCount: number;
-  warnings: CouchbaseWarning[];
+  warnings: CouchbaseWarning[];   // { message, code? } - no code is left out, never zeroed
 }
 ```
 
@@ -502,6 +502,7 @@ The request carries `metrics: true`, the effective statement timeout, and
 | signature | `fields` | `null` for a wildcard signature, in which case columns are the union of the keys the rows carry, first seen first |
 | — | `rowCount` | `rows.length`, or the mutation count when a statement returned no rows |
 | metrics `executionTime` | `executionTime` | The cluster's own time (excludes network latency); falls back to the measured wall clock when the cluster reported none |
+| `warnings` | `warnings` | The notices the cluster attached to a statement it completed, each carrying its message and the cluster's own code **when it reported one** — an entry with no code arrives without one rather than with a substituted `0`, which is itself a legal code. **Absent** when the cluster reported no warnings at all — never an empty array, so the result UI decides from the field's presence alone (issue #273) |
 
 ### 5.3 `USE KEYS` reads a document with no index at all
 
@@ -589,8 +590,10 @@ connection ceiling over REST, so the denominator is a constant while the numerat
 | `kill` | `DELETE FROM system:active_requests WHERE requestId = $1` | Target is the request id shown in active sessions |
 
 `vacuum`, `optimize` and `check` have no Couchbase equivalent, so they are absent from
-`maintenanceOperations` and the UI never offers them; calling `runMaintenance` with one directly
-throws a `QueryError` naming the three supported operations.
+`maintenanceOperations` and the monitoring Tables tab never offers them (#272); the admin Operations
+tab still does not read capabilities ([#282](https://github.com/libredb/libredb-studio/issues/282)).
+Calling `runMaintenance` with one directly throws a `QueryError` naming the three supported
+operations.
 
 ---
 
@@ -605,6 +608,7 @@ throws a `QueryError` naming the three supported operations.
 | `explainFormat` | `couchbase-json` |
 | `supportsExternalQueryLimiting` | `true` |
 | `supportsCreateTable` | `false` |
+| `supportsInlineRowEdit` | `false` — SQL++ has `UPDATE <keyspace> SET ... WHERE ...`, but the shared editor's `WHERE <pk> = <value>` would filter on `__id`, the key **projection alias**, which is not a document field ([§13](#13-known-limitations--future-work)) |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['analyze', 'reindex', 'kill']` |
 | `supportsConnectionString` | `true` |
@@ -777,6 +781,18 @@ native dependency, and they are listed first so nobody discovers them by acciden
   without fetching it) has no REST equivalent. SQL++ projection covers reading a path; targeted
   in-place path mutation does not exist here — an `UPDATE ... SET` rewrites through the query
   service instead.
+- **No inline row editing in the results grid**, declared as `supportsInlineRowEdit: false`
+  ([#269](https://github.com/libredb/libredb-studio/issues/269)). The obstacle is not `UPDATE` — SQL++
+  has it — but the document key: the collection-open query projects it as `META(d).id AS __id`, and
+  the shared editor's key heuristic picks that alias up and emits `WHERE __id = '<key>'`, a predicate
+  no document satisfies, so the edit would match zero documents and still report success. Addressing a
+  document needs `META(d).id` or `USE KEYS`, i.e. per-dialect statement building
+  ([#279](https://github.com/libredb/libredb-studio/issues/279)). Until then the control is not
+  offered here and a document is edited with a hand-written SQL++ statement.
+- **No column modification in a generated migration.** #269 also gave the schema-diff migration
+  generator a per-dialect answer for a modified column; a collection has no column definition to
+  change, so it emits `-- Couchbase: Cannot alter column "<name>". ...` where it previously emitted
+  PostgreSQL `ALTER TABLE ... ALTER COLUMN` DDL the query service would reject.
 
 A follow-up issue gets opened if a real user reports one of: browsing collections that have no
 index, viewing non-JSON documents, or a policy requiring the official SDK. At that point the work is

@@ -278,12 +278,24 @@ describe("CouchbaseProvider metadata", () => {
       explainFormat: "couchbase-json",
       supportsExternalQueryLimiting: true,
       supportsCreateTable: false,
+      supportsInlineRowEdit: false,
       supportsMaintenance: true,
       maintenanceOperations: ["analyze", "reindex", "kill"],
       supportsConnectionString: true,
       defaultPort: 8091,
       schemaRefreshPattern: "\\b(CREATE|DROP|ALTER)\\s+(COLLECTION|SCOPE|INDEX)\\b",
     });
+  });
+
+  test("declares supportsInlineRowEdit false because the grid's key column is a projection alias", () => {
+    // SQL++ does have `UPDATE <keyspace> SET ... WHERE ...`, but the statement the
+    // shared hook builds cannot address a document here: the collection-open query
+    // projects the key as `META(d).id AS __id` (`src/lib/query-generators.ts`), and
+    // the hook's primary-key heuristic picks `__id` up because it ends in `_id`. The
+    // emitted `WHERE __id = '<key>'` filters on a field no document has, so it
+    // matches nothing. Addressing a document needs `META(d).id` or `USE KEYS`, which
+    // is per-dialect statement building - deferred to issue #279.
+    expect(new CouchbaseProvider(makeConnection()).getCapabilities().supportsInlineRowEdit).toBe(false);
   });
 
   test("labels collections and documents", () => {
@@ -457,6 +469,40 @@ describe("CouchbaseProvider query", () => {
     await provider.query("SELECT * FROM `travel`.`_default`.`airline` WHERE country = $1", ["France"]);
 
     expect(bodyOf("country = $1").args).toEqual(["France"]);
+  });
+
+  test("carries the notices the cluster attached to a completed statement (#273)", async () => {
+    // The cluster answers `status: success` and appends advice about the
+    // statement it just ran; those notices used to stop at the transport seam,
+    // so a user never learned their query had been answered with a caveat.
+    const provider = await connectProvider();
+    queryHandler = () =>
+      queryPayload([{ id: "hotel::1" }], {
+        signature: { id: "string" },
+        warnings: [
+          { code: 4321, msg: "The index advisor recommends an index on `city`" },
+          { code: 3230, msg: "This statement uses a full keyspace scan" },
+        ],
+      });
+
+    const result = await provider.query("SELECT id FROM `travel`.`inventory`.`hotel`");
+
+    expect(result.warnings).toEqual([
+      { code: 4321, message: "The index advisor recommends an index on `city`" },
+      { code: 3230, message: "This statement uses a full keyspace scan" },
+    ]);
+  });
+
+  test("leaves the warnings channel absent when the cluster reported none", async () => {
+    // Absence is the signal, so a clean run must not carry an empty array: the
+    // result UI decides whether to render anything at all from this field.
+    const provider = await connectProvider();
+    queryHandler = () => queryPayload([{ id: "hotel::1" }], { signature: { id: "string" } });
+
+    const result = await provider.query("SELECT id FROM `travel`.`inventory`.`hotel`");
+
+    expect(result.warnings).toBeUndefined();
+    expect("warnings" in result).toBe(false);
   });
 });
 
@@ -883,6 +929,19 @@ describe("CouchbaseProvider query preparation", () => {
     expect(prepared.query).toContain("LIMIT 25");
     expect(prepared.wasLimited).toBe(true);
     expect(prepared.limit).toBe(25);
+  });
+
+  // Couchbase delegates to the shared limiter, so a comment-led SELECT is bounded
+  // through the same fix rather than through anything of this provider's own (#275).
+  test("applies the external row limit to a comment-led SELECT", () => {
+    const provider = new CouchbaseProvider(makeConnection());
+
+    const prepared = provider.prepareQuery("/* annotated */ SELECT * FROM `travel`.`inventory`.`hotel`", {
+      limit: 25,
+    });
+
+    expect(prepared.query).toBe("/* annotated */ SELECT * FROM `travel`.`inventory`.`hotel` LIMIT 25");
+    expect(prepared.wasLimited).toBe(true);
   });
 
   test("leaves a mutation untouched", () => {

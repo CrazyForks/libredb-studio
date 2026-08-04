@@ -439,6 +439,9 @@ describe("MySQLProvider", () => {
       expect(caps.explainFormat).toBe("mysql-json");
       expect(caps.supportsExplain).toBe(caps.explainFormat !== undefined);
       expect(caps.supportsConnectionString).toBe(true);
+      // `UPDATE t SET c = v WHERE pk = v` is core MySQL DML — the shape the inline
+      // row editor builds (#269).
+      expect(caps.supportsInlineRowEdit).toBe(true);
       expect(caps.maintenanceOperations).toContain("analyze");
       expect(caps.maintenanceOperations).toContain("optimize");
       expect(caps.maintenanceOperations).toContain("check");
@@ -952,6 +955,32 @@ describe("MySQLProvider", () => {
       provider = new MySQLProvider(makeMySQLConfig());
       const sql = "INSERT INTO users (name) VALUES ('test')";
       const result = provider.prepareQuery(sql);
+      expect(result.query).toBe(sql);
+      expect(result.wasLimited).toBe(false);
+    });
+
+    // `#` is MySQL's own second line-comment marker, and it is the reason the shared
+    // trivia pattern in `lib/sql/leading-keyword.ts` recognises one at all: without it
+    // a `# note`-led SELECT classified as an unknown statement type and reached the
+    // server with no LIMIT, which is #275's reported symptom on this provider.
+    test.each<[string, string]>([
+      ["a hash comment", "# note\nSELECT * FROM users"],
+      ["a line comment", "-- note\nSELECT * FROM users"],
+      ["a block comment", "/* note */ SELECT * FROM users"],
+    ])("SELECT behind %s still gets LIMIT appended", (_label, sql) => {
+      provider = new MySQLProvider(makeMySQLConfig());
+      const result = provider.prepareQuery(sql);
+
+      expect(result.query).toContain("LIMIT");
+      expect(result.wasLimited).toBe(true);
+    });
+
+    test("a hash comment does not make a write look like a read", () => {
+      provider = new MySQLProvider(makeMySQLConfig());
+      const sql = "# note\nUPDATE users SET name = 'x' WHERE id = 1";
+
+      const result = provider.prepareQuery(sql);
+
       expect(result.query).toBe(sql);
       expect(result.wasLimited).toBe(false);
     });

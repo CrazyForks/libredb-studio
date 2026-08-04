@@ -454,6 +454,13 @@ function toQueryResult(result: ClickHouseQueryResult, measuredMs: number): Query
   const textual = result.rawText !== null;
   const rows = textual ? [{ [RAW_TEXT_COLUMN]: result.rawText }] : result.rows;
   const reportedMs = Math.round(result.executionTimeMs);
+  // Declared types travel with the result (#273), verbatim wrappers included:
+  // `Nullable(String)` is what tells the user the column accepts nulls, and for a
+  // computed column like `count()` this is the ONLY source - the schema tree has
+  // no catalog entry for it. An empty map means the envelope described no
+  // columns (a write, or a format the user chose), which stays absent rather than
+  // shipping a `{}` the grid would have to check.
+  const columnTypes = result.columnTypes ?? {};
 
   return {
     rows,
@@ -462,6 +469,7 @@ function toQueryResult(result: ClickHouseQueryResult, measuredMs: number): Query
     // changed - verbatim, including the zero a queued mutation reports.
     rowCount: rows.length > 0 ? rows.length : result.mutationCount,
     executionTime: reportedMs > 0 ? reportedMs : measuredMs,
+    ...(Object.keys(columnTypes).length > 0 ? { columnTypes } : {}),
   };
 }
 
@@ -500,6 +508,12 @@ export class ClickHouseProvider extends SQLBaseProvider {
       // produce invalid input is not a supported capability. DDL typed into the
       // editor works normally, which is how a ClickHouse user creates a table.
       supportsCreateTable: false,
+      // Live-verified against 26.7.1 and the reason issue #269 exists: a bare
+      // `UPDATE ... SET`, which is what the inline row editor builds, answers code
+      // 48 NOT_IMPLEMENTED (HTTP 501). ClickHouse spells a row mutation
+      // `ALTER TABLE t UPDATE c = v WHERE ...`, an asynchronous mutation rather
+      // than a statement the shared hook can emit, so the control is hidden here.
+      supportsInlineRowEdit: false,
       supportsMaintenance: true,
       maintenanceOperations: ["optimize", "analyze", "kill"],
       supportsConnectionString: true,
