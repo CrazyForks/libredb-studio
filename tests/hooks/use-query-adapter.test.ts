@@ -353,6 +353,95 @@ describe("useQueryAdapter", () => {
     expect(params.onQueryExecute).not.toHaveBeenCalled();
   });
 
+  /**
+   * The gate reads the statement under the ACTIVE CONNECTION's dialect (#292).
+   *
+   * This file uses the real predicate, so it is where the embedded path's dialect
+   * channel is provable end to end: the same text is a commented-out note under
+   * one connection's grammar and a `DELETE` the statement operates under
+   * another's, and only the connection says which.
+   */
+  test("executeQuery reads the statement under the active connection's dialect", async () => {
+    const hidden = "WITH t AS (\n  #- drop the ) SELECT here\n  SELECT id FROM logs\n) DELETE FROM users";
+
+    const onMysql = makeHookParams({ activeConnection: makeConnection({ type: "mysql" }) });
+    const { result: mysql } = renderHook(() => useQueryAdapter(onMysql));
+    await act(async () => {
+      await mysql.current.executeQuery(hidden);
+    });
+
+    expect(mysql.current.safetyCheckQuery).toBe(hidden);
+    expect(onMysql.onQueryExecute).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The embedded path's half of #300: the default connection here is PostgreSQL,
+   * where block comments NEST, so a comment carrying a second opener runs past the
+   * `*\/` a flat reading stops at. Read flat, the word after that marker answered
+   * for the statement - one the operator commented out, never in the dangerous set -
+   * so the `DROP` reached the host application's executor with no confirmation. The
+   * two shapes ask for different reasons: the balanced one because the `DROP` is now
+   * read, the unbalanced one because the text cannot be resolved at all.
+   */
+  test.each<[string, string]>([
+    ["a balanced nested comment", "/* outer /* inner */ still a note */ DROP TABLE users"],
+    ["a nested comment that never closes", "/* outer /* inner */ DROP TABLE users"],
+  ])("executeQuery sets safetyCheckQuery for a destructive statement behind %s", async (_label, hidden) => {
+    const params = makeHookParams();
+
+    const { result } = renderHook(() => useQueryAdapter(params));
+
+    await act(async () => {
+      await result.current.executeQuery(hidden);
+    });
+
+    expect(result.current.safetyCheckQuery).toBe(hidden);
+    expect(params.onQueryExecute).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The embedded path's half of #297: a write hidden behind a run the reader cannot
+   * resolve reaches the dialog instead of the server.
+   *
+   * This file uses the REAL predicate, so this is where the new rule is provable on
+   * the packaged execution path rather than only in the predicate's unit tests. The
+   * script is two statements under PostgreSQL's reading of `'\'` and one under
+   * MySQL's; the gate cannot tell which, and it is the second statement that writes.
+   */
+  test("executeQuery sets safetyCheckQuery for a write hidden behind an unresolvable literal", async () => {
+    const params = makeHookParams();
+
+    const { result } = renderHook(() => useQueryAdapter(params));
+
+    const hidden = "SELECT '\\';\nUPDATE t SET x = 1";
+    await act(async () => {
+      await result.current.executeQuery(hidden);
+    });
+
+    expect(result.current.safetyCheckQuery).toBe(hidden);
+    expect(params.onQueryExecute).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The other side of the same rule, on the same path: a statement whose runs all
+   * resolve executes without a prompt even though it carries a backslash. The cost
+   * of the rule above is a prompt for text that cannot be read, not for text that
+   * contains an escape.
+   */
+  test("executeQuery runs a read whose literal resolves, backslash and all", async () => {
+    const params = makeHookParams();
+
+    const { result } = renderHook(() => useQueryAdapter(params));
+
+    const escaped = "SELECT 'a\\nb' FROM t";
+    await act(async () => {
+      await result.current.executeQuery(escaped);
+    });
+
+    expect(result.current.safetyCheckQuery).toBeNull();
+    expect(params.onQueryExecute).toHaveBeenCalledWith("conn-1", escaped);
+  });
+
   // ── executeQuery leaves other tabs untouched ────────────────────────────────
 
   test("executeQuery updates only the target tab when multiple tabs exist", async () => {

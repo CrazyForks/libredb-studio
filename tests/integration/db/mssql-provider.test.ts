@@ -1,4 +1,5 @@
-import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
+import { EventEmitter } from "node:events";
 
 // ---------------------------------------------------------------------------
 // Mock mssql BEFORE importing the provider
@@ -7,6 +8,8 @@ import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
 let mockQueryFn: (sql: string) => Promise<unknown>;
 let capturedInputs: Array<{ name: string; value: unknown }> = [];
 let cancelShouldThrow = false;
+/** The pool handed to the most recently constructed provider. */
+let lastPool: EventEmitter | undefined;
 
 class MockRequest {
   private _transaction: unknown;
@@ -41,13 +44,20 @@ class MockTransaction {
   async rollback() {}
 }
 
-class MockConnectionPool {
+/**
+ * A real EventEmitter, because `mssql`'s ConnectionPool is one and emits `error` for a
+ * background connection failure (a non-ESOCKET tedious error) as well as for a failed
+ * acquire. An `error` event with no listener is an uncaught exception (#298), so an inert
+ * `on` in the mock would hide the crash instead of pinning it.
+ */
+class MockConnectionPool extends EventEmitter {
   private _config: unknown;
   public size = 10;
   public available = 7;
   public pending = 0;
 
   constructor(config: unknown) {
+    super();
     this._config = config;
   }
 
@@ -62,10 +72,20 @@ class MockConnectionPool {
   }
 }
 
+/**
+ * The provider does `new mssql.ConnectionPool(config)`; recording the instance here lets a
+ * test emit on the very emitter the provider attached its listener to.
+ */
+function ConnectionPoolFactory(config: unknown): MockConnectionPool {
+  const pool = new MockConnectionPool(config);
+  lastPool = pool;
+  return pool;
+}
+
 mock.module("mssql", () => {
   return {
     default: {
-      ConnectionPool: MockConnectionPool,
+      ConnectionPool: ConnectionPoolFactory,
       Transaction: MockTransaction,
       Request: MockRequest,
     },
@@ -475,6 +495,30 @@ describe("MSSQLProvider", () => {
       await provider.connect(); // should not throw
       expect(provider.isConnected()).toBe(true);
     });
+
+    // ── Pool error events (#298) ─────────────────────────────────────────────
+
+    test("a pool error is logged and does not escalate past the provider", async () => {
+      await provider.connect();
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      try {
+        expect(() => lastPool?.emit("error", new Error("socket hang up"))).not.toThrow();
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        const logged = errorSpy.mock.calls[0].join(" ");
+        expect(logged).toContain("[MSSQL]");
+        expect(logged).toContain("socket hang up");
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    test("the pool carries exactly one error listener, and a repeat connect adds none", async () => {
+      await provider.connect();
+      await provider.connect();
+
+      expect(lastPool?.listenerCount("error")).toBe(1);
+    });
   });
 
   // =========================================================================
@@ -701,20 +745,98 @@ describe("MSSQLProvider", () => {
           expect(result.wasLimited).toBe(false);
         });
 
-        test.each<[string, string]>([
-          ["a temp table", "SELECT * FROM #tmp ORDER BY id"],
-          ["a literal whose end is undeterminable", "SELECT id FROM users WHERE path = 'C:\\';"],
-        ])("the offset branch declines on %s, which it cannot append to", (_label, sql) => {
+        test("the offset branch declines on a literal whose end is undeterminable", () => {
+          const sql = "SELECT id FROM users WHERE path = 'C:\\';";
+
           const result = provider.prepareQuery(sql, { limit: 50, offset: 10 });
 
           expect(result.query).toBe(sql);
           expect(result.wasLimited).toBe(false);
         });
 
+        // A temp table used to reach the same refusal, and it no longer does: this
+        // provider now tells the shared reader that `#` is code in T-SQL (#292), so
+        // `#tmp` is the statement's own text, the end is cuttable and the page is
+        // appended where T-SQL wants it. The refusal was never about temp tables
+        // being unsafe to page - it was the price of a reader that could not tell
+        // `#tmp` from `# note`.
+        test("the offset branch now pages a temp-table read, which T-SQL accepts", () => {
+          const result = provider.prepareQuery("SELECT * FROM #tmp ORDER BY id", { limit: 50, offset: 10 });
+
+          expect(result.query).toBe("SELECT * FROM #tmp ORDER BY id OFFSET 10 ROWS FETCH NEXT 50 ROWS ONLY");
+          expect(result.wasLimited).toBe(true);
+        });
+
         test("the TOP head splice is unchanged by a trailing comment", () => {
           const result = provider.prepareQuery("SELECT * FROM users -- daily check", { limit: 50 });
 
           expect(result.query).toBe("SELECT TOP 50 * FROM users -- daily check");
+          expect(result.wasLimited).toBe(true);
+        });
+
+        // ── The `#` grammar is T-SQL's here (#292) ──────────────────────────
+        //
+        // This block records the shape the trailing-comment note above had to
+        // leave open: put trivia AFTER the bound of a temp-table page and the
+        // whole line vanished into a "comment" that starts at `#tmp`, so the
+        // end-anchored probe saw no bound and a `TOP` was spliced alongside an
+        // `OFFSET … FETCH` that SQL Server rejects outright (Msg 10741). Naming
+        // the dialect closes it at the root: `#` is never a comment in T-SQL.
+        test.each<[string, string]>([
+          ["a trailing line comment", "SELECT * FROM #tmp ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY -- daily"],
+          [
+            "a trailing block comment",
+            "SELECT * FROM #tmp ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY /* daily */",
+          ],
+          [
+            "a terminator and a comment",
+            "SELECT * FROM #tmp ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY; -- daily",
+          ],
+        ])("does not splice TOP into an already-paged temp-table read carrying %s", (_label, sql) => {
+          const result = provider.prepareQuery(sql, { limit: 50 });
+
+          expect(result.query).toBe(sql);
+          expect(result.wasLimited).toBe(false);
+        });
+
+        // Fixture discipline: a bracket-quoted NAME carrying a hash, read from a
+        // temp table - two constructs the scanner does not model as a unit. The
+        // emitted text is asserted whole, because the failure mode this milestone
+        // shipped last time was a bound spliced INTO a bracketed name.
+        test("splices TOP ahead of a bracket-quoted name carrying a hash", () => {
+          const result = provider.prepareQuery("SELECT [a#b] FROM #tmp", { limit: 50 });
+
+          expect(result.query).toBe("SELECT TOP 50 [a#b] FROM #tmp");
+          expect(result.wasLimited).toBe(true);
+        });
+
+        // ── `[…]` stays a quoted NAME here (#295) ───────────────────────────
+        //
+        // The bracket grammar is now the dialect's answer, and T-SQL's is the one
+        // the shared reader always applied: everything between the brackets is the
+        // name — an apostrophe, a comment marker, a semicolon — and a doubled `]`
+        // is how a bracket inside one is written, which is exactly what this
+        // provider's own `escapeIdentifier` emits. ClickHouse gets the array
+        // reading instead, and teaching THIS scan to step over string literals is
+        // what would break the first row below.
+        test.each<[string, string, string]>([
+          ["an apostrophe", "SELECT [it's] FROM users", "SELECT TOP 50 [it's] FROM users"],
+          ["a doubled close bracket", "SELECT [a]]b] FROM users", "SELECT TOP 50 [a]]b] FROM users"],
+          ["a comment marker", "SELECT [a--b] FROM users", "SELECT TOP 50 [a--b] FROM users"],
+          ["a semicolon", "SELECT [a;b] FROM users", "SELECT TOP 50 [a;b] FROM users"],
+        ])("splices TOP ahead of a bracket-quoted name carrying %s", (_label, sql, expected) => {
+          const result = provider.prepareQuery(sql, { limit: 50 });
+
+          expect(result.query).toBe(expected);
+          expect(result.wasLimited).toBe(true);
+        });
+
+        test("pages a bracket-quoted name carrying an apostrophe, appending at the real end", () => {
+          // The tail branch is where a misread name costs more than a bound: the
+          // page has to land after the whole name, not inside it.
+          const result = provider.prepareQuery("SELECT [it's] FROM users ORDER BY id", { limit: 50, offset: 10 });
+
+          expect(result.query).toBe("SELECT [it's] FROM users ORDER BY id OFFSET 10 ROWS FETCH NEXT 50 ROWS ONLY");
           expect(result.wasLimited).toBe(true);
         });
       });
@@ -726,6 +848,192 @@ describe("MSSQLProvider", () => {
         expect(result.query).toContain("OFFSET 10 ROWS");
         expect(result.query).toContain("FETCH NEXT 50 ROWS ONLY");
         expect(result.wasLimited).toBe(true);
+      });
+    });
+
+    // ── Block comments NEST here (#300) ──────────────────────────────────────
+    //
+    // T-SQL supports nested comments: a `/*` anywhere inside a comment opens a
+    // nested one and needs its own `*/` ("Slash Star (Block Comment)"). Read flat,
+    // the text between the inner `*/` and the comment's real end reaches the
+    // readers as code - and on THIS provider that is worse than a lost bound,
+    // because the `TOP` splice writes into the head at an index that reading
+    // chose. The first row below is the shape it emitted: a `TOP` placed after a
+    // `DISTINCT` that is inside the comment, so SQL Server saw
+    // `SELECT name FROM t` - unbounded - while this method reported a limit.
+    describe("nested block comments", () => {
+      test("splices TOP before the whole comment rather than into it", () => {
+        const result = provider.prepareQuery("SELECT /* a /* b */ DISTINCT */ name FROM t", { limit: 50 });
+
+        expect(result.query).toBe("SELECT TOP 50 /* a /* b */ DISTINCT */ name FROM t");
+        expect(result.wasLimited).toBe(true);
+      });
+
+      test("still keeps TOP after a DISTINCT that follows the whole comment", () => {
+        const result = provider.prepareQuery("SELECT /* a /* b */ c */ DISTINCT name FROM t", { limit: 50 });
+
+        expect(result.query).toBe("SELECT /* a /* b */ c */ DISTINCT TOP 50 name FROM t");
+        expect(result.wasLimited).toBe(true);
+      });
+
+      test("bounds a read behind a leading nested comment", () => {
+        const result = provider.prepareQuery("/* a /* b */ x */ SELECT name FROM t", { limit: 50 });
+
+        expect(result.query).toBe("/* a /* b */ x */ SELECT TOP 50 name FROM t");
+        expect(result.wasLimited).toBe(true);
+      });
+
+      test("adds no clause to a write a nested comment hid inside a CTE list", () => {
+        const sql =
+          "WITH recent AS (\n  /* outer /* inner */ ) SELECT 1 */\n  SELECT id FROM logs\n)\nINSERT INTO archive (id) SELECT id FROM recent";
+
+        const result = provider.prepareQuery(sql, { limit: 50 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+      });
+
+      test("adds no clause where the nested comment never closes", () => {
+        const sql = "/* a /* b */ SELECT name FROM t";
+
+        const result = provider.prepareQuery(sql, { limit: 50 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+      });
+    });
+
+    // ── A statement that already carries a page (#293) ───────────────────────
+    //
+    // `TOP` and `OFFSET … FETCH` may not both appear in one query expression, so
+    // adding a row-count clause to a statement that already carries a page does
+    // not return too many rows - SQL Server rejects the statement outright
+    // (Msg 10741) while this method reports `wasLimited: true`. Two shapes reach
+    // that, and neither of them is the hash #292 closed at the root:
+    //
+    // 1. The statement's end may not be CUT. The already-bounded probes in the
+    //    shared limiter are anchored at the end of the statement's own text, and
+    //    where the cut is refused that text still carries the trailing trivia -
+    //    so a real page written BEFORE a trailing comment sits away from the
+    //    anchor and reads as absent.
+    // 2. `OFFSET n ROWS` with no `FETCH` tail is a complete T-SQL page that the
+    //    shared probes do not recognise at all: they want a `FETCH … ROWS ONLY`
+    //    tail or a bare `OFFSET n` at the very end, and this form is neither.
+    describe("statements that already carry a page", () => {
+      // Shape 1. Every row carries a real page AND real trailing trivia; what
+      // differs is only the reason the end cannot be cut. The emitted text is
+      // asserted whole, because what this closes is an emitted statement the
+      // server refuses rather than one that returns too many rows.
+      test.each<[string, string]>([
+        [
+          "a literal whose end is undeterminable",
+          "SELECT id FROM users WHERE path = 'C:\\' ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY -- daily",
+        ],
+        [
+          "an unterminated block comment",
+          "SELECT id FROM users ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY /* daily",
+        ],
+        [
+          "an unterminated bracket-quoted name",
+          "SELECT [abc FROM users ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY -- daily",
+        ],
+      ])("adds no TOP to a paged read whose end cannot be cut for %s", (_label, sql) => {
+        const result = provider.prepareQuery(sql, { limit: 50 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+        expect(result.query).not.toMatch(/\bTOP\b/i);
+      });
+
+      // Shape 2. The `#tmp` row is this task's fixture-discipline input: a
+      // temp-table name and a block comment after the page, two constructs the
+      // shared scanner reads only because this provider names its dialect.
+      test.each<[string, string]>([
+        ["with no FETCH tail", "SELECT * FROM users ORDER BY id OFFSET 10 ROWS"],
+        ["spelled ROW rather than ROWS", "SELECT * FROM users ORDER BY id OFFSET 1 ROW"],
+        ["before a trailing line comment", "SELECT * FROM users ORDER BY id OFFSET 10 ROWS -- daily"],
+        ["before a terminator", "SELECT * FROM users ORDER BY id OFFSET 10 ROWS;"],
+        ["with a FETCH tail", "SELECT * FROM users ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY"],
+        ["on a temp table, before a block comment", "SELECT * FROM #tmp ORDER BY id OFFSET 10 ROWS /* daily */"],
+      ])("recognises a T-SQL page %s and adds no clause beside it", (_label, sql) => {
+        const result = provider.prepareQuery(sql, { limit: 50 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+        expect(result.query).not.toMatch(/\bTOP\b/i);
+      });
+
+      // The pagination branch reaches the same statement, and appending there
+      // emits `… OFFSET 10 ROWS OFFSET 10 ROWS FETCH NEXT 50 ROWS ONLY`.
+      test("appends no second page to a T-SQL page when an offset is requested", () => {
+        const sql = "SELECT * FROM users ORDER BY id OFFSET 10 ROWS";
+
+        const result = provider.prepareQuery(sql, { limit: 50, offset: 10 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+      });
+
+      // The page probe is anchored at the end of the statement, exactly as the
+      // shared ones are: an `OFFSET` belonging to a subquery is a different query
+      // expression, which a `TOP` on the outer one may legally join, and one
+      // written in text the statement merely carries is no page at all.
+      test.each<[string, string, string]>([
+        [
+          "an OFFSET inside a subquery",
+          "SELECT * FROM (SELECT id FROM t ORDER BY id OFFSET 10 ROWS) x",
+          "SELECT TOP 50 * FROM (SELECT id FROM t ORDER BY id OFFSET 10 ROWS) x",
+        ],
+        [
+          "a page spelled inside a trailing comment",
+          "SELECT * FROM users -- OFFSET 10 ROWS",
+          "SELECT TOP 50 * FROM users -- OFFSET 10 ROWS",
+        ],
+        [
+          "a page spelled inside a bracket-quoted name",
+          "SELECT [OFFSET 5 ROWS] FROM users",
+          "SELECT TOP 50 [OFFSET 5 ROWS] FROM users",
+        ],
+        [
+          "a column whose name merely begins with the word",
+          "SELECT offset_id FROM users WHERE path = 'C:\\'",
+          "SELECT TOP 50 offset_id FROM users WHERE path = 'C:\\'",
+        ],
+      ])("still bounds a read carrying %s", (_label, sql, expected) => {
+        const result = provider.prepareQuery(sql, { limit: 50 });
+
+        expect(result.query).toBe(expected);
+        expect(result.wasLimited).toBe(true);
+      });
+
+      // A head `TOP` is found by a probe anchored at the statement's own
+      // `SELECT`, so no trailing trivia and no unreadable tail can hide it. This
+      // is today's answer on both rows; it is asserted because the refusal added
+      // here must not turn a recognised bound into a silent second one.
+      test.each<[string, string]>([
+        ["before a trailing comment", "SELECT TOP 10 * FROM users -- daily"],
+        ["in a statement whose end cannot be cut", "SELECT TOP 10 id FROM users WHERE path = 'C:\\'"],
+      ])("keeps a head TOP %s and collects no second clause", (_label, sql) => {
+        const result = provider.prepareQuery(sql, { limit: 50 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+        expect(result.query.match(/\bTOP\b/gi)).toHaveLength(1);
+      });
+
+      // The blunt half of the rule, pinned so it stays a decision rather than a
+      // surprise: where the end cannot be cut, no anchor is trustworthy, so the
+      // WORD alone is enough to decline - and a statement that merely names a
+      // column `offset` beside an unreadable literal loses its bound. It is
+      // reported honestly (`wasLimited: false`), which is the trade every reader
+      // in `src/lib/sql/` makes for text it cannot resolve.
+      test("declines where an unreadable end sits beside a column named like a clause", () => {
+        const sql = "SELECT [offset] FROM users WHERE path = 'C:\\'";
+
+        const result = provider.prepareQuery(sql, { limit: 50 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
       });
     });
 

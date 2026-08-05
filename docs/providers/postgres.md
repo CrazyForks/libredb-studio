@@ -223,6 +223,25 @@ The statement timeout is **separate** from pool config: `ProviderOptions.queryTi
 live `{ total, idle, active, waiting }` counts. Every query acquires a client from the pool and
 releases it in a `finally` block.
 
+#### Idle-client failures are handled, not fatal
+
+`connect()` attaches an `error` listener to the pool as soon as it is constructed. This is not
+optional bookkeeping: a client that fails while **checked out** rejects its own query, but a client
+that fails while **idle** (the server dropped it, the network went away) has no query to reject, so
+`pg` removes and destroys it and emits `error` on the pool instead. An `error` event with no listener
+is an uncaught exception — i.e. a long-running server process would die from a dropped idle
+connection.
+
+The listener reports the failure with the file's usual bracketed-prefix `console.error` and does
+nothing else. `pg` has already discarded the client, so the handler exists to keep the event
+non-fatal and visible, not to reconnect; the pool opens a fresh client on the next acquire.
+
+The same guard is on the PostgreSQL **storage** pool (see [STORAGE.md](../STORAGE.md)), which is a
+second long-lived `pg.Pool` when `STORAGE_PROVIDER=postgres`. Across the other pooled drivers, only
+SQL Server needs the same treatment ([mssql.md](./mssql.md#42-connection-pooling)): mysql2 and
+oracledb expose no pool-level `error` event at all, which is recorded at each provider's
+`connect()`.
+
 ### 4.3 SSL
 
 `buildSSLConfig()` ([postgres.ts:342](../../src/lib/db/providers/sql/postgres.ts)) resolves SSL with
@@ -274,6 +293,42 @@ and, **only for `SELECT`/CTE-`SELECT` queries that don't already have a `LIMIT`*
   already-limited check, so an annotated bounded query is not bounded twice. Before this, an
   annotated `SELECT` classified as an unknown statement type and returned **every** row while the
   UI badge reported it as not limited (#275).
+- The statement's characters are read under **PostgreSQL's** grammar, which the provider passes down
+  from its own `type` ([`grammar.ts`](../../src/lib/sql/grammar.ts)). PostgreSQL has exactly two
+  comment forms, `--` and `/* … */`; `#` is an operator character (`#>` and `#>>` walk a jsonb path,
+  `#-` deletes one, `##` is geometric, `#` is integer XOR). The shared reader used to approximate
+  that with "a comment unless the next character makes an operator", which kept everyday jsonb queries
+  bounded but read `SELECT flags # 5 AS x FROM t` as a statement that ends at the `#` — so it was not
+  bounded. Both are bounded now, and the emitted text is unchanged apart from the appended clause
+  (#292). See
+  [Which dialect the readers are reading](../editor/query-optimization.md#which-dialect-the-readers-are-reading).
+- **`[…]` is a SUBSCRIPT here, not a quoted name.** `expression[subscript]` extracts an element and
+  `expression[lower:upper]` a slice (manual 4.2.3), array constructors nest — the manual's own example
+  is `SELECT ARRAY[[1,2],[3,4]]` (4.2.12) — and identifiers are quoted with double quotes (4.1.1), so
+  `[` is never a name quote in this dialect. The run nests, nothing inside it is escaped, and a literal
+  inside it is read as a literal, so a nested array (`SELECT ARRAY[[1,2],[3,4]] AS a FROM t`), a
+  subscript key carrying a close bracket (`SELECT j['a]b'] FROM t`) and a nested subscript
+  (`SELECT t.data[idx[0]] FROM t`) are all read whole: bounded, emitted intact, no prompt (#295).
+  A run short of its closer (`SELECT ARRAY[[1,2] AS a FROM t`) is still undeterminable — not bounded,
+  and the safety gate asks — which is the fail-safe direction and the only bracket shape that costs
+  anything here. Pinned in `tests/integration/db/postgres-provider.test.ts`, including a statement that
+  ENDS with a nested array (nothing after the run would catch a bound placed by a reader that lost
+  track of where it closes), and on the gate side in `tests/components/QuerySafetyDialog.test.tsx`.
+- **Block comments NEST here, and that is the dialect's own rule** — PostgreSQL's manual (4.1.5
+  Comments) says they nest "as specified in the SQL standard but unlike C", precisely so a region that
+  already contains comments can be commented out. The shared reader used to end every comment at its
+  first `*/`, which handed everything between that marker and the comment's real end to the readers as
+  code. On this provider that was the most expensive shape in the family, because a `)` written in that
+  region closes a CTE body that is still open: `WITH recent AS (/* a /* b */ ) SELECT 1 */ SELECT id
+  FROM logs) INSERT INTO archive (id) SELECT id FROM recent` typed as a `SELECT` and collected a bound,
+  and on PostgreSQL that bound applies to the rows the INSERT **writes** — a partial commit reported as
+  a truncated result set. Under PostgreSQL's grammar the comment is read whole, the statement is typed
+  `INSERT`, and nothing is appended (#300). The read side improves too: `/* a /* b */ x */ SELECT id
+  FROM logs` is now typed `SELECT` and bounded, comment emitted intact. A comment carrying one opener
+  too many (`/* a /* b */ SELECT 1`) never closes here, so it is undeterminable: not bounded, and the
+  safety gate asks — the fail-safe direction, since the same text is either an unterminated comment the
+  server rejects or a comment hiding a statement nobody can see. Pinned in
+  `tests/integration/db/postgres-provider.test.ts`.
 - A statement leading with `WITH` is typed by the keyword its CTE list **operates**
   ([`operative-keyword.ts`](../../src/lib/sql/operative-keyword.ts)), so a data-modifying CTE
   (`WITH t AS (UPDATE … RETURNING …) INSERT INTO … SELECT …`) is **not** bounded. This matters most on
@@ -290,9 +345,15 @@ and, **only for `SELECT`/CTE-`SELECT` queries that don't already have a `LIMIT`*
   `-- LIMIT 10` look like a real one, so nothing was injected (#280). A statement with no trailing
   trivia is emitted exactly as before. A statement whose end may not be **cut** is returned untouched
   with `wasLimited: false`, since a guess would place the bound after the `;` or in the middle of the
-  statement: a quote behind an odd backslash run (MySQL and PostgreSQL close it in different places)
-  and a trailing `#` run, which is a comment in MySQL and PostgreSQL's XOR operator here
-  (`SELECT flags # 5`).
+  statement. **On this dialect the shapes that reach it are a quote behind an odd backslash run** (MySQL
+  and PostgreSQL close such a literal in different places, so the reader declines to guess), **a
+  bracketed run short of its closer** (see the bullet above) **and any other
+  run that never closes** — an unterminated comment or literal. A trailing `#`
+  run used to reach it too and no longer does — under PostgreSQL's grammar `#` is code, not a comment
+  marker, so `SELECT flags # 5` is cut and bounded like any other statement (#292); the refusal survives
+  only for a caller that names no dialect. The backslash shape also asks for confirmation since #297 —
+  an unresolvable run is text the safety gate cannot read either — see
+  [query-optimization.md](../editor/query-optimization.md#text-the-reading-cannot-resolve-asks-and-says-so).
 
 `prepareQuery()` is a *preparation* step (the UI calls it before `query()`); `query()` itself runs
 exactly the SQL it is handed.

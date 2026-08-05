@@ -959,10 +959,11 @@ describe("MySQLProvider", () => {
       expect(result.wasLimited).toBe(false);
     });
 
-    // `#` is MySQL's own second line-comment marker, and it is the reason the shared
-    // trivia pattern in `lib/sql/leading-keyword.ts` recognises one at all: without it
-    // a `# note`-led SELECT classified as an unknown statement type and reached the
-    // server with no LIMIT, which is #275's reported symptom on this provider.
+    // `#` is MySQL's own second line-comment marker, and it is the reason
+    // `lib/sql/leading-keyword.ts` skips such a run at all - on every dialect, since
+    // none of them can OPEN a statement with one. Without it a `# note`-led SELECT
+    // classified as an unknown statement type and reached the server with no LIMIT,
+    // which is #275's reported symptom on this provider.
     test.each<[string, string]>([
       ["a hash comment", "# note\nSELECT * FROM users"],
       ["a line comment", "-- note\nSELECT * FROM users"],
@@ -983,6 +984,49 @@ describe("MySQLProvider", () => {
 
       expect(result.query).toBe(sql);
       expect(result.wasLimited).toBe(false);
+    });
+
+    // ── The `#` grammar is MySQL's here (#292) ────────────────────────────
+    //
+    // The shared readers used to decide `#` from the characters alone, and the
+    // rule they settled on was PostgreSQL's: a hash whose next character makes a
+    // jsonb/geometric operator is code. On THIS provider that reading is simply
+    // wrong - every `#` opens a comment - and it cost a write its typing. The
+    // provider now tells the readers which dialect they are reading, so these
+    // assertions go through `prepareQuery`, the real caller, and pin the emitted
+    // text rather than "a bound was added".
+
+    describe("hash comments (#292)", () => {
+      test("a comment hiding a paren does not retype the DELETE it precedes", () => {
+        provider = new MySQLProvider(makeMySQLConfig());
+        // `#-` reads as a jsonb operator to a dialect-blind scan, so the `)` inside
+        // the comment closed the CTE body early and `SELECT` answered for the whole
+        // statement - a bound on a DELETE, which MySQL 8 accepts and commits.
+        const sql = "WITH t AS (\n  #- drop the ) SELECT here\n  SELECT id FROM logs\n) DELETE FROM users";
+
+        const result = provider.prepareQuery(sql, { limit: 50 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+      });
+
+      test("a bound written after a hash is commented out, so a real one is added before it", () => {
+        provider = new MySQLProvider(makeMySQLConfig());
+
+        const result = provider.prepareQuery("SELECT * FROM t # LIMIT 10", { limit: 50 });
+
+        expect(result.query).toBe("SELECT * FROM t LIMIT 50 # LIMIT 10");
+        expect(result.wasLimited).toBe(true);
+      });
+
+      test("a hash inside a backtick-quoted name is part of the name", () => {
+        provider = new MySQLProvider(makeMySQLConfig());
+
+        const result = provider.prepareQuery("SELECT `a#b` FROM t", { limit: 50 });
+
+        expect(result.query).toBe("SELECT `a#b` FROM t LIMIT 50");
+        expect(result.wasLimited).toBe(true);
+      });
     });
   });
 

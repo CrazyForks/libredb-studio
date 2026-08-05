@@ -31,6 +31,7 @@ import { DatabaseConfigError, ConnectionError, QueryError, mapDatabaseError } fr
 import { formatBytes } from "../../utils/pool-manager";
 import { analyzeQuery, DEFAULT_QUERY_LIMIT, MAX_UNLIMITED_ROWS } from "../../utils/query-limiter";
 import { readLeadingKeyword } from "@/lib/sql/leading-keyword";
+import { resolveSqlGrammar, type SqlGrammar } from "@/lib/sql/grammar";
 import { readStatementEnd } from "@/lib/sql/statement-end";
 
 // Row shape used to group foreign keys per table in getSchema().
@@ -46,12 +47,23 @@ type ForeignKeyInfo = { columnName: string; referencedTable: string; referencedC
  * (#275). `DISTINCT` is found the same way, so `SELECT /* c *\/ DISTINCT a` places
  * `TOP` after the `DISTINCT` and not between the two - `SELECT TOP n DISTINCT ...`
  * is a syntax error in T-SQL.
+ *
+ * Every one of those three reads takes T-SQL's grammar, because this is a HEAD
+ * rewrite and the index comes from the reading: T-SQL nests block comments, so a
+ * flat reading of `SELECT /* a /* b *\/ DISTINCT *\/ name FROM t` found a
+ * `DISTINCT` that is inside the comment and spliced the `TOP` in after it - inside
+ * the comment too. SQL Server then ran the statement unbounded while this provider
+ * reported a limit, which is #280's shape rather than a missed bound (#300).
+ *
+ * The two SUFFIX slices are safe under this dialect's grammar specifically: only
+ * the alternate-quote tag reads the character before its index (see `readSqlSpan`),
+ * and T-SQL does not have that form.
  */
-function injectTop(sql: string, limit: number): string | null {
-  const select = readLeadingKeyword(sql);
+function injectTop(sql: string, limit: number, grammar: SqlGrammar): string | null {
+  const select = readLeadingKeyword(sql, grammar);
   if (select === null || select.keyword !== "SELECT") return null;
 
-  const next = readLeadingKeyword(sql.slice(select.end));
+  const next = readLeadingKeyword(sql.slice(select.end), grammar);
   const insertAt = next?.keyword === "DISTINCT" ? select.end + next.end : select.end;
 
   // A `TOP` already sitting where this one would go means the statement carries its
@@ -59,10 +71,51 @@ function injectTop(sql: string, limit: number): string | null {
   // whitespace between the two words, so a comment between them defeats it, as does
   // a `DISTINCT`. Splicing anyway yields `SELECT TOP 50 TOP 10` and a syntax error,
   // so decline and let the caller report that nothing was limited.
-  if (readLeadingKeyword(sql.slice(insertAt))?.keyword === "TOP") return null;
+  if (readLeadingKeyword(sql.slice(insertAt), grammar)?.keyword === "TOP") return null;
 
   return `${sql.slice(0, insertAt)} TOP ${limit}${sql.slice(insertAt)}`;
 }
+
+/**
+ * A T-SQL page written as `OFFSET n ROW[S]`, at the end of the statement.
+ *
+ * That is a complete page here - "skip n rows and return the rest" - and it is
+ * the one bound form the shared probes in `query-limiter.ts` cannot see: they
+ * want a `FETCH … ROWS ONLY` tail or a bare `OFFSET n`, and `OFFSET 10 ROWS` is
+ * neither. Unseen, the statement looked unbounded and collected a clause beside
+ * its own page, which SQL Server rejects outright (Msg 10741) - so the statement
+ * FAILED rather than returning too many rows, and this method reported a limit
+ * for it. The form belongs to this dialect, so it is read here rather than in the
+ * shared limiter, where it would move every other dialect's probes (#293).
+ *
+ * Anchored at the end of the statement for the same reason the shared probes
+ * are: an `OFFSET` inside a subquery (`… FROM (SELECT … OFFSET 10 ROWS) x`) is a
+ * different query expression, which a `TOP` on the outer one may legally join,
+ * and one written in a trailing comment is not a page at all. A digit count only,
+ * as the shared probes read: `OFFSET @skip ROWS` is not recognised, which is the
+ * limitation `docs/providers/mssql.md` records.
+ */
+const TSQL_PAGE_TAIL = /\bOFFSET\s+\d+\s+ROWS?\s*$/i;
+
+/**
+ * Whether text mentions a clause a row-count clause may not sit beside.
+ *
+ * Consulted ONLY where the statement's end may not be cut. Every already-bounded
+ * probe - the shared ones and `TSQL_PAGE_TAIL` above - is anchored at the end of
+ * the statement's own text, and where the cut is refused that text still carries
+ * the trailing trivia: a real page written before a trailing comment then sits
+ * away from the anchor and reads as absent. An anchor that may be reading trivia
+ * is not an answer a decision that ADDS a clause may rest on, so this asks the
+ * weaker question the situation allows - is there anything here that could be a
+ * page? - and the branch declines when there is.
+ *
+ * Unanchored and deliberately blunt: it also fires on a column named `offset`
+ * and on a subquery's own page, so such a statement loses its bound. That is the
+ * trade the whole of `src/lib/sql/` makes for text it cannot resolve - an
+ * over-large read reported honestly as unbounded, never a statement the server
+ * refuses - and both halves are pinned in this provider's suite.
+ */
+const TSQL_ROW_BOUND_MENTION = /\b(?:OFFSET|FETCH)\b/i;
 
 // ============================================================================
 // SQL Statements
@@ -462,6 +515,16 @@ export class MSSQLProvider extends SQLBaseProvider {
     try {
       const config = this.buildConfig();
       this.pool = new mssql.ConnectionPool(config);
+
+      // `mssql`'s ConnectionPool is an EventEmitter that emits `error` for a background
+      // connection failure (a non-ESOCKET tedious error) and for a failed acquire. An
+      // `error` event with no listener is an uncaught exception, so without this handler
+      // one of those takes the server process down (#298). A failed acquire ALSO rejects
+      // the caller's promise, so this handler must only log — swallowing nothing.
+      this.pool.on("error", (error: unknown) => {
+        console.error("[MSSQL] Pool error:", error);
+      });
+
       await this.pool.connect();
 
       // Test the connection
@@ -559,7 +622,7 @@ export class MSSQLProvider extends SQLBaseProvider {
   public override prepareQuery(query: string, options: QueryPrepareOptions = {}): PreparedQuery {
     const { limit = DEFAULT_QUERY_LIMIT, offset = 0, unlimited = false } = options;
     const effectiveLimit = unlimited ? MAX_UNLIMITED_ROWS : limit;
-    const queryInfo = analyzeQuery(query);
+    const queryInfo = analyzeQuery(query, this.type);
 
     if (queryInfo.type === "SELECT" && !queryInfo.hasLimit) {
       // The `TOP` branch writes into the HEAD and was never reachable by a
@@ -572,25 +635,33 @@ export class MSSQLProvider extends SQLBaseProvider {
       //
       // Splitting and rejoining is lossless and the splice does not depend on
       // where the statement ends, so the `TOP` branch stays correct even where
-      // the tail may not be CUT - which matters here more than anywhere else,
-      // because a T-SQL temp table (`SELECT * FROM #tmp`) is exactly such a
-      // statement and is entirely ordinary. Only the appending branch has to
-      // decline.
+      // the tail may not be CUT. Only the appending branch has to decline there.
       //
-      // What makes that tolerable is that a refused cut still reports the whole
-      // statement as its end, so the already-bounded probe above sees a
-      // `FETCH NEXT` written after the `#` and this block is not entered for an
-      // already-paged temp table. It is not airtight: put trailing trivia after
-      // that bound (`... FETCH NEXT 10 ROWS ONLY -- daily`) and the end-anchored
-      // probe stops seeing it, so a `TOP` is spliced alongside an `OFFSET …
-      // FETCH` that SQL Server rejects. That shape behaves exactly as it did
-      // before this change - the probe was end-anchored on the raw text then too
-      // - and closing it needs the `#` end re-read under a hash-is-code scan,
-      // which is a change of its own with its own tests.
+      // The end is read under T-SQL's grammar (#292), where `#` opens no comment
+      // at all - `#name` and `##name` are temp tables. That is what makes a temp
+      // table an ordinary statement here rather than the special case it used to
+      // be: `SELECT * FROM #tmp` is cuttable, so BOTH branches are reachable for
+      // it, and the already-bounded probe sees a `FETCH NEXT` written after the
+      // `#` even when trailing trivia follows it.
       const source = query.trim();
-      const { end, rewritable } = readStatementEnd(source);
+      // Resolved once and handed to both readers below, so the head splice and the
+      // end reader cannot disagree about where a comment ends (#300).
+      const grammar = resolveSqlGrammar(this.type);
+      const { end, rewritable } = readStatementEnd(source, grammar);
       let modifiedSql = source.slice(0, end);
       const trailing = source.slice(end);
+
+      // Two pages the shared probes cannot see, and a clause beside either is a
+      // statement SQL Server refuses (Msg 10741) rather than one that returns too
+      // many rows - so both decline here, before either branch commits to a
+      // `wasLimited: true` (#293). The first is this dialect's own `OFFSET n ROWS`
+      // form; the second is every statement whose end may not be cut, where no
+      // end anchor is reading the statement's real tail and the honest answer is
+      // that a page cannot be ruled out. Neither is the hash the paragraph above
+      // describes: that half is closed at the root by naming the dialect.
+      if (TSQL_PAGE_TAIL.test(modifiedSql) || (!rewritable && TSQL_ROW_BOUND_MENTION.test(modifiedSql))) {
+        return { query, wasLimited: false, limit: effectiveLimit, offset };
+      }
 
       if (offset > 0) {
         if (!rewritable) {
@@ -605,7 +676,7 @@ export class MSSQLProvider extends SQLBaseProvider {
         modifiedSql = `${modifiedSql} OFFSET ${offset} ROWS FETCH NEXT ${effectiveLimit} ROWS ONLY`;
       } else {
         // Inject TOP N after SELECT
-        const injected = injectTop(modifiedSql, effectiveLimit);
+        const injected = injectTop(modifiedSql, effectiveLimit, grammar);
 
         // Nothing to inject into: report the truth rather than a limit that is not
         // there. `analyzeQuery` also calls a CTE a SELECT, and `TOP` belongs to the

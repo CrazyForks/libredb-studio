@@ -373,6 +373,49 @@ or `SETTINGS` clause is expressing intent the editor must not silently rewrite, 
 favour not rewriting: rewriting wrongly turns a working statement into a syntax error, while leaving
 it alone at worst returns more rows than the page size.
 
+Both the detection and the inherited limiter read the statement under **ClickHouse's** grammar, which
+this provider passes down from its own `type` ([`grammar.ts`](../../src/lib/sql/grammar.ts)).
+ClickHouse's syntax reference lists `#` and `#!` beside `--` as single-line comment forms, and the
+shared reader used to guess PostgreSQL's rule instead — a hash followed by `>`, `-` or `#` is an
+operator — so a comment written that way was read as SQL, and an ordinary one at the end of a
+statement made the bound unplaceable. `SELECT * FROM users # daily check` is now bounded before the
+comment, exactly as the `--` form is, and `SELECT * FROM users # FORMAT TSV` is read as what it is: a
+commented-out clause, not a trailing one (#292). See
+[Which dialect the readers are reading](../editor/query-optimization.md#which-dialect-the-readers-are-reading).
+
+The same channel carries the second reading this dialect needs: **`[…]` is an array literal or a
+subscript here, not a quoted name.** Arrays nest (`Array(Array(T))`) and nothing inside them is
+escaped, while SQL Server's `[name]` ends at the first unpaired `]` and writes a bracket inside a name
+by doubling it — two rules that cannot both hold, so the reading comes from the dialect (#295). Under
+the name reading ClickHouse lost bounds in two everyday shapes: a subscript whose key text contains a
+close bracket (`WITH m['a]b'] AS v SELECT v`) ended the run at that bracket, so the CTE element could
+not be crossed and the statement typed as unknown; and a nested array (`SELECT [[1,2],[3,4]] AS a`)
+ended with a doubled bracket read as an escape, so the run never closed and the statement's end was
+not cuttable. Both are now bounded, emitted byte-intact. A run that genuinely never closes
+(`SELECT [[1,2] AS a`) is still reported as undeterminable and the statement is passed through
+untouched — the same fail-safe direction as an unterminated literal.
+
+A third fact of the same record: **block comments nest here.** ClickHouse's syntax reference states
+that C-style comments can be nested and gives a nested example, while the shared reader used to end
+every comment at its first `*/` — handing everything between that marker and the comment's real end to
+the readers as code, which cost the statement its bound. On this engine, whose whole point is scanning
+more rows than a browser can hold, a missing bound is the entire cost: there is no data-modifying CTE
+here, so no bound can land on a write. `/* a /* b */ x */ SELECT arrayJoin([1, 2]) AS n` and
+`WITH /* a /* b */ x */ 1 AS one SELECT one FROM events` are now bounded, and a trailing nested comment
+takes the bound before it rather than inside it. A comment carrying one opener too many
+(`/* a /* b */ SELECT n FROM events`) never closes here, so it is undeterminable and the statement is
+passed through untouched — the same fail-safe direction as an unclosed array, and it costs that
+statement a confirmation prompt as well (#300).
+
+The same reading reaches the **destructive-statement confirmation**, because that predicate reads the
+statement under the connection's dialect too. It gains prompts here: a nested array before a
+destructive keyword (`WITH [[1,2],[3,4]] AS x DELETE FROM t`) used to leave the run unterminated and
+everything after it invisible, so nothing asked. Nothing is lost either, since #297 closed the
+narrowing this paragraph used to record: bracket text that does not *balance*
+(`WITH [[1,2] AS x DELETE FROM t`) is undeterminable under the array reading, and unresolvable text
+now asks — the confirmation dialog says the statement could not be fully read instead of staying
+silent. The statement is a syntax error in ClickHouse either way. Both directions are pinned by tests.
+
 A hand-rolled semicolon strip used to stand in for that reading, so `... FORMAT TSV -- note` read as
 carrying no trailing clause at all. That was harmless only while the inherited limiter appended its
 bound after the comment, where the server never saw it; now that the bound is placed **before** the

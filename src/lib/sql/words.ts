@@ -19,6 +19,7 @@
  * or one word at a time cannot backtrack at all.
  */
 
+import { DEFAULT_SQL_GRAMMAR, type SqlGrammar } from "./grammar";
 import { IDENTIFIER_PART, IDENTIFIER_START, readSqlSpan } from "./spans";
 
 /** A word (identifier or keyword) and where it ends. */
@@ -70,13 +71,30 @@ export interface CodeWord {
  * different places, the text is a syntax error under one of them, and guessing here
  * would answer for words inside a literal under the other. Pinned by a test in
  * `tests/unit/sql/words.test.ts`.
+ *
+ * So a caller that must not be silent about such text asks about it separately
+ * rather than reading this reader's `null` as "the word is not there": the
+ * confirmation gate calls `hasUnterminatedSpan` and prompts on it (#297). This
+ * reader's answer stays what it is - where the word was FOUND - because the readers
+ * that walk a statement to rewrite it need exactly that.
+ *
+ * WHICH runs are not code is the dialect's answer for one character: a write
+ * written after a `#` is commented out in MySQL and the statement's own code in
+ * PostgreSQL, and the safety predicate above this reader has to prompt in the
+ * second case and not the first (#292). Omitting `grammar` keeps the reading a
+ * dialect-less call always had.
  */
-export function findCodeWord(sql: string, word: string, from = 0): CodeWord | null {
+export function findCodeWord(
+  sql: string,
+  word: string,
+  from = 0,
+  grammar: SqlGrammar = DEFAULT_SQL_GRAMMAR,
+): CodeWord | null {
   const target = word.toUpperCase();
   let i = from;
 
   while (i < sql.length) {
-    const span = readSqlSpan(sql, i);
+    const span = readSqlSpan(sql, i, grammar);
     if (span !== null) {
       i = span.end;
       continue;

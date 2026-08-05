@@ -945,3 +945,314 @@ describe("applyQueryLimit: bracket-quoted identifiers", () => {
     expect(applyQueryLimit("SELECT [a--b] FROM t -- daily", 500).sql).toBe("SELECT [a--b] FROM t LIMIT 500 -- daily");
   });
 });
+
+// ─── `[…]` is read per dialect (#295) ────────────────────────────────────────
+//
+// The reading above is a NAME, which is right for SQL Server and SQLite and wrong
+// for ClickHouse, where the same characters are an array or a subscript: they nest
+// and nothing inside them is escaped. Read as a name, a `]` written inside a
+// string ends the run early and the CTE element around it cannot be crossed, so
+// the statement loses its bound - on the engine whose whole point is scanning more
+// rows than a browser can hold. The two readings are mutually exclusive, so this
+// is the dialect's answer and both sides are asserted on the emitted text.
+
+describe("applyQueryLimit: the bracket grammar", () => {
+  test.each<[string, string, "clickhouse", string]>([
+    [
+      "a map subscript whose key carries a close bracket",
+      "WITH m['a]b'] AS v SELECT v FROM t",
+      "clickhouse",
+      "WITH m['a]b'] AS v SELECT v FROM t LIMIT 500",
+    ],
+    [
+      "a nested array element",
+      "WITH [[1,2],[3,4]] AS a SELECT arrayJoin(a)",
+      "clickhouse",
+      "WITH [[1,2],[3,4]] AS a SELECT arrayJoin(a) LIMIT 500",
+    ],
+    [
+      "a nested array in the select list",
+      "SELECT [[1,2],[3,4]] AS a FROM t",
+      "clickhouse",
+      "SELECT [[1,2],[3,4]] AS a FROM t LIMIT 500",
+    ],
+    // The bound goes after the run and before the trailing comment: a subscript is
+    // the statement's own text, not trivia, so an end read before it would splice
+    // the clause into the middle of the statement. The rows where the run is the
+    // statement's LAST token are what make that assertable at all - with code after
+    // the run, both readings put the end in the same place (reported by review).
+    [
+      "an array literal before a trailing hash comment",
+      "SELECT [[1,2],[3]] AS a FROM t # daily",
+      "clickhouse",
+      "SELECT [[1,2],[3]] AS a FROM t LIMIT 500 # daily",
+    ],
+    ["a subscript that ends the statement", "SELECT m['a]b']", "clickhouse", "SELECT m['a]b'] LIMIT 500"],
+    [
+      "a nested array that ends the statement, before a comment",
+      "SELECT [[1,2],[3,4]] # daily",
+      "clickhouse",
+      "SELECT [[1,2],[3,4]] LIMIT 500 # daily",
+    ],
+  ])("%s is bounded under the subscript grammar, emitted intact", (_label, sql, type, expected) => {
+    const result = applyQueryLimit(sql, 500, 0, {}, type);
+
+    expect(result.sql).toBe(expected);
+    expect(result.wasLimited).toBe(true);
+    // Without the dialect the same text keeps today's answer, which for every
+    // shape here is no bound at all: the name reading either cannot cross the
+    // element or cannot close the run.
+    expect(applyQueryLimit(sql, 500).sql).not.toBe(expected);
+  });
+
+  test.each<[string, string, "mssql" | "sqlite", string]>([
+    ["an apostrophe inside the name", "SELECT [it's] FROM t", "mssql", "SELECT [it's] FROM t LIMIT 500"],
+    ["a doubled close bracket", "SELECT [a]]b] FROM t", "mssql", "SELECT [a]]b] FROM t LIMIT 500"],
+    ["a comment marker inside the name", "SELECT [a--b] FROM t", "sqlite", "SELECT [a--b] FROM t LIMIT 500"],
+    ["a name carrying a semicolon", "SELECT [a;b] FROM t -- daily", "sqlite", "SELECT [a;b] FROM t LIMIT 500 -- daily"],
+  ])("a bracket-quoted name with %s stays one name under the name grammar", (_label, sql, type, expected) => {
+    const result = applyQueryLimit(sql, 500, 0, {}, type);
+
+    expect(result.sql).toBe(expected);
+    expect(result.wasLimited).toBe(true);
+  });
+
+  test("a subscript with no literal in it, and a literal with no close bracket, keep their answers", () => {
+    // Neither reading moves for these, and that is worth pinning: it is what says
+    // the change is confined to the runs where the two grammars disagree.
+    expect(applyQueryLimit("SELECT a[1] FROM t", 500, 0, {}, "clickhouse").sql).toBe("SELECT a[1] FROM t LIMIT 500");
+    expect(applyQueryLimit("SELECT a[1] FROM t", 500).sql).toBe("SELECT a[1] FROM t LIMIT 500");
+    expect(applyQueryLimit("SELECT 'a[b' FROM t", 500, 0, {}, "clickhouse").sql).toBe("SELECT 'a[b' FROM t LIMIT 500");
+    expect(applyQueryLimit("SELECT 'a[b' FROM t", 500).sql).toBe("SELECT 'a[b' FROM t LIMIT 500");
+  });
+
+  test("a run the subscript grammar cannot close is not rewritten", () => {
+    const sql = "SELECT [1,2 AS a FROM t";
+
+    expect(applyQueryLimit(sql, 500, 0, {}, "clickhouse")).toMatchObject({ sql, wasLimited: false });
+  });
+});
+
+// ─── The dialect channel (#292) ──────────────────────────────────────────────
+//
+// Every reading above is a call that names NO dialect, and the point of the
+// compatibility default is that those answers do not move: the readers do exactly
+// what they did before this channel existed. A caller that DOES name its dialect
+// gets that dialect's grammar, and the shapes below are the ones where the two
+// answers differ - each asserted on BOTH sides, so the default is a decision
+// rather than whatever the implementation happened to do.
+
+describe("a named dialect changes the reading; naming none does not", () => {
+  // The bad direction this family exists to prevent: a hash comment whose first
+  // character makes a PostgreSQL operator hides a `)`, the CTE body ends early,
+  // and a statement that DELETEs is typed SELECT and bounded. MySQL 8 accepts
+  // both `WITH … DELETE` and a `LIMIT` on a `DELETE`, so that bound would commit a
+  // partial delete while the UI reported a truncated result set.
+  const HIDDEN_DELETE = "WITH t AS (\n  #- drop the ) SELECT here\n  SELECT id FROM logs\n) DELETE FROM users";
+
+  test("without a dialect the hidden DELETE keeps today's (wrong) type", () => {
+    expect(analyzeQuery(HIDDEN_DELETE).type).toBe("SELECT");
+  });
+
+  test("under MySQL's grammar it is typed as the DELETE it operates and gets no bound", () => {
+    expect(analyzeQuery(HIDDEN_DELETE, "mysql").type).toBe("DELETE");
+
+    const result = applyQueryLimit(HIDDEN_DELETE, 500, 0, {}, "mysql");
+    expect(result.sql).toBe(HIDDEN_DELETE);
+    expect(result.wasLimited).toBe(false);
+  });
+
+  // The read-side face of the same ambiguity: a bound written after a hash is
+  // read as a real one today, so the statement is left unbounded. Under MySQL's
+  // grammar the bound is commented out, so a real one is added - and it is added
+  // BEFORE the comment, or it would land inside it.
+  test("a bound commented out with a hash is real without a dialect and commented out under MySQL's", () => {
+    const sql = "SELECT * FROM t # LIMIT 10";
+
+    expect(analyzeQuery(sql).hasLimit).toBe(true);
+    expect(applyQueryLimit(sql, 500).sql).toBe(sql);
+
+    expect(analyzeQuery(sql, "mysql").hasLimit).toBe(false);
+    expect(applyQueryLimit(sql, 500, 0, {}, "mysql")).toMatchObject({
+      sql: "SELECT * FROM t LIMIT 500 # LIMIT 10",
+      wasLimited: true,
+    });
+  });
+
+  // The other side: under a code grammar the run is part of the statement, so the
+  // cut is no longer refused and an ordinary temp-table read is bounded.
+  test.each<[string, string, "mssql" | "oracle" | "postgres" | "sqlite", string]>([
+    ["a T-SQL temp table", "SELECT * FROM #tmp", "mssql", "SELECT * FROM #tmp LIMIT 500"],
+    [
+      "an Oracle identifier carrying a hash",
+      "SELECT * FROM EMP WHERE ID# = 1",
+      "oracle",
+      "SELECT * FROM EMP WHERE ID# = 1 LIMIT 500",
+    ],
+    ["a PostgreSQL XOR operator", "SELECT flags # 5 AS x FROM t", "postgres", "SELECT flags # 5 AS x FROM t LIMIT 500"],
+    ["a SQLite bind variable", "SELECT * FROM t WHERE id = #id", "sqlite", "SELECT * FROM t WHERE id = #id LIMIT 500"],
+  ])("%s is bounded under a code grammar and left alone without one", (_label, sql, type, expected) => {
+    expect(applyQueryLimit(sql, 500).wasLimited).toBe(false);
+
+    const result = applyQueryLimit(sql, 500, 0, {}, type);
+    expect(result.sql).toBe(expected);
+    expect(result.wasLimited).toBe(true);
+  });
+
+  // Fixture discipline: input built from syntax these readers do not model as a
+  // unit - a hash INSIDE a quoted name, and a dollar-quoted body carrying both a
+  // hash and a close paren. The emitted text is asserted whole, because "a bound
+  // was added" would pass while the bound sat inside the name.
+  test.each<[string, string, "mysql" | "postgres" | "mssql", string]>([
+    ["a backtick name carrying a hash", "SELECT `a#b` FROM t", "mysql", "SELECT `a#b` FROM t LIMIT 500"],
+    [
+      "a bracket name carrying a hash, from a temp table",
+      "SELECT [a#b] FROM #tmp",
+      "mssql",
+      "SELECT [a#b] FROM #tmp LIMIT 500",
+    ],
+    [
+      "a dollar-quoted body carrying a hash and a paren",
+      "SELECT $fn$ # ) DELETE $fn$ AS body FROM t",
+      "postgres",
+      "SELECT $fn$ # ) DELETE $fn$ AS body FROM t LIMIT 500",
+    ],
+  ])("%s is emitted intact", (_label, sql, type, expected) => {
+    const result = applyQueryLimit(sql, 500, 0, {}, type);
+
+    expect(result.sql).toBe(expected);
+    expect(result.wasLimited).toBe(true);
+  });
+
+  // Oracle's alternate quoting (`q'{it's}'`) is the second grammar this channel
+  // carries, and the only dialect that has the form is the only one that reads it.
+  // Both inputs below are Oracle text, so the dialect-less answers are what
+  // reading Oracle as something else costs: the first loses its bound, and the
+  // second - whose literal also carries a `--` - has the clause placed before what
+  // that reading calls a trailing comment, i.e. inside the literal. That answer is
+  // correct FOR the grammar being read (there `q` is a name and `'[it'` a string)
+  // and wrong for the statement, which is the whole point of naming the dialect.
+  test.each<[string, string, string, string]>([
+    [
+      "a CTE body holding an apostrophe",
+      "WITH t AS (SELECT q'{it's}' AS s FROM dual) SELECT * FROM t",
+      "WITH t AS (SELECT q'{it's}' AS s FROM dual) SELECT * FROM t",
+      "WITH t AS (SELECT q'{it's}' AS s FROM dual) SELECT * FROM t LIMIT 500",
+    ],
+    [
+      "a literal holding an apostrophe and a comment marker",
+      "SELECT q'[it's a -- note )]' AS s FROM dual",
+      "SELECT q'[it's a LIMIT 500 -- note )]' AS s FROM dual",
+      "SELECT q'[it's a -- note )]' AS s FROM dual LIMIT 500",
+    ],
+  ])("%s is read as a literal under Oracle's grammar only", (_label, sql, withoutDialect, underOracle) => {
+    expect(applyQueryLimit(sql, 500).sql).toBe(withoutDialect);
+
+    const result = applyQueryLimit(sql, 500, 0, {}, "oracle");
+    expect(result.sql).toBe(underOracle);
+    expect(result.wasLimited).toBe(true);
+  });
+
+  test("isSelectQuery takes the dialect too, so the multi-statement route agrees with the provider", () => {
+    expect(isSelectQuery(HIDDEN_DELETE)).toBe(true);
+    expect(isSelectQuery(HIDDEN_DELETE, "mysql")).toBe(false);
+  });
+
+  // A dialect with no established `#` rule keeps the default reading, and that is
+  // an answer this milestone owes its readers rather than an accident.
+  test("a dialect left at the compatibility default answers as a dialect-less call does", () => {
+    expect(analyzeQuery(HIDDEN_DELETE, "druid").type).toBe("SELECT");
+    expect(applyQueryLimit("SELECT * FROM t # note", 500, 0, {}, "couchbase").wasLimited).toBe(false);
+  });
+});
+
+// ─── Where a block comment ends is the dialect's answer too (#300) ───────────
+//
+// The third grammar this channel carries, and the one whose cost is the same as
+// the `#` row's worst case: a comment that NESTS ends later than the flat reading
+// thinks, so a `)` written between the first `*/` and the comment's real end
+// closes a CTE body that is still open. The statement is then typed by a keyword
+// the operator commented out, and a bound appended to a write on PostgreSQL
+// commits part of it.
+
+describe("a nested block comment under the dialect that reads it", () => {
+  // The `)` and the `SELECT` both sit AFTER the inner `*/`, which is the region a
+  // flat reading hands over as code. With the whole comment read as one comment,
+  // the CTE body runs to its real `)` and the statement is the write it operates.
+  const hiddenWrite = (write: string) =>
+    `WITH recent AS (\n  /* outer /* inner */ ) SELECT 1 */\n  SELECT id FROM logs\n)\n${write}`;
+
+  test.each<[string, string, ParsedQueryInfo["type"]]>([
+    ["an INSERT … SELECT", "INSERT INTO archive (id) SELECT id FROM recent", "INSERT"],
+    ["an UPDATE … SET", "UPDATE archive SET seen = true WHERE id IN (SELECT id FROM recent)", "UPDATE"],
+  ])("%s hidden behind a nested comment is typed as the write it is, and not bounded", (_label, write, type) => {
+    const sql = hiddenWrite(write);
+
+    // Today's answer without the dialect, kept: the flat reading really is what
+    // MySQL does, and the statement is a syntax error there.
+    expect(analyzeQuery(sql).type).toBe("SELECT");
+    expect(analyzeQuery(sql, "mysql").type).toBe("SELECT");
+
+    expect(analyzeQuery(sql, "postgres").type).toBe(type);
+
+    const result = applyQueryLimit(sql, 500, 0, {}, "postgres");
+    expect(result.sql).toBe(sql);
+    expect(result.wasLimited).toBe(false);
+  });
+
+  // The read side of the same fact: with the comment read whole, the statement
+  // behind it is an ordinary SELECT and collects its bound - and the bound goes
+  // after the statement, never inside the comment.
+  test("a read behind a nested comment is bounded, and the comment is emitted intact", () => {
+    const sql = "/* outer /* inner */ still a note */ SELECT id FROM logs";
+
+    expect(applyQueryLimit(sql, 500).wasLimited).toBe(false);
+
+    expect(applyQueryLimit(sql, 500, 0, {}, "postgres")).toMatchObject({
+      sql: "/* outer /* inner */ still a note */ SELECT id FROM logs LIMIT 500",
+      wasLimited: true,
+    });
+  });
+
+  // Fixture discipline (the milestone's rule): a nested comment written where no
+  // reader models it as a unit - inside a dollar-quoted body, and inside a trailing
+  // comment run - with the emitted text asserted whole rather than "a bound was
+  // added".
+  test.each<[string, string, string]>([
+    [
+      "a dollar-quoted body carrying a nested comment and a paren",
+      "SELECT $fn$ /* a /* b */ ) $fn$ AS body FROM t",
+      "SELECT $fn$ /* a /* b */ ) $fn$ AS body FROM t LIMIT 500",
+    ],
+    [
+      "a trailing nested comment, where the bound goes before it",
+      "SELECT id FROM logs /* a /* b */ c */",
+      "SELECT id FROM logs LIMIT 500 /* a /* b */ c */",
+    ],
+  ])("%s is emitted intact under a nesting grammar", (_label, sql, expected) => {
+    const result = applyQueryLimit(sql, 500, 0, {}, "postgres");
+
+    expect(result.sql).toBe(expected);
+    expect(result.wasLimited).toBe(true);
+  });
+
+  // One opener too many is undeterminable rather than guessed, so nothing is
+  // rewritten - the fail-safe direction this folder keeps everywhere.
+  test("a nested comment that never closes is not rewritten under a nesting grammar", () => {
+    const sql = "/* outer /* inner */ SELECT id FROM logs";
+
+    expect(applyQueryLimit(sql, 500, 0, {}, "postgres")).toMatchObject({ sql, wasLimited: false });
+  });
+
+  // Ordinary comments answer the same under both readings, which is what says the
+  // change is confined to the runs where the grammars disagree.
+  test.each<[string, string, string]>([
+    ["one block comment", "/* note */ SELECT 1", "/* note */ SELECT 1 LIMIT 500"],
+    ["adjacent block comments", "/*a*//*b*/SELECT 1", "/*a*//*b*/SELECT 1 LIMIT 500"],
+    ["a comment holding a lone star", "/* a * b */ SELECT 1", "/* a * b */ SELECT 1 LIMIT 500"],
+    ["a multi-line comment", "/* one\n   two */ SELECT 1", "/* one\n   two */ SELECT 1 LIMIT 500"],
+  ])("%s keeps its answer under both readings", (_label, sql, expected) => {
+    expect(applyQueryLimit(sql, 500).sql).toBe(expected);
+    expect(applyQueryLimit(sql, 500, 0, {}, "postgres").sql).toBe(expected);
+  });
+});

@@ -649,15 +649,83 @@ describe("OracleProvider", () => {
         expect(result.query).toBe("SELECT * FROM USERS FETCH FIRST 500 ROWS ONLY; -- daily check");
       });
 
+      // A quote behind an odd backslash run: Oracle and MySQL close that literal
+      // in different places, so there is no honest place for the clause.
+      // Appending on a guess would put it after the terminator.
+      test("returns a literal whose end is undeterminable untouched rather than bounding it on a guess", () => {
+        const sql = "SELECT * FROM USERS WHERE PATH = 'C:\\';";
+
+        const result = provider.prepareQuery(sql);
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+      });
+
+      // ── The `#` grammar is Oracle's here (#292) ─────────────────────────
+      //
+      // `#` is a legal identifier character in Oracle and opens no comment there
+      // - node-oracledb's own SQL tokenizer accepts it inside a name and starts
+      // comments on `--` and `/*` only. While the shared reader had to guess, it
+      // read `ID#` as MySQL would and declined to bound the statement at all;
+      // told which dialect it is reading, it bounds it where Oracle wants it.
       test.each<[string, string]>([
-        // A quote behind an odd backslash run: Oracle and MySQL close that
-        // literal in different places, so there is no honest place for the
-        // clause. Appending on a guess would put it after the terminator.
-        ["a literal whose end is undeterminable", "SELECT * FROM USERS WHERE PATH = 'C:\\';"],
-        // `#` is legal in an Oracle identifier and is MySQL's comment marker, and
-        // nothing in the text tells them apart. Appending would have emitted
-        // `... WHERE ID FETCH FIRST 500 ROWS ONLY# = 1`.
-        ["an identifier carrying a hash", "SELECT * FROM EMP WHERE ID# = 1"],
+        ["a bare identifier carrying a hash", "SELECT * FROM EMP WHERE ID# = 1"],
+        ["a hash at the end of a table name", "SELECT * FROM EMP#"],
+      ])("bounds %s instead of declining", (_label, sql) => {
+        const result = provider.prepareQuery(sql);
+
+        expect(result.query).toBe(`${sql} FETCH FIRST 500 ROWS ONLY`);
+        expect(result.wasLimited).toBe(true);
+      });
+
+      // ── Alternate quoting is a literal here (#292) ──────────────────────
+      //
+      // `q'{it's}'` is how Oracle writes a literal that carries apostrophes, and
+      // the shared span reader had no branch for the form: the body was walked as
+      // code, so the first apostrophe inside it opened a string and everything
+      // after it read one construct out of step. Two costs, both real today: a `)`
+      // in the body ends a CTE body early, so the statement is typed by a keyword
+      // that is inside the literal and loses its bound; and a `--` in the body
+      // makes the rest of the literal look like trailing trivia, so #280's
+      // insert-before-trivia rewrite splices the clause INSIDE the literal and
+      // emits SQL Oracle rejects. `prepareQuery` passes its own type, and Oracle's
+      // grammar has the form - node-oracledb's own tokenizer
+      // (`lib/thin/statement.js`, `_parseQstring`) pairs `[ ] { } ( ) < >` and
+      // closes every other delimiter with itself.
+      test.each<[string, string]>([
+        ["a CTE body holding an apostrophe", "WITH T AS (SELECT q'{it's}' AS S FROM DUAL) SELECT * FROM T"],
+        [
+          "a literal holding a close paren and a write keyword",
+          "WITH T AS (SELECT q'{it's ) DELETE FROM USERS}' AS S FROM DUAL) SELECT * FROM T",
+        ],
+        ["a literal holding a comment marker", "SELECT q'[it's a -- note )]' AS S FROM DUAL"],
+        ["an upper-case tag", "SELECT Q'<it's>' AS S FROM DUAL"],
+        ["a delimiter that closes with itself", "SELECT q'!it's!' AS S FROM DUAL"],
+        // The national-charset spelling of the same form (`nq'…'`, Oracle's SQL
+        // Language Reference). Its comment-marker shape is the corrupting one
+        // above, so it is asserted here rather than left to the reader's charity.
+        ["a national-charset literal", "SELECT nq'{it's}' AS S FROM DUAL"],
+        ["a national-charset literal holding a comment marker", "SELECT nq'[it's a -- note )]' AS S FROM DUAL"],
+        [
+          "an upper-case national-charset literal in a CTE body",
+          "WITH T AS (SELECT NQ'{it's ) SELECT X}' AS S FROM DUAL) SELECT * FROM T",
+        ],
+      ])("bounds %s, with the clause after the literal", (_label, sql) => {
+        const result = provider.prepareQuery(sql);
+
+        expect(result.query).toBe(`${sql} FETCH FIRST 500 ROWS ONLY`);
+        expect(result.wasLimited).toBe(true);
+      });
+
+      // Where the form itself cannot be read to its end there is no honest place
+      // for the clause, so the statement is returned as it came.
+      test.each<[string, string]>([
+        ["an alternate literal that never closes", "SELECT q'{it's FROM DUAL"],
+        ["a national-charset literal that never closes", "SELECT nq'{it's FROM DUAL"],
+        // A name that merely ends in the tag's letters is a name: Oracle reads it
+        // greedily and so does this reader, which leaves the apostrophe after it
+        // opening an ordinary string that never closes.
+        ["a name ending in the tag's letters", "SELECT FREQ'{it's}' AS S FROM DUAL"],
       ])("returns %s untouched rather than bounding it on a guess", (_label, sql) => {
         const result = provider.prepareQuery(sql);
 

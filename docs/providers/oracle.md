@@ -111,13 +111,48 @@ result capped. A statement with no trailing comment is emitted exactly as it was
 reading answers whether the statement already carries a `FETCH FIRST`, so
 `SELECT … FETCH FIRST 10 ROWS ONLY -- deliberate` is still honoured and never gets a second clause.
 A statement whose end may not be **cut** is returned untouched with `wasLimited: false` rather than
-bounded on a guess. Two shapes reach that on Oracle: a literal Oracle and MySQL would close in
-different places (a quote behind an odd backslash run), and `#` inside an identifier (`ID#`, common
-in legacy schemas), which the shared scanner has to read as MySQL's comment marker because nothing in
-the text distinguishes the two. Both are a **deliberate loss of a bound**: appending after the whole
-text, as this method used to, happened to be valid Oracle for these two shapes, and is what puts the
-clause inside a trailing comment everywhere else. They now return every row rather than being bounded
-on a reading that is right for Oracle and wrong for the dialect the scanner cannot rule out.
+bounded on a guess. One shape reaches that on Oracle: a literal Oracle and MySQL would close in
+different places (a quote behind an odd backslash run). It is a **deliberate loss of a bound** —
+appending after the whole text, as this method used to, happened to be valid Oracle there, and is
+what puts the clause inside a trailing comment everywhere else — so that statement returns every row
+rather than being bounded on a guess. Since #297 the same unresolvable run also costs that statement a
+confirmation prompt, because the safety gate cannot read it either; the general rule and its accepted
+costs are in
+[query-optimization.md](../editor/query-optimization.md#text-the-reading-cannot-resolve-asks-and-says-so).
+
+`#` inside an identifier (`ID#`, common in legacy schemas) used to reach the same refusal and no
+longer does. `prepareQuery()` passes its own `type` to the shared readers (#292), and Oracle's grammar
+says `#` opens no comment: node-oracledb's own SQL tokenizer
+(`node_modules/oracledb/lib/thin/statement.js`) accepts `#` as an identifier character and starts
+comments on `--` and `/* … */` only. `SELECT * FROM EMP WHERE ID# = 1` is therefore bounded, emitted
+as `… ID# = 1 FETCH FIRST 500 ROWS ONLY`. See
+[Which dialect the readers are reading](../editor/query-optimization.md#which-dialect-the-readers-are-reading).
+
+**Alternate quoting (`q'{it's}'`) is read as the literal it is** — the second half of the same fix, and
+Oracle is the only dialect that has the form. The delimiter after the tag opens the body and its
+partner followed by `'` closes it (`[ ] { } ( ) < >` pair up, any other character closes with itself,
+`q` or `Q`, and `nq'…'` / `NQ'…'` is the same form for `NCHAR`/`NVARCHAR2`), so the body carries
+apostrophes with nothing escaped. That is precisely what made reading it as code costly, and it cost
+two different things:
+
+- An apostrophe in the body opened a string, so everything after it was read one construct out of
+  step: a `)` inside the literal closed a CTE body early and the statement was typed by a keyword
+  written *inside* the literal. `WITH T AS (SELECT q'{it's}' AS S FROM DUAL) SELECT * FROM T` lost its
+  bound entirely.
+- A `--` in the body made the rest of the literal look like a trailing comment, and the
+  insert-before-trivia rule above then placed the clause **inside** the literal:
+  `SELECT q'[it's a -- note )]' AS S FROM DUAL` was emitted as
+  `SELECT q'[it's a FETCH FIRST 500 ROWS ONLY -- note )]' AS S FROM DUAL` with `wasLimited: true` —
+  a statement Oracle rejects, reported as capped.
+
+Both are gone for either spelling of the tag; the clause now lands after the literal. A body whose
+closing delimiter never arrives is undeterminable, so that statement is returned untouched rather than
+bounded on a guess. The tag must also **start** a word: in `SELECT FREQ'{it's}' …` the reader takes
+`FREQ` for a name and the apostrophe after it for an ordinary string, so that statement reaches the
+same refusal rather than a bound placed inside something that may not be a literal at all. That is
+deliberately stricter than node-oracledb's tokenizer, which opens a q-string at any `'` preceded by
+`q`/`Q` whatever comes before it; the strict side is the one whose mistake costs a bound — and, since
+#297, a confirmation prompt on that statement — rather than a misplaced clause.
 
 ### 3.3 Owner-scoped, five-query schema introspection
 

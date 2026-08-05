@@ -669,6 +669,63 @@ describe("SQLiteProvider", () => {
       expect(result.query).toBe(sql);
       expect(result.wasLimited).toBe(false);
     });
+
+    // ── The `#` grammar is SQLite's here (#292) ──────────────────────────
+    //
+    // SQLite has two comment forms, `--` and `/* */`. Its own tokenizer (the
+    // bundled amalgamation classifies `#` as `CC_VARALPHA`) reads `#name` as a
+    // bind variable, i.e. code. The shared reader used to guess MySQL's rule
+    // here, which swallowed the rest of the line and cost the statement its
+    // bound; naming the dialect bounds it instead, emitted text intact.
+    test("bounds a statement carrying a hash-prefixed bind variable", () => {
+      provider = new SQLiteProvider(makeSQLiteConfig());
+
+      const result = provider.prepareQuery("SELECT * FROM users WHERE id = #id");
+
+      expect(result.query).toBe("SELECT * FROM users WHERE id = #id LIMIT 500");
+      expect(result.wasLimited).toBe(true);
+    });
+
+    // ── `[…]` is a quoted name here too (#295) ───────────────────────────
+    //
+    // SQLite accepts Microsoft-style bracket identifiers: its own tokenizer (the
+    // bundled amalgamation classifies `[` as `CC_QUOTE2`, "`[...]` style quoted
+    // ids") reads everything up to the close bracket as the name. So the bracket
+    // fact for this dialect is the name reading, not ClickHouse's array one, and a
+    // scan that stepped over string literals inside the run would lose the first
+    // row below. The emitted text is asserted whole: a bound spliced INTO a
+    // bracketed name is the corrupted-statement shape, not a missing bound.
+    test.each<[string, string, string]>([
+      ["an apostrophe", "SELECT [it's] FROM users", "SELECT [it's] FROM users LIMIT 500"],
+      ["a comment marker", "SELECT [a--b] FROM users", "SELECT [a--b] FROM users LIMIT 500"],
+      [
+        "a comment marker before real trailing trivia",
+        "SELECT [a--b] FROM users -- daily",
+        "SELECT [a--b] FROM users LIMIT 500 -- daily",
+      ],
+    ])("bounds a statement whose bracket-quoted name carries %s", (_label, sql, expected) => {
+      provider = new SQLiteProvider(makeSQLiteConfig());
+
+      const result = provider.prepareQuery(sql);
+
+      expect(result.query).toBe(expected);
+      expect(result.wasLimited).toBe(true);
+    });
+
+    // KNOWN DIVERGENCE, asserted so it is a decision: SQLite has no escape inside
+    // a bracket identifier - its tokenizer stops at the FIRST `]` - while this
+    // reader honours SQL Server's doubled bracket, so it reads `[a]]b]` as one
+    // name where SQLite reads `[a]` followed by junk. SQLite rejects that text
+    // either way, so the longer reading only ever costs a bound on a statement the
+    // server refuses.
+    test("reads a doubled close bracket as part of the name, which SQLite itself does not", () => {
+      provider = new SQLiteProvider(makeSQLiteConfig());
+
+      const result = provider.prepareQuery("SELECT [a]]b] FROM users");
+
+      expect(result.query).toBe("SELECT [a]]b] FROM users LIMIT 500");
+      expect(result.wasLimited).toBe(true);
+    });
   });
 
   // --------------------------------------------------------------------------

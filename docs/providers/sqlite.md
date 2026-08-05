@@ -268,6 +268,27 @@ Homebrew). Each channel is browser-verified by
 `query(sql, params?)` — positional params via the driver's `all()`/`run()`. There is no
 `prepareQuery()` override, so the inherited base injects a `LIMIT` into bare `SELECT`s
 (`DEFAULT_QUERY_LIMIT = 500`). No transactions, no cancellation ([§3.4](#34-no-transactions-api-no-cancellation-no-pool)).
+
+The inherited path reads the statement under **SQLite's** grammar, which the base passes down from the
+provider's own `type` ([`grammar.ts`](../../src/lib/sql/grammar.ts)). SQLite has two comment forms,
+`--` and `/* … */`; `#` opens neither. Its own tokenizer (the amalgamation bundled with
+`better-sqlite3` classifies `#` as `CC_VARALPHA`) reads `#name` as a bind variable, i.e. code. The
+shared reader used to guess MySQL's rule here, which swallowed the rest of the line and cost the
+statement its bound, so `SELECT * FROM users WHERE id = #id` returned every row; it is now bounded,
+emitted intact (#292). See
+[Which dialect the readers are reading](../editor/query-optimization.md#which-dialect-the-readers-are-reading).
+
+The same tokenizer settles this dialect's second grammar fact: `[` is `CC_QUOTE2` there — "`[...]` style
+quoted ids", the Microsoft-style form SQLite accepts for compatibility — so **`[…]` is a quoted name
+here**, not ClickHouse's nestable array (#295). Everything between the brackets is the name, apostrophe
+and comment marker included, so `SELECT [it's] FROM users` and `SELECT [a--b] FROM users` are both
+bounded with the clause written after the whole name. One deliberate divergence: SQLite's tokenizer
+stops at the FIRST `]` and has no escape, while this reader honours SQL Server's doubled bracket, so
+`[a]]b]` reads as one name where SQLite reads `[a]` followed by junk. SQLite rejects that text either
+way, so the longer reading can only ever cost a bound — and, where the doubled bracket swallows the
+real closer so the run never terminates (`SELECT [a]] FROM t`), a confirmation prompt as well, since
+#297 asks about text the reader cannot resolve. Both are on statements the server refuses, and both are
+pinned by tests rather than left to be discovered.
 `EXPLAIN QUERY PLAN` is supported (`supportsExplain: true`, `explainFormat: "sqlite-queryplan"`) — the UI renders the plan as a tree; SQLite reports no per-node cost or timing metrics, so none are shown.
 
 ---

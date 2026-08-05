@@ -21,24 +21,42 @@
  * to change:
  *
  * - `statement-splitter.ts` inlines the same scan, wound together with the line
- *   counting it needs, and treats `#` as ordinary code - so a MySQL hash comment
- *   containing a `;` still splits there. Reusing this module would move statement
- *   boundaries: a separate bug with its own tests.
+ *   counting it needs, and knows none of the dialect facts below: it treats `#`
+ *   as ordinary code, so a MySQL hash comment containing a `;` still splits there;
+ *   it has no alternate-quoting branch, so an Oracle `q'{a'b;c}'` body splits
+ *   at that `;`; and it has no bracket branch of either kind, so a `;` inside a
+ *   bracket-quoted NAME (`SELECT [a;b] FROM t`, verified) splits one statement into
+ *   two while every reader over this module sees one name. The bracket fact's
+ *   SUBSCRIPT half escapes it only where the key is STRING-quoted, and by luck
+ *   rather than by design: the splitter reads `'…'` and `"…"` but not backticks, so
+ *   `SELECT arr[\`a;b\`] FROM t` splits there exactly as the bracketed name does.
+ *   All three divergences are safe in the same direction - the fragments lose a
+ *   bound rather than gaining a misplaced one - and reusing this module would move
+ *   statement boundaries: a separate bug with its own tests.
  * - `alias-extractor.ts:134-135` blanks literals with a regex that honours
  *   BACKSLASH escapes, which this module reports as undeterminable instead (see
  *   `readQuoted`). Its job is autocomplete, where a wrong alias costs a
  *   suggestion; here a wrong literal boundary costs a bound on a write.
  *
  * This module is what every NEW reader builds on, so the count does not grow.
+ *
+ * Where the dialects genuinely disagree about a character, the reading comes from
+ * the caller's grammar record (`grammar.ts`) rather than from this file taking one
+ * engine's side. A call that names no dialect keeps the reading this module had
+ * before the record existed.
  */
+
+import { DEFAULT_SQL_GRAMMAR, type SqlGrammar } from "./grammar";
 
 /**
  * What kind of non-code run a span is.
  *
  * Callers care about the distinction in two ways: trivia (`whitespace`,
- * `line-comment`, `block-comment`) can be skipped between tokens, while a
- * literal is a token - a quoted identifier can BE a name, so a reader that
- * skipped it as trivia would misread `WITH "my cte" AS (…)`.
+ * `line-comment`, `block-comment`) can be skipped between tokens, while the rest
+ * are the statement's own text - a quoted identifier can BE a name, so a reader
+ * that skipped it as trivia would misread `WITH "my cte" AS (…)`, and a
+ * `subscript` sits in the middle of an expression, so a reader that took it for
+ * trivia would place the statement's end before it.
  */
 export type SqlSpanKind =
   | "whitespace"
@@ -46,7 +64,8 @@ export type SqlSpanKind =
   | "block-comment"
   | "string"
   | "quoted-identifier"
-  | "dollar-string";
+  | "dollar-string"
+  | "subscript";
 
 export interface SqlSpan {
   kind: SqlSpanKind;
@@ -75,6 +94,24 @@ function isWhitespace(ch: string): boolean {
 /** The characters that turn a `#` into a PostgreSQL operator rather than a comment. */
 function isHashOperatorTail(ch: string | undefined): boolean {
   return ch === ">" || ch === "-" || ch === "#";
+}
+
+/**
+ * Whether a line comment opens at `index`.
+ *
+ * `--` opens one in every dialect here and needs no grammar. `#` is the one this
+ * module could not answer on its own, so it asks the grammar record: MySQL and
+ * ClickHouse open a comment on any `#`, PostgreSQL, Oracle, SQL Server and SQLite
+ * open none, and a caller that named no dialect keeps the hybrid reading this
+ * module used to apply to everyone (see `DEFAULT_SQL_GRAMMAR`).
+ */
+function opensLineComment(sql: string, index: number, grammar: SqlGrammar): boolean {
+  const ch = sql[index];
+  if (ch === "-") return sql[index + 1] === "-";
+  if (ch !== "#") return false;
+  if (grammar.hash === "code") return false;
+  if (grammar.hash === "comment") return true;
+  return !isHashOperatorTail(sql[index + 1]);
 }
 
 /**
@@ -114,8 +151,15 @@ function hasOddBackslashRunBefore(sql: string, from: number, at: number): boolea
  * delimiter behind an odd backslash run is reported as UNDETERMINABLE instead of
  * guessed: `WITH t AS (SELECT '\') SELECT ') DELETE FROM users` reads as a SELECT
  * under one dialect and a DELETE under the other, and guessing the first would
- * append a bound to a DELETE. Callers already decline to rewrite what they cannot
- * read, so the cost of the safe answer is at most an unbounded read.
+ * append a bound to a DELETE. The callers that REWRITE a statement decline to,
+ * so the cost there is at most an unbounded read.
+ *
+ * Since #297 it costs one thing more, and this rule is where the cost is largest:
+ * the confirmation gate asks about text it cannot resolve rather than staying
+ * silent, and `\'` is MySQL's own escape for an apostrophe, so an everyday read
+ * (`… WHERE name = 'O\'Brien'`) prompts on every execute. Naming the dialect does
+ * not narrow it, because whether `\` escapes is deliberately not one of the facts
+ * `grammar.ts` carries yet.
  */
 /**
  * A `[…]` quoted identifier, whose closing bracket is escaped by doubling.
@@ -141,6 +185,177 @@ function readBracketed(sql: string, index: number): SqlSpan {
   }
 
   return { kind: "quoted-identifier", end: sql.length, terminated: false };
+}
+
+/**
+ * A `[…]` array literal or subscript, which NESTS and escapes nothing.
+ *
+ * The other reading of these characters (`readBracketed`) is a name, and the two
+ * disagree about the same text in both directions, which is why the grammar record
+ * picks between them rather than one scan trying to serve both: a `]` written
+ * inside a string ends a NAME (that is the whole point of `[a--b]`) and does not
+ * end a subscript, and a doubled `]` escapes inside a name and closes a nested
+ * array. Reaching into `readSqlSpan` for what a run CONTAINS is safe here for the
+ * same reason it would be wrong there - a subscript's contents are code, a name's
+ * are characters of the name.
+ *
+ * Depth is counted rather than matched, and both brackets are consumed before the
+ * span reader is asked, so the recursion is exactly one level deep and the scan
+ * still advances one span or one character at a time - it cannot backtrack.
+ */
+function readSubscripted(sql: string, index: number, grammar: SqlGrammar): SqlSpan {
+  let depth = 0;
+  let i = index;
+
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === "[") {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === "]") {
+      depth--;
+      i++;
+      if (depth === 0) return { kind: "subscript", end: i, terminated: true };
+      continue;
+    }
+
+    const inner = readSqlSpan(sql, i, grammar);
+    if (inner !== null) {
+      // A run cannot be more certain than what it contains: an unterminated literal
+      // inside means the closing bracket cannot be found, only guessed at, and a
+      // guess here puts the statement's end inside a literal. Every span kind in
+      // this module currently ends an unterminated run at the input's end, so
+      // falling through the loop would reach the same record - this says the reason
+      // locally rather than resting on that coincidence, and it is what keeps the
+      // answer right if a future span kind ever ends BEFORE the input does.
+      if (!inner.terminated) return { kind: "subscript", end: sql.length, terminated: false };
+      i = inner.end;
+      continue;
+    }
+    i++;
+  }
+
+  return { kind: "subscript", end: sql.length, terminated: false };
+}
+
+/**
+ * A block comment under a grammar that NESTS: `/* a /* b *\/ c *\/` is one run.
+ *
+ * Depth is counted rather than matched, and both characters of every delimiter are
+ * consumed before the next look, so `/*\/` is one opener and no closer (the shared
+ * slash belongs to the opener) and the scan cannot see a delimiter twice. It is a
+ * single forward pass over the comment, so it stays linear on an adversarial nest -
+ * the property `leading-keyword.ts` records three measured regex failures for.
+ *
+ * Nothing inside a comment is a literal, here or in the engines this reads for: a
+ * `/*` written inside quotes in comment text is still an opener and a `*\/` inside
+ * them still closes. Looking for literals in there is the plausible wrong fix - it
+ * would make `/* it's /* deep *\/ still *\/` unterminated - so a fixture pins it.
+ *
+ * A run whose depth never returns to zero is reported undeterminable rather than
+ * closed at the last delimiter it saw. That is the fail-safe direction this module
+ * keeps everywhere: it costs the statement its bound (an over-large read) and, since
+ * #297, a confirmation prompt - where the guess would hide a write behind text the
+ * reader claimed to have read.
+ */
+function readNestedBlockComment(sql: string, index: number): SqlSpan {
+  let depth = 0;
+  let i = index;
+
+  while (i + 1 < sql.length) {
+    if (sql[i] === "/" && sql[i + 1] === "*") {
+      depth++;
+      i += 2;
+      continue;
+    }
+    if (sql[i] === "*" && sql[i + 1] === "/") {
+      depth--;
+      i += 2;
+      if (depth === 0) return { kind: "block-comment", end: i, terminated: true };
+      continue;
+    }
+    i++;
+  }
+
+  return { kind: "block-comment", end: sql.length, terminated: false };
+}
+
+/**
+ * The closer Oracle pairs with an alternate-quote opener, or the opener itself.
+ *
+ * From node-oracledb's own SQL tokenizer (`lib/thin/statement.js`,
+ * `_parseQstring`): the four bracket forms close with their partner, and every
+ * other delimiter closes with itself.
+ */
+const ALTERNATE_QUOTE_CLOSERS: Record<string, string> = { "[": "]", "{": "}", "(": ")", "<": ">" };
+
+/**
+ * The length of an alternate-quote tag at `index`, or 0 when none opens there.
+ *
+ * `q'` and `Q'` open one, and the same form spelled `nq'` / `NQ'` (any case
+ * mixture) is the national-character-set literal - Oracle's SQL Language
+ * Reference gives `nq'#…#'` as the NCHAR/NVARCHAR2 spelling. Both are read,
+ * because the body rules are identical and reading only one of them would leave
+ * the other's body walked as code, which is the defect this branch exists to fix.
+ */
+function measureAlternateQuoteTag(sql: string, index: number): number {
+  let i = index;
+  if (sql[i] === "n" || sql[i] === "N") i++;
+  if (sql[i] !== "q" && sql[i] !== "Q") return 0;
+  if (sql[i + 1] !== "'") return 0;
+  return i + 2 - index;
+}
+
+/**
+ * An Oracle alternate-quoted literal: `q'{it's}'`, `Q'<body>'`, `nq'!body!'`.
+ *
+ * The delimiter after the tag opens the body and the matching one FOLLOWED BY a
+ * quote closes it, which is what lets the body carry apostrophes - and the
+ * delimiter character itself (`q'{a}b}'` is one literal) - with nothing escaped.
+ * So there is no doubling rule and no backslash question here: the search is for
+ * the two characters that end it.
+ *
+ * Any character may be the delimiter, which needs no check of its own: Oracle
+ * refuses a whitespace delimiter where this reads a literal - and an opaque span
+ * moves the reading around it, so such a body can also swallow a `)` or a write
+ * keyword - but only in text Oracle rejects outright, so nothing that reaches a
+ * server depends on it. Half of a surrogate pair can never match its own closer, so
+ * that body reads as unterminated: the answer that costs a bound rather than
+ * misplacing one.
+ */
+function readAlternateQuoted(sql: string, index: number, tagLength: number): SqlSpan {
+  const body = index + tagLength + 1;
+  const opener = sql[index + tagLength];
+  // The tag at the very end of the input: no delimiter, so nothing can close it.
+  if (opener === undefined) return { kind: "string", end: sql.length, terminated: false };
+
+  const close = sql.indexOf(`${ALTERNATE_QUOTE_CLOSERS[opener] ?? opener}'`, body);
+  if (close === -1) return { kind: "string", end: sql.length, terminated: false };
+  return { kind: "string", end: close + 2, terminated: true };
+}
+
+/**
+ * Whether the character before `index` continues a word, i.e. `index` is inside
+ * one.
+ *
+ * Only the alternate-quote tag needs this: it is the one span whose first
+ * character is also an identifier character. Oracle's lexer reads a name greedily,
+ * so `freq'x'` there is a name followed by an ordinary string, and without the
+ * check the two kinds of reader in this folder would disagree about such text as
+ * well - the ones that read whole words step over the name and never ask here,
+ * while the ones that walk character by character would ask at its last letter.
+ * Two readings of one construct is what this folder exists to stop.
+ *
+ * node-oracledb's tokenizer has no equivalent check (it parses a q-string at any
+ * `'` preceded by `q`/`Q`), so this is deliberately stricter than the driver and
+ * closer to the server. What it excludes is text no dialect here accepts, and it
+ * excludes it in the safe direction: an ordinary string reading, as today.
+ */
+function continuesWord(sql: string, index: number): boolean {
+  const before = index === 0 ? undefined : sql[index - 1];
+  return before !== undefined && (IDENTIFIER_PART.test(before) || before === "$");
 }
 
 function readQuoted(sql: string, index: number, quote: string, kind: SqlSpanKind, backslashEscapes: boolean): SqlSpan {
@@ -200,8 +415,17 @@ function measureDollarTag(sql: string, index: number): number {
  *
  * Callers walk a statement by asking at every position: is this a span? If yes,
  * jump to `end`; if no, this character is the statement's own code.
+ *
+ * `grammar` is the dialect's reading of the characters the engines disagree about.
+ * Omitting it is a real answer, not a missing one: it means "no dialect was
+ * named", and the compatibility default applies.
+ *
+ * Pass the whole statement, not a suffix of it: the alternate-quote branch looks at
+ * the character BEFORE `index` to tell a tag from the tail of a name, so a slice
+ * that cuts a name in half can answer differently than the same text in place. A
+ * PREFIX slice is safe, which is what the callers here take (`sql.slice(0, end)`).
  */
-export function readSqlSpan(sql: string, index: number): SqlSpan | null {
+export function readSqlSpan(sql: string, index: number, grammar: SqlGrammar = DEFAULT_SQL_GRAMMAR): SqlSpan | null {
   const ch = sql[index];
   if (ch === undefined) return null;
 
@@ -211,36 +435,58 @@ export function readSqlSpan(sql: string, index: number): SqlSpan | null {
     return { kind: "whitespace", end, terminated: true };
   }
 
-  // `#` is MySQL's and MariaDB's second line-comment marker. Unlike
-  // `leading-keyword.ts`, which only ever looks at a statement's LEADING trivia,
-  // this reader is asked about every position - and mid-statement `#` is a live
-  // PostgreSQL operator: `#>` and `#>>` walk a jsonb path, `#-` deletes one, `##`
-  // is geometric. Reading `SELECT meta #> '{a}'` as a comment swallows the rest of
-  // the line and costs an everyday jsonb query its bound, so a `#` that opens one
-  // of those operators is code.
+  // `#` is MySQL's, MariaDB's and ClickHouse's second line-comment marker, and it
+  // is ordinary code in PostgreSQL, Oracle, SQL Server and SQLite - a jsonb or
+  // geometric operator (`#>`, `#>>`, `#-`, `##`), an identifier character, a temp
+  // table, a bind-variable prefix. Unlike `leading-keyword.ts`, which only ever
+  // looks at a statement's LEADING trivia, this reader is asked about every
+  // position, so mid-statement `#` is exactly where the disagreement bites.
   //
-  // The trade is stated exactly, because this is the one place the module takes a
-  // dialect's SIDE instead of reporting that the dialects disagree. A MySQL comment
-  // whose first character is one of those (`#- note`) reads as code here, so the
-  // rest of that line is read as SQL where MySQL reads it as comment - and if that
-  // text contains a paren, the two readings end a construct in different places.
-  // `WITH t AS (\n #- note )\n SELECT 1) DELETE FROM users` is a DELETE in MySQL and
-  // reads as a SELECT here, which is the direction `operative-keyword.ts` otherwise
-  // promises to avoid. Reporting it undeterminable would close that, at the price of
-  // every PostgreSQL jsonb-operator CTE losing its bound: a certain cost against a
-  // contrived one. So the reading stands, the gap is recorded rather than hidden
-  // (`operative-keyword.ts`, and a test pins it), and `# note` - how comments are
-  // actually written - is unaffected either way.
-  if ((ch === "-" && sql[index + 1] === "-") || (ch === "#" && !isHashOperatorTail(sql[index + 1]))) {
+  // This used to be resolved here, by taking PostgreSQL's side: a `#` that opens
+  // one of those operators is code. That kept `SELECT meta #> '{a}'` bounded and
+  // cost the other direction - a MySQL comment written `#- note` read as SQL, so a
+  // `)` inside it ended a CTE body early and `WITH t AS (\n #- note )\n SELECT 1)
+  // DELETE FROM users` was typed a read and handed a bound, which MySQL applies to
+  // the rows the DELETE removes. The grammar record answers it now (#292), and the
+  // hybrid survives only as what a caller that named no dialect gets.
+  if (opensLineComment(sql, index, grammar)) {
     const newline = sql.indexOf("\n", index);
     // The newline belongs to the comment: it is what closes it.
     return { kind: "line-comment", end: newline === -1 ? sql.length : newline + 1, terminated: true };
   }
 
+  // A `/*` written INSIDE a block comment opens a second one in PostgreSQL, SQL
+  // Server and ClickHouse and means nothing at all in MySQL, SQLite and Oracle, so
+  // the two readings put the comment's end in different places - and everything
+  // between the first `*\/` and the real end is either comment text or the
+  // statement's own code depending on which one applies. Read flat where the
+  // dialect nests, a `)` written in that region closed a CTE body that was still
+  // open, so the statement was typed by a keyword the operator had commented out:
+  // `WITH t AS (\n /* a /* b *\/ ) SELECT 1 *\/\n SELECT id FROM logs\n) INSERT …`
+  // was typed a read and handed a bound, which on PostgreSQL commits part of the
+  // insert. The grammar record answers it now (#300), and the flat reading survives
+  // as MySQL's, SQLite's, Oracle's and what a caller that named no dialect gets.
   if (ch === "/" && sql[index + 1] === "*") {
+    if (grammar.blockComment === "nesting") return readNestedBlockComment(sql, index);
+
     const close = sql.indexOf("*/", index + 2);
     if (close === -1) return { kind: "block-comment", end: sql.length, terminated: false };
     return { kind: "block-comment", end: close + 2, terminated: true };
+  }
+
+  // Oracle writes a literal that carries apostrophes as `q'{it's}'` (`nq'…'` for
+  // the national character set), and it is the only dialect here with the form.
+  // Read as code - all any reader here could do before it was told the dialect -
+  // the first apostrophe INSIDE the body opens a string and everything after it is
+  // read one construct out of step, which costs in both of this folder's
+  // directions: a `)` in the body ended a CTE body early, so the statement was
+  // typed by a keyword written inside the literal and lost its bound, and a `--` in
+  // the body made the rest of the literal look like trailing trivia, so the bound
+  // was inserted INSIDE the literal and the statement Oracle received was corrupt
+  // while the caller was told it was limited (#292).
+  if (grammar.alternateQuoting) {
+    const tagLength = measureAlternateQuoteTag(sql, index);
+    if (tagLength > 0 && !continuesWord(sql, index)) return readAlternateQuoted(sql, index, tagLength);
   }
 
   if (ch === "'") return readQuoted(sql, index, "'", "string", true);
@@ -264,12 +510,19 @@ export function readSqlSpan(sql: string, index: number): SqlSpan | null {
   // though it is the one delimiter pair here that opens and closes with different
   // characters. SQL Server's escape is a doubled closing bracket.
   //
-  // ClickHouse spells an array with the same characters and nests them, so
-  // `[[1,2],[3,4]]` closes at the first single `]` under this reading and the rest
-  // is undeterminable. That costs a bound on a form which already lost it before
-  // this change (see the array note in `operative-keyword.ts`); telling the two
-  // apart needs the dialect, which this module does not have.
-  if (ch === "[") return readBracketed(sql, index);
+  // ClickHouse spells an array with the same characters and nests them, and there
+  // the name reading is wrong in both of its rules at once: `m['a]b']` is a
+  // subscript whose key carries a close bracket (the name reading ends the run at
+  // that bracket, and the CTE element around it can then not be crossed), and
+  // `[[1,2],[3,4]]` ends with a doubled bracket that the name reading takes for an
+  // escape, so the run never closes at all. Both cost the statement its bound. The
+  // grammar record answers it (#295): the two readings are mutually exclusive, so
+  // the dialect picks, and a caller that named none keeps the name reading - which
+  // is where the corrupted-statement shape `SELECT [a LIMIT 500--b] FROM t` lives,
+  // and it is the more expensive mistake of the two.
+  if (ch === "[") {
+    return grammar.bracket === "subscript" ? readSubscripted(sql, index, grammar) : readBracketed(sql, index);
+  }
 
   if (ch === "$") {
     const tagLength = measureDollarTag(sql, index);
@@ -282,4 +535,40 @@ export function readSqlSpan(sql: string, index: number): SqlSpan | null {
   }
 
   return null;
+}
+
+/**
+ * Whether this text carries a run that never closes - i.e. whether part of it is
+ * text no reader over this module can resolve.
+ *
+ * Every OTHER reader here consumes `terminated: false` and then throws it away:
+ * `statement-end.ts` refuses the cut, `words.ts` reports the word it could not see
+ * as absent, `readSubscripted` above gives up on the bracket. Each is answering a
+ * question where declining to act is the safe direction, because their mistake
+ * would be a row bound appended to a write.
+ *
+ * The confirmation gate's costs run the other way - silence there is an
+ * unconfirmed destructive statement, while asking costs a click - so it needs the
+ * signal itself rather than a reader's response to it (#297). Hence a predicate
+ * over spans rather than a fourth reader that re-derives it: an unterminated run
+ * hides whatever is written INSIDE it, and the whole answer is whether one exists.
+ *
+ * A scanner for the same reason as the rest of this module: it advances one span
+ * or one character at a time and cannot backtrack, so it stays linear on the
+ * pasted-script sizes the execute path sees.
+ */
+export function hasUnterminatedSpan(sql: string, grammar: SqlGrammar = DEFAULT_SQL_GRAMMAR): boolean {
+  let i = 0;
+
+  while (i < sql.length) {
+    const span = readSqlSpan(sql, i, grammar);
+    if (span === null) {
+      i++;
+      continue;
+    }
+    if (!span.terminated) return true;
+    i = span.end;
+  }
+
+  return false;
 }

@@ -30,6 +30,7 @@ import {
 import { DatabaseConfigError, ConnectionError, QueryError, mapDatabaseError } from "../../errors";
 import { formatBytes } from "../../utils/pool-manager";
 import { analyzeQuery, DEFAULT_QUERY_LIMIT, MAX_UNLIMITED_ROWS } from "../../utils/query-limiter";
+import { resolveSqlGrammar } from "@/lib/sql/grammar";
 import { readStatementEnd } from "@/lib/sql/statement-end";
 
 // ============================================================================
@@ -279,6 +280,11 @@ export class OracleProvider extends SQLBaseProvider {
     }
 
     try {
+      // No pool `error` listener here, unlike the PostgreSQL and SQL Server providers
+      // (#298): oracledb's pool has no pool-level `error` event to listen for. Audited in
+      // the installed package — `oracledb/lib/pool.js` extends EventEmitter but emits only
+      // the internal `_afterPoolClose` and `_allCheckedIn`, and nothing under `oracledb/lib`
+      // emits `error` at all. Connection failures surface through the awaiting call.
       this.pool = await oracledb.createPool({
         user: this.config.user,
         password: this.config.password,
@@ -394,7 +400,7 @@ export class OracleProvider extends SQLBaseProvider {
   public override prepareQuery(query: string, options: QueryPrepareOptions = {}): PreparedQuery {
     const { limit = DEFAULT_QUERY_LIMIT, offset = 0, unlimited = false } = options;
     const effectiveLimit = unlimited ? MAX_UNLIMITED_ROWS : limit;
-    const queryInfo = analyzeQuery(query);
+    const queryInfo = analyzeQuery(query, this.type);
 
     if (queryInfo.type === "SELECT" && !queryInfo.hasLimit) {
       // Both branches append at the tail, so both used to have their clause
@@ -404,10 +410,12 @@ export class OracleProvider extends SQLBaseProvider {
       // trailing trivia instead, which also keeps the `;` out of the comment.
       // A statement whose end may not be cut has nowhere honest to take the
       // clause, so it is returned untouched rather than bounded on a guess. On
-      // Oracle the live shape is `#` in an identifier (`ID#`), which is legal
-      // there and a comment marker in MySQL.
+      // Oracle that is a literal Oracle and MySQL would close in different
+      // places. `#` in an identifier (`ID#`) used to reach the same refusal and
+      // no longer does: the end is read under Oracle's own grammar (#292), where
+      // `#` is an identifier character and opens no comment.
       const source = query.trim();
-      const { end, rewritable } = readStatementEnd(source);
+      const { end, rewritable } = readStatementEnd(source, resolveSqlGrammar(this.type));
       if (!rewritable) {
         return { query, wasLimited: false, limit: effectiveLimit, offset };
       }

@@ -3,7 +3,8 @@
  * Uses mock.module() to intercept pg before provider import.
  */
 
-import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
+import { EventEmitter } from "node:events";
 import type { DatabaseConnection } from "@/lib/types";
 import { DatabaseConfigError } from "@/lib/db/errors";
 
@@ -25,17 +26,31 @@ const mockClient = {
   release: () => {},
 };
 
-const mockPool = {
-  connect: async () => mockClient,
-  end: async () => {},
-  totalCount: 10,
-  idleCount: 7,
-  waitingCount: 0,
-};
+/**
+ * The pool mock is a real EventEmitter, and a fresh instance per construction, because
+ * that is what `pg` hands back. An `error` event with no listener is an uncaught
+ * exception (#298), so a plain object carrying an inert `on` could not tell a pool whose
+ * idle-client failure is handled from one that takes the process down with it.
+ */
+class MockPool extends EventEmitter {
+  public totalCount = 10;
+  public idleCount = 7;
+  public waitingCount = 0;
+
+  async connect() {
+    return mockClient;
+  }
+
+  async end() {}
+}
+
+/** The pool handed to the most recently constructed provider. */
+let lastPool: MockPool | undefined;
 
 mock.module("pg", () => ({
   Pool: function () {
-    return mockPool;
+    lastPool = new MockPool();
+    return lastPool;
   },
 }));
 
@@ -1639,6 +1654,40 @@ describe("PostgresProvider", () => {
   });
 
   // --------------------------------------------------------------------------
+  // Pool Error Events (#298)
+  // --------------------------------------------------------------------------
+
+  describe("pool error events", () => {
+    test("an idle client error is logged and does not escalate past the provider", async () => {
+      provider = new PostgresProvider(makePgConfig());
+      await provider.connect();
+      const pool = lastPool;
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      try {
+        // `pg` has already removed and destroyed the client by the time it emits on the
+        // POOL; with no listener that emit is an uncaught exception, i.e. a dead server.
+        expect(() => pool?.emit("error", new Error("Connection terminated unexpectedly"))).not.toThrow();
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        const logged = errorSpy.mock.calls[0].join(" ");
+        expect(logged).toContain("[Postgres]");
+        expect(logged).toContain("Connection terminated unexpectedly");
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    test("the pool carries exactly one error listener, and a repeat connect adds none", async () => {
+      provider = new PostgresProvider(makePgConfig());
+      await provider.connect();
+      // connect() is a no-op once a pool exists, so listeners cannot accumulate.
+      await provider.connect();
+
+      expect(lastPool?.listenerCount("error")).toBe(1);
+    });
+  });
+
+  // --------------------------------------------------------------------------
   // Pool Stats
   // --------------------------------------------------------------------------
 
@@ -1709,6 +1758,129 @@ describe("PostgresProvider", () => {
       expect(activity[0].client_addr).toBe("127.0.0.1");
       expect(activity[0].state).toBe("active");
       expect(activity[0].query).toBe("SELECT * FROM test_table");
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // prepareQuery() — the `#` grammar is PostgreSQL's here (#292)
+  // --------------------------------------------------------------------------
+  //
+  // PostgreSQL has exactly two comment forms, `--` and `/* */`; `#` is an
+  // operator character (`#>`, `#>>`, `#-` walk or delete a jsonb path, `#` is
+  // integer XOR). The shared readers used to approximate that with "a hash is a
+  // comment unless the next character makes an operator", which reads `# note` on
+  // this provider as a comment and stops the statement there. Asserted through
+  // the provider's own `prepareQuery`, with the emitted text pinned whole.
+
+  describe("prepareQuery()", () => {
+    test.each<[string, string]>([
+      ["a jsonb path operator", "SELECT meta #> '{a}' FROM docs"],
+      ["a jsonb path-as-text operator", "SELECT meta #>> '{a}' FROM docs"],
+      ["an integer XOR operator", "SELECT flags # 5 AS x FROM t"],
+      ["a dollar-quoted body carrying a hash and a paren", "SELECT $fn$ # ) DELETE $fn$ AS body FROM t"],
+    ])("bounds a statement carrying %s, emitted intact", (_label, sql) => {
+      provider = new PostgresProvider(makePgConfig());
+
+      const result = provider.prepareQuery(sql, { limit: 50 });
+
+      expect(result.query).toBe(`${sql} LIMIT 50`);
+      expect(result.wasLimited).toBe(true);
+    });
+
+    test("a write is still a write, hash or no hash", () => {
+      provider = new PostgresProvider(makePgConfig());
+      const sql = "UPDATE t SET flags = flags # 5";
+
+      const result = provider.prepareQuery(sql, { limit: 50 });
+
+      expect(result.query).toBe(sql);
+      expect(result.wasLimited).toBe(false);
+    });
+
+    // ── `[…]` is a SUBSCRIPT here (#295) ────────────────────────────────────
+    //
+    // Established from the manual: `expression[subscript]` and
+    // `expression[lower:upper]` are an element and a slice (4.2.3), array
+    // constructors nest and the manual's own example is `SELECT ARRAY[[1,2],[3,4]]`
+    // (4.2.12), and identifiers are quoted with double quotes (4.1.1) - so `[` is
+    // never a name quote in this dialect and the NAME reading it briefly inherited
+    // from SQL Server could not close a nested array or a key carrying a `]`. That
+    // cost a bound on everyday syntax and, once #297 landed, a confirmation prompt
+    // on an ordinary read.
+    //
+    // The last row is the one the reader could get wrong silently: the statement
+    // ENDS with the bracketed run, so nothing after it would catch a bound placed
+    // by a reader that lost track of where the run closes. A fixture can only pin a
+    // reading where the two readings disagree.
+    test.each<[string, string]>([
+      ["an ordinary subscript", "SELECT a[1] FROM t"],
+      ["a flat array constructor", "SELECT ARRAY[1,2] FROM t"],
+      ["a nested array constructor", "SELECT ARRAY[[1,2],[3,4]] AS a FROM t"],
+      ["a jsonb subscript whose key carries a close bracket", "SELECT j['a]b'] FROM t"],
+      ["a nested subscript", "SELECT t.data[idx[0]] FROM t"],
+      ["a statement that ENDS with a nested array", "SELECT ARRAY[[1,2],[3,4]]"],
+    ])("bounds %s, appending the clause after the run", (_label, sql) => {
+      provider = new PostgresProvider(makePgConfig());
+
+      const result = provider.prepareQuery(sql, { limit: 50 });
+
+      expect(result.query).toBe(`${sql} LIMIT 50`);
+      expect(result.wasLimited).toBe(true);
+    });
+
+    // A reading is not a licence to guess: a subscript run short of its closer is
+    // still undeterminable, so the statement keeps its text and loses its bound
+    // rather than collecting a clause inside the run.
+    test("leaves an unclosed subscript run unbounded, and emits it untouched", () => {
+      provider = new PostgresProvider(makePgConfig());
+      const sql = "SELECT ARRAY[[1,2] AS a FROM t";
+
+      const result = provider.prepareQuery(sql, { limit: 50 });
+
+      expect(result.query).toBe(sql);
+      expect(result.wasLimited).toBe(false);
+    });
+
+    // ── Block comments NEST here (#300) ────────────────────────────────────
+    //
+    // PostgreSQL's manual (4.1.5) says block comments nest "as specified in the SQL
+    // standard but unlike C", so a `/*` written inside one opens a second comment
+    // and the run continues past the next `*/`. Read flat, everything between that
+    // `*/` and the comment's real end reaches the readers as code - and this is the
+    // provider where that costs the most, because `WITH … INSERT` really writes and
+    // a bound appended to it commits part of the write.
+
+    test.each<[string, string]>([
+      ["an INSERT … SELECT", "INSERT INTO archive (id) SELECT id FROM recent"],
+      ["an UPDATE … SET", "UPDATE archive SET seen = true WHERE id IN (SELECT id FROM recent)"],
+    ])("leaves %s hidden behind a nested comment unbounded, emitted intact", (_label, write) => {
+      provider = new PostgresProvider(makePgConfig());
+      const sql = `WITH recent AS (\n  /* outer /* inner */ ) SELECT 1 */\n  SELECT id FROM logs\n)\n${write}`;
+
+      const result = provider.prepareQuery(sql, { limit: 50 });
+
+      expect(result.query).toBe(sql);
+      expect(result.wasLimited).toBe(false);
+    });
+
+    test("bounds a read behind a nested comment, and emits the comment intact", () => {
+      provider = new PostgresProvider(makePgConfig());
+      const sql = "/* outer /* inner */ still a note */ SELECT id FROM logs";
+
+      const result = provider.prepareQuery(sql, { limit: 50 });
+
+      expect(result.query).toBe(`${sql} LIMIT 50`);
+      expect(result.wasLimited).toBe(true);
+    });
+
+    test("leaves a statement whose nested comment never closes untouched", () => {
+      provider = new PostgresProvider(makePgConfig());
+      const sql = "/* outer /* inner */ SELECT id FROM logs";
+
+      const result = provider.prepareQuery(sql, { limit: 50 });
+
+      expect(result.query).toBe(sql);
+      expect(result.wasLimited).toBe(false);
     });
   });
 });

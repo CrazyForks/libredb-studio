@@ -135,6 +135,107 @@ not a name, or an `AS` with no body after it — is re-read as an expression tha
 supported dialect accepts such text, so what the server receives is a rejected statement either way
 rather than a partly limited write.
 
+### Which dialect the readers are reading
+
+Every reader above answers from characters alone, and a few characters mean different things in
+different engines. Where they do, a reader with no dialect has to take one engine's side, and the
+wrong side moves where a construct ends — a `)` that closes a CTE body, a comment that hides a bound,
+the keyword that types the statement.
+
+The dialect was always available at the callers: every provider knows its own `type`, the
+multi-statement route resolves its provider before it asks, and both client-side execution paths hold
+the active connection. It is now passed down (`src/lib/sql/grammar.ts`), and **exactly one place**
+maps a database type to grammar facts — the readers receive the resolved record and never see a type
+id, so no reader can grow a dialect test of its own.
+
+| Character | Established reading | Dialects |
+|-----------|--------------------|----------|
+| `#` | opens a line comment | MySQL, MariaDB, ClickHouse (which also has `#!`) |
+| `#` | ordinary code — a jsonb/geometric operator, an identifier character, a temp-table name, a bind-variable prefix | PostgreSQL, Oracle, SQL Server, SQLite |
+| `q'…'` | a string literal (alternate quoting): the delimiter after the tag opens the body and its partner followed by `'` closes it, so the body carries apostrophes unescaped — `[ ] { } ( ) < >` pair up, any other character closes with itself, either letter case of the tag, and `nq'…'` is the same form for the national character set | Oracle only |
+| `q'…'` | not a form at all — a name followed by an ordinary string, which is what those characters are there | everything else, including the default |
+| `[…]` | a quoted **name**: everything between the brackets is the identifier (`SELECT [a--b] FROM t` selects a column called `a--b`) and the run does not nest. The doubled `]` this reading honours is SQL Server's escape — SQLite stops at the first `]` and has none, so `[a]]b]` reads as one name where SQLite reads `[a]` and then junk, which it rejects either way | SQL Server, SQLite |
+| `[…]` | an **array literal or subscript**: it nests (`[[1,2],[3,4]]`), nothing inside it is escaped, and a literal inside it is a literal (`m['a]b']`) | ClickHouse, PostgreSQL |
+| `/* … /* … */ … */` | one **nesting** comment: a `/*` inside a comment opens another and the run continues until the depth returns to zero, so a region that already contains comments can be commented out. A run short of a closer is undeterminable rather than closed early | PostgreSQL, SQL Server, ClickHouse |
+| `/* … /* … */ … */` | a **flat** comment: the first `*/` ends it, and everything after that is the statement's own code | MySQL, MariaDB, SQLite, Oracle, and the default |
+
+Each row was established from an authoritative source: the engine's own documentation, or its
+driver's own tokenizer under `node_modules` (node-oracledb accepts `#` inside an identifier; the
+SQLite amalgamation classifies `#` as a bind-variable prefix and `[` as a "`[...]` style quoted id").
+A rule that could **not** be established is not guessed from a neighbouring dialect — the dialect stays
+at the compatibility default below, and it is listed here rather than left implicit. The default is per
+**fact**, not per dialect: a dialect whose `#` rule is known can still be undecided about its brackets.
+
+The two non-SQL types, **MongoDB and Redis, have no SQL grammar at all** and are left out of the rows
+below: their providers never reach these readers on the query path, and the confirmation gate — which
+reads whatever is in the editor — asks `readsSqlText()` before applying any span-based rule to their
+text, so a JSON document or a Redis command is not judged by a SQL reader that cannot parse it. The
+gate's keyword tests still run on that text.
+
+| Fact | Undecided, so left at the default | Established, and it happens to equal the default |
+|------|-----------------------------------|--------------------------------------------------|
+| `#` | Couchbase, Druid, the embedded LibreDB provider | — |
+| `q'…'` | nobody | everything except Oracle: the form is Oracle's alone, so "not a literal" is the correct reading for the rest |
+| `[…]` | MySQL, Oracle, Couchbase, Druid, LibreDB | SQL Server and SQLite, whose rule the default already applied |
+| `/* … */` nesting | Couchbase, Druid, LibreDB | MySQL, SQLite and Oracle, whose flat rule the default already applied — each established from its own source rather than assumed to agree |
+
+The distinction is visible in `src/lib/sql/grammar.ts` too: an established fact is written out in that
+dialect's row, an undecided one is written `DEFAULT_SQL_GRAMMAR.<fact>`.
+
+The bracket row is the one where a default costs something, and PostgreSQL is why it is worth
+establishing rather than accepting: left at the name reading, a nested array or a subscript key
+containing a `]` lost its bound there — and, since #297, also asked for confirmation, because the same
+undeterminable run is text the safety gate cannot read. A prompt on everyday syntax teaches operators
+to click the gate away, which costs more than the missed bound, so the rule was established from the
+manual (4.2.3 Subscripts, 4.2.12 Array Constructors). MySQL and Oracle stay undecided: `[` is not a
+name quote in either, but neither has a subscript rule to read it under instead, and reading one
+engine's rule off another's is what this channel exists to stop. The direction there is safe — a run
+the name reading cannot close is reported as undeterminable, an undeterminable end is never cut, so
+the cost is an unbounded read and never a misplaced clause — and those two dialects do not write
+bracket runs in everyday SQL. See
+[Text the reading cannot resolve asks, and says so](#text-the-reading-cannot-resolve-asks-and-says-so).
+
+**A call that names no dialect keeps today's reading**, and that is a decision with its own tests, not
+an accident: `#` opens a comment unless the next character makes a PostgreSQL operator (`#>`, `#>>`,
+`#-`, `##`) — neither of the honest readings, but what this folder did for every engine before the
+channel existed, kept so that the fixtures written for #275, #280, #287, #291 and #294 keep asserting
+the behaviour they were written for. Block comments do not nest under the default for the same reason.
+The default has no alternate-quoting form either, which is the
+same reading every non-Oracle dialect gets and the correct one for all of them.
+
+One reading is deliberately **not** the dialect's, and it is the only such override in this folder:
+`#` in a statement's **leading** trivia is skipped as a comment on every dialect
+(`src/lib/sql/leading-keyword.ts`). No dialect here can *open* a statement with `#` — `#tmp`, `#>` and
+`ID#` are all mid-statement forms — so skipping the run only ever changes which syntax error the
+server reports, while reading it as code would take the bound back off a `# note`-led SELECT on
+PostgreSQL and SQL Server. Every other fact that reader consults, including where a block comment
+ends, is the dialect's own.
+
+The alternate-quote tag has to **start** a word: Oracle's lexer reads a name greedily, so `freq'x'` is
+a name followed by an ordinary string there, and this reader answers the same. That makes the tag the
+one span in `src/lib/sql/spans.ts` whose reading depends on the character *before* it, so callers pass
+a whole statement (or a prefix of one), never a suffix.
+
+What changes for a caller that does name one:
+
+| Statement | Dialect | Before | Now |
+|-----------|---------|--------|-----|
+| `WITH t AS (` + `#- note )` + `SELECT 1) DELETE FROM users` | MySQL | typed `SELECT`, bound appended to a `DELETE` | typed `DELETE`, not bounded |
+| `SELECT * FROM t # LIMIT 10` | MySQL | the commented-out bound read as real, statement unbounded | bound added before the comment |
+| `SELECT * FROM #tmp` | SQL Server | end not cuttable, appending branch declines | `#tmp` is the statement's own text, the statement is bounded |
+| `SELECT * FROM EMP WHERE ID# = 1` | Oracle | not bounded | bounded |
+| `WITH t AS (SELECT q'{it's}' …) SELECT * FROM t` | Oracle | the apostrophe inside the literal opened a string, the CTE list could not be read, not bounded | the literal is a literal, statement typed `SELECT`, bounded |
+| `SELECT q'[it's a -- note )]' FROM dual` | Oracle | the `--` inside the literal read as a trailing comment, so the bound was inserted **inside** the literal and the statement was reported limited | the whole literal is the statement's text, bound appended after it |
+| `SELECT * FROM users # daily` | ClickHouse | not bounded | bound added before the comment |
+| `SELECT meta #> '{a}' FROM docs` | PostgreSQL | bounded (the default already read this correctly) | unchanged |
+| `WITH m['a]b'] AS v SELECT v` | ClickHouse | the `]` inside the key ended the bracketed run, the CTE element could not be crossed, not bounded | the subscript is one run, statement typed `SELECT`, bounded |
+| `SELECT [[1,2],[3,4]] AS a FROM t` | ClickHouse | the closing `]]` read as an escape, so the run never closed and the end was not cuttable, not bounded | the arrays nest, bound appended after them |
+| `SELECT [it's] FROM users` | SQL Server, SQLite | bounded (the name reading is these dialects' own) | unchanged, and now pinned as the dialect's answer rather than a shared default |
+| `WITH t AS (` + `/* a /* b */ ) SELECT 1 */` + `… ) INSERT INTO …` | PostgreSQL, ClickHouse | the comment closed at the inner `*/`, so the `)` after it ended the CTE body and the statement typed `SELECT` — a bound appended to an INSERT | the whole comment is a comment, the statement is typed `INSERT`, not bounded |
+| `/* a /* b */ x */ SELECT id FROM logs` | PostgreSQL, SQL Server, ClickHouse | the word after the inner `*/` typed the statement, so it was not bounded | typed `SELECT`, bounded, comment emitted intact |
+| `SELECT /* a /* b */ DISTINCT */ name FROM t` | SQL Server | `TOP` spliced after a `DISTINCT` that is inside the comment — i.e. inside the comment, so the statement ran unbounded while reporting a limit | `TOP` spliced before the comment |
+| `/* a /* b */ SELECT id FROM logs` | PostgreSQL, SQL Server, ClickHouse | the comment closed at its only `*/` and the statement read as an ordinary SELECT | the comment never closes, so the text is undeterminable: not bounded, and the safety gate asks |
+
 ### Where the bound is placed
 
 The clause is inserted **between the statement and its trailing trivia** — whitespace, comments and
@@ -164,34 +265,64 @@ The same reading of the end answers "is this statement already bounded". The `LI
 
 Reading where a statement ends and **cutting** it there are separate answers, because they are not
 equally risky: a probe that stops early merely finds no bound, while a clause inserted early lands in
-the middle of the statement and the server rejects it outright. Two shapes are therefore read but not
-cut, and a statement carrying either is **returned untouched with `wasLimited: false`** — the second
+the middle of the statement and the server rejects it outright. Three shapes are therefore read but not
+cut, and a statement carrying one is **returned untouched with `wasLimited: false`** — the second
 branch of "never `true` alongside a bound the engine cannot see":
 
 | Shape | Why the cut is refused |
 |-------|------------------------|
 | An unterminated comment or literal, or a quote behind an odd backslash run (`… WHERE name = 'O\'Brien'`) | MySQL escapes with backslashes and PostgreSQL does not, so the two close the literal in different places; inserting on a guess puts the bound after the statement's own `;` |
-| A `#` run at the end of the statement (`SELECT * FROM #tmp`, `… WHERE ID# = 1`, `SELECT flags # 5`) | `#` is MySQL's second comment marker and ordinary code elsewhere — a T-SQL temp table, an Oracle identifier, a PostgreSQL XOR — and nothing in the text tells them apart (`#note` and `#tmp` are the same characters) |
+| On a dialect that **nests** block comments, a comment carrying one opener too many (`/* a /* b */ SELECT 1`) | the run never returns to depth zero, so it is an unterminated comment there — the same refusal as the row above, reached by a rule that is the dialect's own (#300) |
+| A `#` run at the end of the statement (`SELECT * FROM #tmp`, `… WHERE ID# = 1`, `SELECT flags # 5`), **when no dialect was named** | `#` is a comment marker in MySQL and ClickHouse and ordinary code elsewhere — a T-SQL temp table, an Oracle identifier, a PostgreSQL XOR — and nothing in the *text* tells them apart (`#note` and `#tmp` are the same characters) |
+| A bracketed run that never closes — an unterminated name (`SELECT [abc`) or, under the subscript reading, an array short of a bracket (`SELECT [[1,2] AS a`) or one holding an unresolvable literal | a run cannot be more certain than what it contains; guessing where it ends puts the bound inside a name or a literal, which is the corrupted-statement shape rather than a missed bound |
 
-Both are a **deliberate loss of a bound**: appending after everything, as the limiter used to, was
+Each is a **deliberate loss of a bound**: appending after everything, as the limiter used to, was
 valid SQL for the dialect in which those characters are code, and is exactly what put the clause
 inside a trailing comment for the dialect in which they are not. Not bounding costs an over-large
 read the user can re-run, which is the trade every reader in `src/lib/sql/` makes.
 
+Rows one and three cost one thing more since #297, because a run that never closes is also text the
+safety gate cannot read: such a statement asks for confirmation before it runs (see
+[Text the reading cannot resolve asks, and says so](#text-the-reading-cannot-resolve-asks-and-says-so)).
+The `#` row is the exception — a `#` line comment closed by the end of the input is terminated, so
+that shape loses its bound silently, as it always did.
+
+The `#` row applies to the **dialect-less** reading only. A caller that names its dialect has told
+the two apart, so the refusal is lifted in whichever direction that dialect requires: MySQL and
+ClickHouse cut before the comment, PostgreSQL, Oracle, SQL Server and SQLite read the run as the
+statement's own text and cut after it. Every caller in this project names one, so the row describes
+the compatibility default rather than everyday behaviour.
+
 A `#` comment with code after it on a later line is unaffected. Where the cut is refused, the
 statement's *text* is still read to its very end (trailing whitespace and `;` aside), so a bound
 written after a `#` is still found and never doubled — which is also why MSSQL's `TOP` splice, writing
-into the head, keeps bounding `SELECT * FROM #tmp` while leaving a temp-table page that already
-carries a `FETCH NEXT` alone. That last part is not airtight: trailing trivia written *after* such a
-bound hides it from the end-anchored probe, so the `TOP` is spliced anyway — unchanged from before
-this section existed, and noted here rather than claimed closed. The
-one shape that stays wrong is a bound commented out with `#` (`… # LIMIT 10`): it is still read as
-real, so that statement is left alone instead of being bounded. The `--` form, which is unambiguous,
-is fixed.
+into the head, keeps bounding `SELECT * FROM #tmp` even without a dialect. Under the dialect-less
+reading that is not airtight — trailing trivia written *after* an existing bound hides it from the
+end-anchored probe, so a `TOP` is spliced alongside an `OFFSET … FETCH` that SQL Server rejects — and
+naming the dialect is what closes it *for a hash*: `#` is never a comment in T-SQL, so the probe sees
+the bound that is there. Every other route to a refused cut reached that provider the same way, and
+what closes those is the rule in the next paragraph. Likewise the one shape that stays wrong without a
+dialect, a bound commented out with `#` (`… # LIMIT 10`), is read correctly under MySQL's grammar: the
+commented-out clause is not a clause, and a real bound is added before it.
+
+A refused cut costs more than the bound, and this is the part that is easy to miss: it also makes every
+**already-bounded probe** unreliable. Those probes read the statement's own text, and where the cut is
+refused that text is the terminator strip — trailing whitespace and `;` removed and nothing else — so a
+real bound written *before* a trailing comment sits away from the end anchor and reads as absent. For a
+caller that responds to "not bounded" by leaving the statement alone, that is harmless. For a caller
+that responds by ADDING a clause, it is not: the clause lands beside a bound the probe could not see,
+and engines reject the pair outright rather than returning too many rows. So a provider that adds its
+own clause has to treat those probes as non-authoritative wherever the cut was refused. MSSQL is the
+one that adds a clause the refusal does not otherwise stop — `TOP n` goes into the head, which no
+trailing comment can reach — and it now declines whenever such a statement mentions an `OFFSET` or a
+`FETCH` at all, blunt on purpose, since a page cannot be ruled out from text nothing can read (#293).
 
 Providers that append a clause of their own follow the same rule: Oracle's `FETCH FIRST` and
 `OFFSET … FETCH NEXT`, and MSSQL's `OFFSET … FETCH NEXT` pagination branch. MSSQL's `SELECT TOP n`
-splices into the head, which no trailing comment can reach, and is unchanged. ClickHouse's refusal to
+splices into the head, which no trailing comment can reach, so it keeps bounding a statement whose end
+may not be cut — with the one exception above. MSSQL also recognises a page form of its own that the
+shared probes above do not, `OFFSET n ROWS` with no `FETCH` tail; it is read in that provider, because
+the form is T-SQL's alone and no other dialect's probes should move for it. ClickHouse's refusal to
 rewrite a statement ending in `FORMAT`/`SETTINGS`, and Druid's refusal to rewrite one ending in an
 `OFFSET`, both read the same end — otherwise a trailing comment would hide the clause from them and
 the bound placed before that comment would turn a working statement into a server-side syntax error.
@@ -208,7 +339,14 @@ not a pattern belonging to the route. It used to be `/^\s*SELECT\b/i`, which tol
 not a comment — and the splitter keeps each statement's leading comments — so a final `SELECT` behind a
 `-- note` was not recognised and reached the engine unbounded, the one place the comment-tolerant
 classifier had not been adopted (#281). The CTE typing applies here too: a final read-only CTE is
-bounded, a final data-modifying one is not.
+bounded, a final data-modifying one is not. The route resolves its connection before it asks, so the
+reading is done under **that connection's dialect** and this route and the provider that runs the
+statement cannot disagree about what the statement is.
+
+The splitter itself is a separate, still dialect-blind scan: it inlines its own span walk and reads
+`#` as ordinary code, so a MySQL hash comment carrying a `;` still splits a statement there. Changing
+that moves statement boundaries, which is its own change with its own tests — recorded here rather
+than folded in.
 
 Last-only is that route's own policy, and it leaves a hole this section does not close: a non-final
 `SELECT` runs exactly as written, and its **entire** result set travels back in `statements[i].rows`.
@@ -235,7 +373,18 @@ same reading the auto-limiter uses, so the two cannot disagree about where a sta
 | Any of those behind a comment (`-- note`, `/* note */`, MySQL's `# note`, several stacked) | Yes |
 | A `WITH` whose CTE list precedes one (`WITH x AS (…) DELETE FROM …`) | Yes |
 | A `WITH` whose CTE list *contains* an `UPDATE … SET` (PostgreSQL's data-modifying CTE) | Yes |
+| A statement carrying a run the reader cannot resolve (`SELECT '\';` and anything after it, an unterminated comment, literal, name or array) | Yes, and the dialog says why |
+| Any of those behind a **nested** comment (`/* a /* b */ c */ DROP TABLE users`), on a dialect that nests — PostgreSQL, SQL Server, ClickHouse | Yes: the comment is read whole, so the statement's own keyword is the one that answers |
+| The same text on a dialect that does **not** nest — MySQL, MariaDB, SQLite, Oracle | No, because there the comment closed at the first `*/` and what follows it is text the engine rejects outright |
 | `SELECT`, including one naming a destructive keyword in a string or a comment | No |
+
+The reading is done under the **active connection's dialect** on both execution paths, because what
+counts as a comment decides what the statement says. On MySQL, a `#` comment inside a CTE list used to
+hide the `)` that closes it, so the reader answered with the `SELECT` inside the comment's reach and
+the `DELETE` after the list ran with no confirmation at all; under MySQL's grammar the comment is a
+comment and the `DELETE` is seen. The other direction matters as much: `SELECT 1 # UPDATE t SET x = 1`
+is a commented-out note on MySQL — prompting there would be a false alarm — and is the statement's own
+code on PostgreSQL, where those characters are an operator.
 
 The statement's own keyword is read with `src/lib/sql/operative-keyword.ts` and tested against a
 keyword set. It used to be re-derived here as six anchored patterns (`/^\s*DROP\b/i`, …), which
@@ -252,23 +401,81 @@ from a statement that really does write. It reads the statement's **code** rathe
 (`src/lib/sql/words.ts`), so unlike the pattern before it, a read that merely quotes
 `'UPDATE t SET x = 1'` or mentions it in a comment no longer prompts.
 
+### Text the reading cannot resolve asks, and says so
+
+Every other reader in `src/lib/sql/` errs toward **not acting** on text it cannot resolve, because
+its mistake would be a row bound appended to a write — a partial commit (#287). This gate's costs
+run the other way: a false prompt costs one click, silence costs an unconfirmed destructive
+statement. So a statement carrying a run that never closes prompts (#297), and the dialog leads with
+a distinct notice — *"Part of this statement could not be read"* — explaining that a quoted, commented
+or bracketed run never closes, that nothing after that point could be checked, and that this is why it
+is asking. The notice stays visible beside the AI risk verdict, including a verdict of *Safe*: that
+analysis was produced from text whose reading stopped early, so it may not describe what the
+statement does.
+
+`SELECT '\';` followed by a write is the shape the issue was filed about — `'\'` closes the string
+under PostgreSQL's `standard_conforming_strings` and continues it under MySQL's default, so
+`src/lib/sql/spans.ts` reports it as undeterminable rather than guessing, and everything after it
+was invisible to the reading. It now asks instead of executing.
+
+The accepted cost, pinned by tests rather than left to be discovered, in two classes:
+
+- **A closing quote behind an odd backslash run** is reported undeterminable whatever the dialect, and
+  this is the most frequent prompt the rule buys: it covers a literal ending in a backslash (a Windows
+  path) *and* `\'` as an escaped apostrophe — which is MySQL's own escape, so an everyday MySQL read
+  such as `… WHERE name = 'O\'Brien'` asks on every execute. Naming the dialect does not narrow this
+  one, because whether `\` escapes is deliberately not a fact the grammar record carries yet (fixtures
+  across this milestone rest on the undeterminable reading). What does *not* happen is a prompt
+  for a statement that merely contains a backslash — `SELECT 'a\nb' FROM t`, `… LIKE 'a\_b'` and
+  `'C:\\Users\\me'` all resolve and run without one.
+- **A bracketed run a dialect at the default bracket reading cannot close.** `[…]` is read as SQL
+  Server's quoted name for the dialects with no established subscript rule (MySQL, Oracle, Couchbase,
+  Druid, LibreDB), so a nested run or a key carrying a `]` written there is unresolvable and asks.
+  ClickHouse and PostgreSQL read those as subscripts and do not — the PostgreSQL row was established
+  precisely because everyday syntax there (`ARRAY[[1,2],[3,4]]`, `j['a]b']`) was paying this prompt.
+  Ordinary `a[1]` and `ARRAY[1,2]` resolve under every reading.
+
+**Not a cost this rule pays: non-SQL query text.** Both execution paths ask about whatever is in the
+editor, so this predicate is handed MongoDB documents and Redis commands as well. A SQL span reader's
+verdict about text that is not SQL is not evidence of anything — the escaped quote in
+`{"filter":{"msg":"say \"hi\""}}` or in `SET k "a\"b"` closes perfectly in the grammar the text is
+actually written in — so the unresolvable-run rule is applied only where `readsSqlText()` says the
+dialect writes SQL. Saying *"could not be read"* about text that reads fine is the false alarm this
+notice exists to avoid, and a gate operators learn to click through protects nothing. The keyword
+tests still run on that text; only the span-based rule is narrowed.
+
+A fourth class arrives with the nesting fact (#300), and it is the reverse of the ones above — a prompt
+the dialect *adds* rather than one it narrows: on PostgreSQL, SQL Server and ClickHouse a block comment
+carrying one opener too many (`/* a /* b */ SELECT 1`) never closes, so an ordinary read written that
+way asks before it runs. That is the fail-safe direction on those engines, where the same text is
+either an unterminated comment (so the server rejects it) or a comment hiding a statement nobody can
+see; the flat reading of it — comment closed, `SELECT 1` executed — is what a dialect-less caller and
+the flat dialects still get.
+
+Naming the dialect narrows the second class — ClickHouse's `[[1,2],[3,4]]` is a closed run under its
+own grammar (#295) and unresolvable only to a reader without it — and it lifts a form the default
+cannot read at all: Oracle's `q'{it's}'` (#292). It does nothing for the first class, per that
+bullet.
+
 Three gaps are known and pinned by tests rather than claimed closed:
 
 - **Only `UPDATE … SET` is looked for inside a read.** A write hidden in a CTE *body* under any
   other keyword (`WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone`) does not prompt.
   Widening the probe to `DELETE`/`INSERT`/`MERGE` would also make every read whose code names one
   of them prompt, so the asymmetry is inherited from the vocabulary above rather than chosen here.
-- **A statement whose shape cannot be read at all** — an unclosed CTE list, or an undeterminable
-  literal such as `'\'`, which closes the string in PostgreSQL and not in MySQL — hides what
-  follows it. The text is a syntax error under at least one dialect, so the server rejects it
-  either way. This is also the one place the reading NARROWED: the text-scanning probe it replaced
-  found an `UPDATE … SET` written after such a literal, so `SELECT '\';` followed by a write
-  prompted before and does not now. Whether unresolvable text should ask instead is tracked as
-  #297, and the dialect-aware reading #292 asks for would settle where the literal ends.
+- **A statement whose shape cannot be TYPED** — an unclosed CTE list such as
+  `WITH t AS (DELETE FROM x` — does not prompt. This is the boundary of the rule above rather than
+  an exception to it: every character was read, and what they spell is an incomplete statement
+  rather than a run hiding what is written inside it. No dialect accepts the text, so the server
+  rejects it; and the keyword inside the unclosed list is a CTE-body write, which the gap above
+  already does not prompt for even when the list closes. Pinned by
+  `tests/components/QuerySafetyDialog.test.tsx` ("does not prompt when the statement's shape cannot
+  be typed") so the boundary stays a decision — the shipped rule keys on unresolvable *runs*, and
+  widening it to every statement the reader cannot type would prompt for an empty editor.
 - **A multi-statement script is read as one statement.** `SELECT 1; DROP TABLE users` does not
   prompt (its first keyword is the `SELECT`), while `SELECT 1; UPDATE t SET x = 1` does, because
   the unanchored probe finds it. Executing the destructive statement on its own prompts, as long
-  as that statement's own shape can be read — the gap above is the exception.
+  as that statement's own shape can be typed — the gap above is the exception.
 
 Four runs bypass the gate on purpose, all on the standalone path
 (`src/hooks/use-query-execution.ts`): an EXPLAIN run (see below), a Load-More page of a result the
@@ -399,6 +606,18 @@ EXPLAIN is built for SELECT statements only. Clicking **Explain** with anything 
 (`UPDATE`, `INSERT`, DDL, …) executes nothing and reports "Only SELECT statements can
 be explained" — an explain run never falls back to running the original statement,
 because it deliberately bypasses the dangerous-query confirmation dialog.
+
+Because it bypasses that dialog, the classification is the *only* screen on this path, and on
+PostgreSQL the wrapper is `EXPLAIN (ANALYZE, …)` — which **runs** what it explains. So the PostgreSQL
+and ClickHouse strategies read the statement under their own dialect's grammar rather than the shared
+default (#300): block comments nest in both, and a flat reading of
+`/* a /* b */ SELECT 1 */ DELETE FROM users` reports `SELECT` as the leading keyword while PostgreSQL
+reads the whole run as one comment and executes the `DELETE`. Verified on PostgreSQL 18: explaining
+that statement against a three-row table left zero rows. Under PostgreSQL's grammar the statement
+leads with `DELETE`, so nothing is built and the button reports that it cannot be explained. The other
+four strategies stay dialect-blind: their engines' comment rules are the flat one the default already
+applies (MySQL, SQLite) or were never established (Druid, Couchbase), and their EXPLAIN describes
+without running, so the worst a misread comment costs there is a refused button.
 
 ### How It Works
 

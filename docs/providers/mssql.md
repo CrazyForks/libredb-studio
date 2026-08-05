@@ -104,24 +104,74 @@ as `src/lib/sql/statement-end.ts` delimits it, before any trailing comment and b
 of which are re-attached verbatim. Whitespace written before the terminator is now preserved rather
 than dropped, which is the only emitted-SQL difference on the `TOP` branch.
 
-That reader also answers whether the end may be **cut**, and the two branches differ there too. A
-statement ending in a `#` run — `SELECT * FROM #tmp`, everyday T-SQL, which the shared scanner reads
-as a MySQL comment because nothing in the text distinguishes the two — may not be cut, so the
-appending branch declines. The `TOP` splice writes into the head and rejoins the tail verbatim, so it
-still bounds such a statement, and `SELECT * FROM #tmp` comes back as `SELECT TOP 500 * FROM #tmp`.
-What makes that tolerable is that a refused cut still reports the statement's whole text as its end:
-the shared already-bounded probe therefore sees a `FETCH NEXT` written after the `#`, so a temp-table
-page the user already bounded is left alone rather than collecting a `TOP` — which SQL Server rejects
-outright alongside `OFFSET … FETCH`. It is not airtight. Put trailing trivia after that bound
-(`… FETCH NEXT 10 ROWS ONLY -- daily`) and the end-anchored probe stops seeing it, so the `TOP` is
-spliced anyway. That shape behaves exactly as it did before — the probe was end-anchored on the raw
-text then too — and closing it needs the `#` end re-read under a hash-is-code scan, which is a change
-of its own.
+That reader also answers whether the end may be **cut**, and until #292 it could not answer it for a
+statement ending in a `#` run — `SELECT * FROM #tmp` is everyday T-SQL, and the shared scanner had to
+read it as a MySQL comment because nothing in the *text* distinguishes the two. The appending branch
+therefore declined, and a temp-table page whose bound was followed by trailing trivia
+(`… FETCH NEXT 10 ROWS ONLY -- daily`) hid that bound from the end-anchored probe, so a `TOP` was
+spliced alongside an `OFFSET … FETCH` — which SQL Server rejects outright (Msg 10741).
+
+`prepareQuery()` now passes its own `type` to the shared readers, and under T-SQL's grammar `#` is
+never a comment: `#name` and `##name` are local and global temp tables. So the run is the statement's
+own text, the end is cuttable, and both halves close together:
+
+- `SELECT * FROM #tmp` still comes back as `SELECT TOP 500 * FROM #tmp` (the `TOP` splice writes into
+  the head and never depended on the cut);
+- `SELECT * FROM #tmp ORDER BY id` now takes a real page —
+  `… OFFSET 10 ROWS FETCH NEXT 50 ROWS ONLY` — instead of being returned untouched;
+- `SELECT * FROM #tmp … FETCH NEXT 10 ROWS ONLY -- daily` is recognised as already bounded and
+  collects no `TOP`.
+
+See
+[Which dialect the readers are reading](../editor/query-optimization.md#which-dialect-the-readers-are-reading).
+
+That closed the common half of the same hazard. The other half is not about the hash at all: **wherever
+the end may not be cut, no already-bounded probe is reading the statement's real tail.** Those probes
+are anchored at the end of the statement's own text, and a refused cut reports the terminator strip as
+that text — trailing whitespace and `;` removed and nothing else — so a real page written *before* a
+trailing comment sits away from the anchor and reads as absent. A `TOP` was then spliced beside it and
+SQL Server rejected the statement (Msg 10741): the query **failed** while this method reported a limit.
+Reading a page that is not there is harmless (the statement is left alone); missing one that is there
+is not, so where the cut is refused this provider asks the weaker question the situation allows — does
+the text mention an `OFFSET` or a `FETCH` at all? — and declines when it does. The check is unanchored
+and deliberately blunt: a column named `offset`, or a page belonging to a subquery, is enough to
+decline, so such a statement keeps its full result set and is reported honestly as unbounded (#293).
+
+One page form was invisible even where the end **is** cuttable: **`OFFSET n ROWS` with no `FETCH`
+tail** is a complete T-SQL page, and the shared probes recognise only a `FETCH … ROWS ONLY` tail or a
+bare `OFFSET n`. `SELECT … ORDER BY id OFFSET 10 ROWS` therefore collected a `TOP` — and with an offset
+requested, a second `OFFSET … FETCH` appended beside the first. It is now read here rather than in the
+shared limiter, since the form is this dialect's own and no other dialect's probes should move for it:
+`OFFSET n ROW` and `OFFSET n ROWS` at the end of the statement are a page, and the statement is
+returned untouched. The count must be a literal, exactly as the shared probes read — `OFFSET @skip
+ROWS` is not recognised, so a parameterised page still collects a `TOP`, which is a known limitation
+rather than a decision.
+
+The same channel carries this dialect's bracket reading, and T-SQL's is the one the shared reader always
+applied: **`[…]` is a delimited identifier**, everything between the brackets is the name (apostrophe,
+comment marker and semicolon included), and a `]` inside one is written doubled — which is exactly what
+`escapeIdentifier()` emits. That is now the dialect's stated answer rather than a shared default:
+ClickHouse spells a nestable array with the same characters and gets the opposite reading (#295), and
+teaching one scan to step over string literals inside the brackets — the naive way to serve both —
+would have broken `SELECT [it's] FROM users`, which is legal here.
 
 The `SELECT` it splices after is located with `src/lib/sql/leading-keyword.ts`, so a T-SQL comment
 before the statement (`-- note` or `/* note */`) is skipped rather than defeating the injection. That
 shared helper also skips `#`, which is a comment in MySQL only; T-SQL rejects a statement opening with
 one either way, so skipping it changes which syntax error the server reports and nothing else.
+
+**Block comments NEST here** — "Slash Star (Block Comment) (Transact-SQL)" states that a `/*` anywhere
+inside a comment starts a nested one and requires its own `*/`, and that a missing closer is an error.
+The shared reader used to end every comment at its first `*/`, and on this provider that mattered more
+than a lost bound, because the `TOP` splice writes into the **head** at an index that reading chose:
+`SELECT /* a /* b */ DISTINCT */ name FROM t` was read as a comment ending after `/* a /* b */`,
+followed by a `DISTINCT` — which is inside the comment — so the `TOP` was spliced in after it, inside
+the comment too. SQL Server saw `SELECT name FROM t` and ran it unbounded while this method reported
+`wasLimited: true`. Under T-SQL's grammar the whole run is one comment, so the `TOP` goes before it,
+and a `DISTINCT` written *after* the comment still takes the `TOP` after itself (#300). The same fact
+bounds a read behind a leading nested comment (`/* a /* b */ x */ SELECT name FROM t`), declines on a
+write a nested comment hid inside a CTE list, and declines where the comment carries one opener too
+many and therefore never closes. Pinned in `tests/integration/db/mssql-provider.test.ts`.
 
 `prepareQuery` **declines** rather than splicing in two cases, reporting `wasLimited: false` and
 returning the statement untouched. It never reports a limit while handing back the statement unchanged.
@@ -133,10 +183,15 @@ returning the statement untouched. It never reports a limit while handing back t
   probe missed it, because that probe wants literal whitespace between `SELECT` and `TOP`, which both a
   comment (`SELECT/* c */TOP 10 …`) and a `DISTINCT` defeat. Splicing would emit `SELECT TOP n TOP 10`
   and a syntax error.
+- **A T-SQL page at the end of the statement** (`… ORDER BY id OFFSET 10 ROWS`) — a bound the shared
+  probes do not recognise, and a clause beside it is a rejected statement.
+- **An end that may not be cut, in a statement mentioning `OFFSET` or `FETCH`** — the already-bounded
+  probes cannot be trusted there, so a page cannot be ruled out.
 
-The `OFFSET … FETCH` branch declines in one further case of its own: **an end that may not be cut** —
-a trailing `#` run, or a quote behind an odd backslash run, which T-SQL and MySQL close in different
-places. It has nowhere to append; the `TOP` branch, which does not append, is unaffected.
+The `OFFSET … FETCH` branch declines in one further case of its own: **any end that may not be cut** —
+a trailing `#` run under the dialect-less reading, a quote behind an odd backslash run, an unterminated
+comment or bracket. It has nowhere to append; the `TOP` branch, which splices into the head, keeps
+bounding such a statement unless the rule above applies to it.
 
 ### 3.3 Five-query schema introspection, cross-schema
 
@@ -209,6 +264,20 @@ SQL authentication only (`user`/`password`); Windows/AAD auth is not wired.
 This is the most complete pool/timeout mapping of any SQL provider. `getPoolStats()`
 ([mssql.ts:702](../../src/lib/db/providers/sql/mssql.ts)) exposes
 `{ total: size, idle: available, active, waiting: pending }`.
+
+#### Pool errors are handled, not fatal
+
+`mssql.ConnectionPool` is an `EventEmitter` and emits `error` in two situations: a background
+connection failure (a tedious connection error that is not `ESOCKET`) and a failed acquire. An
+`error` event with no listener is an uncaught exception, so `connect()` attaches a listener the
+moment the pool is constructed — otherwise either situation would take the whole server process
+down. The listener only reports (bracketed-prefix `console.error`, this file's convention): a failed
+acquire **also** rejects the caller's promise, so nothing may be swallowed here.
+
+PostgreSQL carries the same guard for its idle clients
+([postgres.md](./postgres.md#42-connection-pooling)). MySQL and Oracle do not, because mysql2 and
+oracledb expose no pool-level `error` event — that audit result is recorded at each of those
+providers' `connect()`.
 
 ### 4.3 Encryption / SSL
 
@@ -477,6 +546,11 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
   can lose precision; they would need to be fetched as strings to stay exact ([§5.3](#53-data-type--parameter-handling)).
 - **Parameters bound without explicit types** — relies on `mssql` type inference, which can mis-type
   `null`/large-integer/`NVARCHAR` values ([§5.3](#53-data-type--parameter-handling)).
+- **A parameterised page is not recognised as one.** The already-bounded probes read a literal count,
+  so `… OFFSET @skip ROWS [FETCH NEXT @take ROWS ONLY]` still looks unbounded and collects a `TOP`,
+  which SQL Server rejects beside it (Msg 10741) — the statement fails rather than returning too many
+  rows ([§3.2](#32-t-sql-pagination-top-and-offset--fetch)). *Future:* accept a variable or an
+  expression as the count.
 - **No Always On / high-availability options.** `MultiSubnetFailover` (fast failover to an
   availability-group listener) and `ApplicationIntent=ReadOnly` (read-only routing to a readable
   secondary) are not set — both are common requirements for enterprise HA SQL Server. *Future:*

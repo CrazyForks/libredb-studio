@@ -1,11 +1,12 @@
 import { describe, test, expect } from "bun:test";
-import { readSqlSpan } from "@/lib/sql/spans";
+import { resolveSqlGrammar, type SqlGrammar } from "@/lib/sql/grammar";
+import { hasUnterminatedSpan, readSqlSpan } from "@/lib/sql/spans";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /** The span at index 0, as `kind|text` (or `null`), which is what most cases assert. */
-function spanOf(sql: string, index = 0): string | null {
-  const span = readSqlSpan(sql, index);
+function spanOf(sql: string, index = 0, grammar?: SqlGrammar): string | null {
+  const span = readSqlSpan(sql, index, grammar);
   return span === null ? null : `${span.kind}|${sql.slice(index, span.end)}`;
 }
 
@@ -103,6 +104,42 @@ describe("readSqlSpan", () => {
     });
   });
 
+  // ── The `#` reading is the dialect's, when a dialect is named (#292) ─────
+  //
+  // Every case above is a call that names NO dialect, and all of them keep their
+  // answers: the default is today's hybrid reading, pinned as a decision in
+  // `grammar.test.ts`. A call that DOES name one gets that dialect's rule, which
+  // is what removes the "the module takes one engine's side" trade above - not
+  // for the default, but for every caller that knows which engine it is talking
+  // to, and after #292 that is all of them.
+
+  describe("a named dialect decides what `#` means", () => {
+    const MYSQL = resolveSqlGrammar("mysql");
+    const POSTGRES = resolveSqlGrammar("postgres");
+
+    test("a comment grammar reads an operator-tailed hash as a comment", () => {
+      expect(spanOf("#- note\nSELECT 1", 0, MYSQL)).toBe("line-comment|#- note\n");
+      expect(spanOf("SELECT 1 #> note", 9, MYSQL)).toBe("line-comment|#> note");
+    });
+
+    test("a code grammar reads even a plainly-written hash comment as code", () => {
+      expect(readSqlSpan("# note\nSELECT 1", 0, POSTGRES)).toBeNull();
+      expect(readSqlSpan("SELECT * FROM #tmp", 14, POSTGRES)).toBeNull();
+    });
+
+    test("a dialect changes nothing about the `--` comment, which no dialect disputes", () => {
+      expect(spanOf("-- note\nSELECT 1", 0, POSTGRES)).toBe("line-comment|-- note\n");
+      expect(spanOf("-- note\nSELECT 1", 0, MYSQL)).toBe("line-comment|-- note\n");
+    });
+
+    // A `#` inside a literal is the literal's, whatever the dialect says about a
+    // bare one - the branch order has to keep the quote reader in front.
+    test("a hash inside a quoted run is not read as a comment under any grammar", () => {
+      expect(spanOf("`a#b` FROM t", 0, MYSQL)).toBe("quoted-identifier|`a#b`");
+      expect(spanOf("'# not a comment'", 0, POSTGRES)).toBe("string|'# not a comment'");
+    });
+  });
+
   describe("block comments", () => {
     test("reads to the first closing delimiter", () => {
       expect(spanOf("/* a */ /* b */ SELECT")).toBe("block-comment|/* a */");
@@ -117,6 +154,112 @@ describe("readSqlSpan", () => {
     // comment, so callers bias to "cannot tell" rather than guessing.
     test("an unterminated block comment reports terminated: false", () => {
       expect(readSqlSpan("/* never closed", 0)).toEqual({ kind: "block-comment", end: 15, terminated: false });
+    });
+  });
+
+  // ── A second opener inside a comment is the dialect's answer (#300) ───────
+  //
+  // The cases above all call without a dialect and keep the reading this module
+  // always had: the first `*/` closes the run. Where a dialect NESTS them, that
+  // reading hands the text between the first `*/` and the comment's real end to
+  // the readers above as code - and both of them are then wrong at once, because
+  // a `)` in there ends a CTE body early (so the statement is typed by a keyword
+  // written inside a comment) and the keyword the confirmation gate reads is one
+  // the operator commented out.
+
+  describe("a named dialect decides where a block comment ends", () => {
+    const POSTGRES = resolveSqlGrammar("postgres");
+    const MSSQL = resolveSqlGrammar("mssql");
+    const CLICKHOUSE_G = resolveSqlGrammar("clickhouse");
+    const MYSQL = resolveSqlGrammar("mysql");
+    const SQLITE = resolveSqlGrammar("sqlite");
+    const ORACLE_G = resolveSqlGrammar("oracle");
+
+    const NESTED = "/* a /* b */ c */ SELECT 1";
+
+    test.each<[string, SqlGrammar]>([
+      ["postgres", POSTGRES],
+      ["mssql", MSSQL],
+      ["clickhouse", CLICKHOUSE_G],
+    ])("a nesting grammar (%s) reads the inner comment as part of the outer one", (_label, grammar) => {
+      expect(spanOf(NESTED, 0, grammar)).toBe("block-comment|/* a /* b */ c */");
+    });
+
+    test.each<[string, SqlGrammar | undefined]>([
+      ["mysql", MYSQL],
+      ["sqlite", SQLITE],
+      ["oracle", ORACLE_G],
+      ["no dialect at all", undefined],
+    ])("a flat grammar (%s) closes it at the first delimiter", (_label, grammar) => {
+      expect(spanOf(NESTED, 0, grammar)).toBe("block-comment|/* a /* b */");
+    });
+
+    // The fail-safe half of the nesting reading: one opener too many means the
+    // comment never closes, so the span is undeterminable rather than guessed -
+    // which costs a bound and, since #297, asks for a confirmation.
+    test("a nesting grammar reports an unclosed nested comment as undeterminable", () => {
+      expect(readSqlSpan("/* a /* b */ DROP TABLE t", 0, POSTGRES)).toEqual({
+        kind: "block-comment",
+        end: 25,
+        terminated: false,
+      });
+    });
+
+    test("depth is counted, not matched: three levels close in order", () => {
+      expect(spanOf("/*1 /*2 /*3 */ 2*/ 1*/ SELECT", 0, POSTGRES)).toBe("block-comment|/*1 /*2 /*3 */ 2*/ 1*/");
+    });
+
+    test.each<[string, string]>([
+      ["an empty comment", "/**/"],
+      ["a comment holding a lone star", "/* a * b */"],
+      ["a comment with a body", "/*a*/"],
+    ])("a nesting grammar answers %s exactly as the flat reading does", (_label, sql) => {
+      expect(spanOf(`${sql} SELECT 1`, 0, POSTGRES)).toBe(`block-comment|${sql}`);
+      expect(spanOf(`${sql} SELECT 1`, 0)).toBe(`block-comment|${sql}`);
+    });
+
+    // Adjacent comments do not nest into each other: the first closes at depth zero,
+    // and the second is a separate span. Worth asserting because a depth counter that
+    // kept scanning past a zero crossing would swallow both.
+    test("a nesting grammar ends the first of two adjacent comments at its own closer", () => {
+      expect(spanOf("/*a*//*b*/SELECT 1", 0, POSTGRES)).toBe("block-comment|/*a*/");
+      expect(spanOf("/*a*//*b*/SELECT 1", 5, POSTGRES)).toBe("block-comment|/*b*/");
+    });
+
+    // An empty nested comment is the smallest input where the two readings differ,
+    // so it belongs here rather than in the list above: the nesting reading needs
+    // both closers, the flat one stops at the first.
+    test("the two readings of an empty nested comment differ by its second closer", () => {
+      expect(spanOf("/*/**/*/ SELECT 1", 0, POSTGRES)).toBe("block-comment|/*/**/*/");
+      expect(spanOf("/*/**/*/ SELECT 1", 0)).toBe("block-comment|/*/**/");
+    });
+
+    // `/*/` is one opener and no closer: the slash the two delimiters share is
+    // consumed by the opener, so this never closes under either reading.
+    test.each<[string, SqlGrammar | undefined]>([
+      ["a nesting grammar", POSTGRES],
+      ["the default", undefined],
+    ])("%s leaves `/*/` unterminated", (_label, grammar) => {
+      expect(readSqlSpan("/*/", 0, grammar)).toEqual({ kind: "block-comment", end: 3, terminated: false });
+    });
+
+    // Inside a comment there are no literals, in this reader and in the engines it
+    // is reading for: a `/*` written inside a quoted-looking run is still an
+    // opener, and a `*/` inside one still closes. Asserted because the opposite
+    // guess - looking for literals inside comment text - is the plausible wrong fix.
+    test("a quote inside comment text neither opens a literal nor hides a delimiter", () => {
+      expect(spanOf("/* it's /* deep */ still */ SELECT 1", 0, POSTGRES)).toBe(
+        "block-comment|/* it's /* deep */ still */",
+      );
+    });
+
+    // A comment is trivia, so a nested one cannot be part of a statement's text -
+    // but a nested comment INSIDE a bracketed subscript is crossed by the run that
+    // contains it, and that run has to stay one span (#295).
+    test("a nested comment inside a ClickHouse subscript is crossed with the run", () => {
+      expect(spanOf("[1 /* ] /* deep */ still */, 2] x", 0, CLICKHOUSE_G)).toBe(
+        "subscript|[1 /* ] /* deep */ still */, 2]",
+      );
     });
   });
 
@@ -234,6 +377,95 @@ describe("readSqlSpan", () => {
     });
   });
 
+  // ── Alternate quoting (Oracle's `q'…'`) ─────────────────────────────────
+  //
+  // The form exists so that a literal can carry apostrophes without doubling
+  // them, which is exactly what makes reading it as code so damaging: the first
+  // apostrophe INSIDE the body opens a string, and everything after it is read one
+  // construct out of step. A `)` there ends a CTE body early and a `--` there
+  // turns the rest of the literal into what looks like trailing trivia (#292).
+  //
+  // Oracle is the only dialect here with the form, so the branch is reached only
+  // under its grammar; every other dialect reads the same characters as a name
+  // followed by an ordinary string, which is what they are there.
+
+  describe("alternate quoting (`q'…'`, Oracle)", () => {
+    const ORACLE = resolveSqlGrammar("oracle");
+
+    // The delimiter pairs node-oracledb's own tokenizer accepts: the four bracket
+    // forms close with their partner, every other character with itself.
+    test.each<[string, string, string]>([
+      ["a brace-delimited body", "q'{it's}' x", "string|q'{it's}'"],
+      ["a bracket-delimited body", "q'[it's]' x", "string|q'[it's]'"],
+      ["a paren-delimited body", "q'(it's)' x", "string|q'(it's)'"],
+      ["an angle-delimited body", "q'<it's>' x", "string|q'<it's>'"],
+      ["an arbitrary delimiter closing with itself", "q'!it's!' x", "string|q'!it's!'"],
+      ["an upper-case tag", "Q'{it's}' x", "string|Q'{it's}'"],
+      // The national-character-set spelling of the same form, whose body rules are
+      // identical - Oracle's SQL Language Reference gives `nq'#…#'` for NCHAR.
+      ["the national-charset tag", "nq'{it's}' x", "string|nq'{it's}'"],
+      ["an upper-case national-charset tag", "NQ'{it's}' x", "string|NQ'{it's}'"],
+      ["a mixed-case national-charset tag", "nQ'{it's}' x", "string|nQ'{it's}'"],
+    ])("reads %s as one literal", (_label, sql, expected) => {
+      expect(spanOf(sql, 0, ORACLE)).toBe(expected);
+    });
+
+    // The closer ends the body only where a quote follows it, which is what lets
+    // the delimiter character itself appear inside the literal.
+    test("a closing delimiter with no quote after it does not end the body", () => {
+      expect(spanOf("q'{a}b}' x", 0, ORACLE)).toBe("string|q'{a}b}'");
+      expect(spanOf("q'!a!b!' x", 0, ORACLE)).toBe("string|q'!a!b!'");
+    });
+
+    test("a paren, a comment marker and a write keyword inside the body belong to the body", () => {
+      expect(spanOf("q'{it's ) -- DELETE FROM users}' x", 0, ORACLE)).toBe("string|q'{it's ) -- DELETE FROM users}'");
+    });
+
+    // A body that never closes hides whatever follows it, so the reader says so
+    // rather than picking one of the two places the literal could end.
+    test.each<[string, string, number]>([
+      ["a body that never closes", "q'{abc", 6],
+      ["a tag with nothing after it", "q'", 2],
+      ["a national-charset body that never closes", "nq'{abc", 7],
+    ])("reports %s as undeterminable", (_label, sql, end) => {
+      expect(readSqlSpan(sql, 0, ORACLE)).toEqual({ kind: "string", end, terminated: false });
+    });
+
+    test.each<[string, string]>([
+      ["the plain tag", "q'{it's}' x"],
+      ["the national-charset tag", "nq'{it's}' x"],
+    ])("a grammar without the form reads %s as code", (_label, sql) => {
+      expect(readSqlSpan(sql, 0)).toBeNull();
+      expect(readSqlSpan(sql, 0, resolveSqlGrammar("postgres"))).toBeNull();
+    });
+
+    // The tag has to START a token. Oracle's lexer reads a name greedily, so
+    // `freq'x'` is a name followed by a string there too - and without the check
+    // the two kinds of reader in this folder would disagree about it: the ones that
+    // read whole words step over the name and never ask here, while the ones that
+    // walk character by character would ask at its last letter.
+    test.each<[string, string, number]>([
+      ["inside a longer name", "SELECT freq'{x}'", 10],
+      ["whose national-charset spelling sits inside a longer name", "SELECT frenq'{x}'", 10],
+      ["at the `q` of a national-charset tag, which the span starts one earlier", "nq'{it's}'", 1],
+    ])("a tag %s does not open the form", (_label, sql, index) => {
+      expect(readSqlSpan(sql, index, ORACLE)).toBeNull();
+    });
+
+    // The body search is an `indexOf` for two characters, so it cannot backtrack -
+    // and this guard is what stops anyone replacing it with a pattern that can.
+    test("answers in bounded time on a long body that never closes", () => {
+      const sql = `q'{${"a".repeat(20000)}`;
+
+      const started = performance.now();
+      const span = readSqlSpan(sql, 0, ORACLE);
+      const elapsed = performance.now() - started;
+
+      expect(span).toEqual({ kind: "string", end: sql.length, terminated: false });
+      expect(elapsed, `took ${elapsed.toFixed(1)}ms`).toBeLessThan(200);
+    });
+  });
+
   // ── Bounded time ────────────────────────────────────────────────────────
   //
   // This module exists partly because the regex alternative is a ReDoS trap:
@@ -310,5 +542,180 @@ describe("readSqlSpan: bracket-quoted identifiers", () => {
     const span = readSqlSpan("[abc", 0);
     expect(span?.terminated).toBe(false);
     expect(span?.end).toBe(4);
+  });
+});
+
+// ─── Bracketed subscripts (#295) ─────────────────────────────────────────────
+//
+// The same characters are an array literal or a subscript in ClickHouse, where
+// they NEST and nothing is escaped, so the name reading above ends the run at the
+// wrong place twice over: at a `]` written inside a string (`m['a]b']`) and at the
+// first `]` of a nested array (`[[1,2],[3,4]]`, whose `]]` the name reading then
+// takes for an escape and never closes). Both cost the statement its bound. The
+// two grammars are mutually exclusive - teaching the name scan to step over
+// literals would break a legal SQL Server name like `[it's]` - so the reading
+// comes from the dialect.
+
+describe("readSqlSpan: bracketed subscripts", () => {
+  const CLICKHOUSE = resolveSqlGrammar("clickhouse");
+  const MSSQL = resolveSqlGrammar("mssql");
+
+  test("reads an array literal as one span", () => {
+    expect(spanOf("[1,2] AS a", 0, CLICKHOUSE)).toBe("subscript|[1,2]");
+    expect(spanOf("m['k'] FROM t", 1, CLICKHOUSE)).toBe("subscript|['k']");
+  });
+
+  test("nests, so an inner array does not end the outer one", () => {
+    expect(spanOf("[[1,2],[3,4]] AS a", 0, CLICKHOUSE)).toBe("subscript|[[1,2],[3,4]]");
+    expect(spanOf("[[[1]]] x", 0, CLICKHOUSE)).toBe("subscript|[[[1]]]");
+  });
+
+  test("a close bracket inside a literal does not end the run", () => {
+    expect(spanOf("['a]b'] AS v", 0, CLICKHOUSE)).toBe("subscript|['a]b']");
+    expect(spanOf('["a]b"] AS v', 0, CLICKHOUSE)).toBe('subscript|["a]b"]');
+  });
+
+  test("a close bracket inside a comment does not end it either", () => {
+    expect(spanOf("[1 /* ] */, 2] x", 0, CLICKHOUSE)).toBe("subscript|[1 /* ] */, 2]");
+    // `#` is a comment in ClickHouse, which is the T1a row of the same record:
+    // the two facts have to hold at once inside one run.
+    expect(spanOf("[1 # ]\n, 2] x", 0, CLICKHOUSE)).toBe("subscript|[1 # ]\n, 2]");
+  });
+
+  test("a doubled close bracket is not an escape here", () => {
+    // The mutually exclusive half, asserted on one input: `]]` closes the run
+    // under the subscript reading (it is how a nested array ends) and escapes a
+    // name character under SQL Server's.
+    expect(spanOf("[a]]b] x", 0, CLICKHOUSE)).toBe("subscript|[a]");
+    expect(spanOf("[a]]b] x", 0, MSSQL)).toBe("quoted-identifier|[a]]b]");
+  });
+
+  test("reports an unterminated subscript rather than guessing where it ends", () => {
+    expect(readSqlSpan("[1,2", 0, CLICKHOUSE)).toEqual({ kind: "subscript", end: 4, terminated: false });
+    // Depth is counted, so a run that closes one bracket short is unterminated too.
+    expect(readSqlSpan("[[1,2]", 0, CLICKHOUSE)).toEqual({ kind: "subscript", end: 6, terminated: false });
+  });
+
+  test("a literal inside that cannot be resolved makes the whole run unterminated", () => {
+    // The span reader reports a quote behind an odd backslash run as
+    // undeterminable, and a run built on top of one cannot be more certain than
+    // what it contains. Answering `terminated` here would put the end of the
+    // statement inside a literal.
+    expect(readSqlSpan("['a", 0, CLICKHOUSE)).toEqual({ kind: "subscript", end: 3, terminated: false });
+    expect(readSqlSpan("['a\\'] AS v", 0, CLICKHOUSE)?.terminated).toBe(false);
+  });
+});
+
+// ─── Text no reader can resolve (#297) ───────────────────────────────────────
+//
+// Every reader over this module discards `terminated: false` after acting on it:
+// the limiter declines to rewrite, `findCodeWord` reports the word it could not
+// see as absent. The confirmation gate needs the signal ITSELF - a span that never
+// closes hides whatever is written inside it, and answering "not dangerous" for
+// text a reader cannot read is the one direction that costs more than a click.
+
+describe("hasUnterminatedSpan", () => {
+  test.each<[string, string]>([
+    ["a plain read", "SELECT * FROM users"],
+    ["a closed literal", "SELECT name FROM users WHERE name = 'O''Brien'"],
+    ["a backslash inside a literal", "SELECT 'a\\nb' FROM t"],
+    ["a literal ending in a doubled backslash", "SELECT 'C:\\\\Users\\\\me' FROM files"],
+    ["stacked comments", "-- one\n/* two */\n-- three\nSELECT 1"],
+    ["a line comment closed by the end of the input", "SELECT 1 -- note"],
+    ["a dollar-quoted body", "SELECT $fn$ begin end $fn$"],
+    ["a bracket-quoted name", "SELECT [a--b] FROM t"],
+    ["a backtick-quoted name", "SELECT `a b` FROM t"],
+    ["text holding no span at all", "1+1"],
+    ["nothing", ""],
+  ])("answers false for %s", (_label, sql) => {
+    expect(hasUnterminatedSpan(sql)).toBe(false);
+  });
+
+  test.each<[string, string]>([
+    ["a quote behind an odd backslash run", "SELECT '\\';\nUPDATE t SET x = 1"],
+    ["a literal that never closes", "SELECT 'unclosed FROM t"],
+    ["a block comment that never closes", "SELECT 1 /* unclosed"],
+    ["a dollar-quoted body that never closes", "SELECT $fn$ begin"],
+    ["a bracket-quoted name that never closes", "SELECT [name FROM t"],
+    ["a double-quoted name that never closes", 'SELECT "name FROM t'],
+  ])("answers true for %s", (_label, sql) => {
+    expect(hasUnterminatedSpan(sql)).toBe(true);
+  });
+
+  // The signal is the GRAMMAR's answer, not this module's: the same characters are
+  // resolvable under one dialect's reading and not under another's, which is the
+  // whole reason the dialect reaches these readers (#292, #295).
+
+  test("the dialect decides whether a bracketed run resolves", () => {
+    // Under the name reading this closes at the inner `]`; under ClickHouse's
+    // array reading the depth never returns to zero.
+    const unbalanced = "WITH [[1,2] AS x DELETE FROM t";
+
+    expect(hasUnterminatedSpan(unbalanced)).toBe(false);
+    expect(hasUnterminatedSpan(unbalanced, resolveSqlGrammar("clickhouse"))).toBe(true);
+
+    // And the other direction on a nested array that IS balanced: the name reading
+    // takes the trailing `]]` for an escape and never closes the run, while
+    // ClickHouse's counts depth and closes it. This is the reason the confirmation
+    // gate answers the same for both readings of this text and for different
+    // reasons - one read the statement, the other could not.
+    const nested = "WITH [[1,2],[3,4]] AS x DELETE FROM t";
+
+    expect(hasUnterminatedSpan(nested)).toBe(true);
+    expect(hasUnterminatedSpan(nested, resolveSqlGrammar("clickhouse"))).toBe(false);
+  });
+
+  test("the dialect decides whether a nested comment resolves", () => {
+    // One opener too many: flat reading closes at the first `*/` and reads the
+    // rest as code, while a nesting dialect is still inside the comment when the
+    // input runs out - so the same text is resolvable under one and not the other,
+    // and the gate asks only where it cannot be read (#300).
+    const unclosed = "/* a /* b */ DROP TABLE users";
+
+    expect(hasUnterminatedSpan(unclosed)).toBe(false);
+    expect(hasUnterminatedSpan(unclosed, resolveSqlGrammar("mysql"))).toBe(false);
+    expect(hasUnterminatedSpan(unclosed, resolveSqlGrammar("postgres"))).toBe(true);
+
+    // Balanced, so a nesting dialect resolves it - and the gate then has to find
+    // the DROP by reading the statement rather than by giving up on the text.
+    const balanced = "/* a /* b */ c */ DROP TABLE users";
+
+    expect(hasUnterminatedSpan(balanced, resolveSqlGrammar("postgres"))).toBe(false);
+  });
+
+  test("answers in bounded time on a deeply nested comment", () => {
+    // The depth count is a single forward pass, so an adversarial nest is linear.
+    // Unbalanced on purpose: the answer has to be reached by scanning to the end.
+    const deep = `${"/*".repeat(20000)} SELECT 1`;
+
+    const started = performance.now();
+    const unresolved = hasUnterminatedSpan(deep, resolveSqlGrammar("postgres"));
+    const elapsed = performance.now() - started;
+
+    expect(unresolved).toBe(true);
+    expect(elapsed, `took ${elapsed.toFixed(1)}ms`).toBeLessThan(200);
+  });
+
+  test("the dialect decides whether an alternate-quoted literal resolves", () => {
+    // Read as ordinary code the apostrophe inside the body opens a string that
+    // swallows the rest of the input; under Oracle's grammar the form closes.
+    const alternateQuoted = "SELECT q'{it's}' FROM dual";
+
+    expect(hasUnterminatedSpan(alternateQuoted)).toBe(true);
+    expect(hasUnterminatedSpan(alternateQuoted, resolveSqlGrammar("oracle"))).toBe(false);
+  });
+
+  test("answers in bounded time on a large input", () => {
+    // The gate that consumes this runs on the editor's execute path, where a
+    // pasted migration script is ordinary. A scanner that advances one span at a
+    // time cannot backtrack - the property this asserts is kept, not assumed.
+    const many = `SELECT ${"'lit' /* note */ -- line\n".repeat(20000)}1`;
+
+    const started = performance.now();
+    const unresolved = hasUnterminatedSpan(many);
+    const elapsed = performance.now() - started;
+
+    expect(unresolved).toBe(false);
+    expect(elapsed, `took ${elapsed.toFixed(1)}ms`).toBeLessThan(200);
   });
 });

@@ -1,10 +1,11 @@
 import { describe, test, expect } from "bun:test";
+import { resolveSqlGrammar, type SqlGrammar } from "@/lib/sql/grammar";
 import { readOperativeKeyword } from "@/lib/sql/operative-keyword";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function operativeOf(sql: string): string | null {
-  return readOperativeKeyword(sql)?.keyword ?? null;
+function operativeOf(sql: string, grammar?: SqlGrammar): string | null {
+  return readOperativeKeyword(sql, grammar)?.keyword ?? null;
 }
 
 // ─── readOperativeKeyword ───────────────────────────────────────────────────
@@ -296,11 +297,35 @@ describe("readOperativeKeyword", () => {
   // someone closed a gap, which is welcome - update the expectation and say so.
 
   describe("known gaps that answer SELECT for a statement that writes", () => {
-    // Oracle's alternative quoting is not a literal to `readSqlSpan`, so the `)`
-    // inside this one closes the CTE body early. Unreachable in Oracle itself,
-    // which has no `WITH … DELETE`, and no other dialect here has the form.
-    test("walks an Oracle q-quoted literal as code", () => {
+    // Oracle's alternate quoting is not a literal under a grammar that does not
+    // have the form - which is every dialect but Oracle, and the compatibility
+    // default - so the `)` inside this one closes the CTE body early and the
+    // `SELECT` written inside the literal answers for the whole statement.
+    test("walks an Oracle q-quoted literal as code where the grammar has no such form", () => {
       expect(operativeOf("WITH t AS (SELECT q'{it's ) SELECT x}' FROM dual) DELETE FROM users")).toBe("SELECT");
+    });
+
+    // …and that closes under Oracle's own grammar (#292). This is the direction
+    // that matters: read as code, the statement types `SELECT` and the limiter
+    // appends a bound to a `DELETE`; read as the literal it is, the keyword after
+    // the CTE list is the one the statement operates.
+    test("an alternate-quoting grammar reads the q-quoted body as the literal it is", () => {
+      const oracle = resolveSqlGrammar("oracle");
+
+      expect(operativeOf("WITH t AS (SELECT q'{it's ) SELECT x}' FROM dual) DELETE FROM users", oracle)).toBe("DELETE");
+      expect(operativeOf("WITH t AS (SELECT q'{it's}' AS s FROM dual) SELECT * FROM t", oracle)).toBe("SELECT");
+    });
+
+    // The national-charset spelling reads the same way, asserted on the direction
+    // that costs a partial write rather than a bound: a `SELECT` written inside the
+    // literal must not answer for a statement that DELETEs.
+    test("the national-charset spelling is read as a literal too", () => {
+      const oracle = resolveSqlGrammar("oracle");
+
+      expect(operativeOf("WITH t AS (SELECT nq'{it's ) SELECT x}' FROM dual) DELETE FROM users", oracle)).toBe(
+        "DELETE",
+      );
+      expect(operativeOf("WITH t AS (SELECT NQ'{it's}' AS s FROM dual) SELECT * FROM t", oracle)).toBe("SELECT");
     });
 
     // `#-` is a PostgreSQL jsonb operator and a MySQL comment opener at once.
@@ -324,6 +349,25 @@ describe("readOperativeKeyword", () => {
       expect(operativeOf(sql)).toBe("DELETE");
     });
 
+    // …and the gap CLOSES for a caller that names its dialect (#292). This is the
+    // one shape in this family that costs a partially committed write - MySQL 8
+    // accepts both `WITH … DELETE` and a `LIMIT` on a `DELETE` - so it is asserted
+    // in both directions: the write is typed as a write under MySQL's grammar, and
+    // the jsonb operator that the hybrid reading exists to protect still reads as
+    // code under PostgreSQL's.
+    test("a comment grammar reads the same statement as the DELETE it operates", () => {
+      const sql = "WITH t AS (\n  #- drop the ) SELECT here\n  SELECT id FROM logs\n) DELETE FROM users";
+
+      expect(operativeOf(sql, resolveSqlGrammar("mysql"))).toBe("DELETE");
+    });
+
+    test("a code grammar keeps a jsonb-operator CTE readable", () => {
+      const postgres = resolveSqlGrammar("postgres");
+
+      expect(operativeOf("WITH t AS (SELECT meta #> '{a}' AS v FROM docs) SELECT * FROM t", postgres)).toBe("SELECT");
+      expect(operativeOf("WITH t AS (SELECT meta #- '{a}' AS v FROM docs) DELETE FROM users", postgres)).toBe("DELETE");
+    });
+
     // Reading an expression means knowing where it ends only by its `AS`, so any
     // element the standard read DECLINES - a head that is not a name, or an `AS`
     // with no body after it - is re-read as an expression that ends at the first
@@ -340,6 +384,104 @@ describe("readOperativeKeyword", () => {
       ["a statement keyword read as an alias", "WITH x AS DELETE, foo AS (SELECT 1) SELECT 1"],
     ])("reads %s as an expression element and answers for what follows", (_label, sql) => {
       expect(operativeOf(sql)).toBe("SELECT");
+    });
+  });
+
+  // ── The bracket grammar (#295) ──────────────────────────────────────────
+  //
+  // `[…]` is a quoted NAME in SQL Server and SQLite and a nestable array or
+  // subscript in ClickHouse, and the two readings are mutually exclusive: the
+  // name reading ends the run at the first unpaired `]` (so one written inside a
+  // string ends it early) while the subscript reading steps over literals and
+  // counts depth (so a doubled `]` closes it rather than escaping). Each element
+  // the walker cannot cross costs the statement its bound, which on ClickHouse -
+  // the engine whose whole point is scanning more rows than a browser can hold -
+  // is the entire cost.
+
+  describe("a bracketed run under the dialect that owns it", () => {
+    const CLICKHOUSE = resolveSqlGrammar("clickhouse");
+    const MSSQL = resolveSqlGrammar("mssql");
+
+    test.each<[string, string]>([
+      ["a map subscript whose key text carries a close bracket", "WITH m['a]b'] AS v SELECT v"],
+      ["a nested array element", "WITH [[1,2],[3,4]] AS a SELECT arrayJoin(a)"],
+      ["an array holding a close bracket in a literal", "WITH ['a]', 'b'] AS a SELECT a"],
+      ["a subscript chain", "WITH m['k']['j]'] AS v SELECT v"],
+      // Syntax the reader models as neither of its two shapes: a lambda inside an
+      // array literal, and a map literal whose key carries a close bracket.
+      ["a lambda inside an array", "WITH arrayMap(x -> x, [1,2]) AS a SELECT a"],
+      ["a map literal subscripted by a bracketed key", "WITH map('a]b', 1)['a]b'] AS v SELECT v"],
+    ])("crosses %s and reports the operative keyword", (_label, sql) => {
+      expect(operativeOf(sql, CLICKHOUSE)).toBe("SELECT");
+    });
+
+    test("still reads a bracket-quoted name as one name under the SQL Server grammar", () => {
+      // The constraint that makes the naive fix wrong: everything between the
+      // brackets is the NAME there, apostrophe included, and a doubled `]` is how
+      // a bracket inside one is written. A scan that stepped over literals would
+      // lose both.
+      expect(operativeOf("WITH [it's] AS (SELECT 1) SELECT 1", MSSQL)).toBe("SELECT");
+      expect(operativeOf("WITH [my]]cte] AS (SELECT 1) SELECT 1", MSSQL)).toBe("SELECT");
+      expect(operativeOf("WITH [my cte] AS (SELECT 1) DELETE FROM users", MSSQL)).toBe("DELETE");
+    });
+
+    test("reports null where a subscript never closes", () => {
+      // The fail-safe direction is unchanged: a run the reader cannot close is
+      // undeterminable, so the statement is not typed as a read.
+      expect(operativeOf("WITH [1,2 AS a SELECT 1", CLICKHOUSE)).toBeNull();
+      expect(operativeOf("WITH [[1,2] AS a SELECT 1", CLICKHOUSE)).toBeNull();
+      expect(operativeOf("WITH m['a] AS v SELECT v", CLICKHOUSE)).toBeNull();
+    });
+
+    test("crosses a deeply nested subscript in bounded time", () => {
+      // Depth is counted, not matched by a regex: the scan advances one span or
+      // one bracket at a time and cannot backtrack.
+      const sql = `WITH ${"[".repeat(20000)}1${"]".repeat(20000)} AS a SELECT 1`;
+
+      const started = performance.now();
+      const keyword = operativeOf(sql, CLICKHOUSE);
+      const elapsed = performance.now() - started;
+
+      expect(keyword).toBe("SELECT");
+      expect(elapsed, `took ${elapsed.toFixed(1)}ms`).toBeLessThan(200);
+    });
+  });
+
+  // ── The block-comment grammar (#300) ────────────────────────────────────
+  //
+  // A comment that NESTS ends later than a flat reading thinks, and everything in
+  // between is handed to this walker as code. A `)` written in that region closes
+  // the CTE body early, so the statement is typed by a keyword the operator
+  // commented out - and on PostgreSQL, where a `WITH … INSERT` really writes, the
+  // bound that follows commits part of it.
+
+  describe("a nested comment inside a CTE list", () => {
+    const POSTGRES = resolveSqlGrammar("postgres");
+    const MYSQL = resolveSqlGrammar("mysql");
+
+    const HIDDEN_WRITE = (write: string) =>
+      `WITH recent AS (\n  /* outer /* inner */ ) SELECT 1 */\n  SELECT id FROM logs\n)\n${write}`;
+
+    test.each<[string, string]>([
+      ["an INSERT", "INSERT INTO archive (id) SELECT id FROM recent"],
+      ["an UPDATE", "UPDATE archive SET seen = true WHERE id IN (SELECT id FROM recent)"],
+      ["a DELETE", "DELETE FROM archive WHERE id IN (SELECT id FROM recent)"],
+    ])("reports %s under a nesting grammar, where the whole comment is a comment", (_label, write) => {
+      expect(operativeOf(HIDDEN_WRITE(write), POSTGRES)).toBe(write.split(" ")[0]);
+    });
+
+    test("reports the keyword written inside the comment under a flat grammar", () => {
+      // MySQL closes the comment at the first `*/`, so the `)` after it really does
+      // end the CTE body there and `SELECT` really is the next word. The text is a
+      // syntax error on MySQL either way; what matters is that the answer is the
+      // dialect's own reading rather than a shared guess.
+      expect(operativeOf(HIDDEN_WRITE("INSERT INTO archive (id) SELECT id FROM recent"), MYSQL)).toBe("SELECT");
+    });
+
+    test("reports null under a nesting grammar when the nested comment never closes", () => {
+      const unclosed = "WITH recent AS (\n  /* outer /* inner */\n  SELECT id FROM logs\n) DELETE FROM users";
+
+      expect(operativeOf(unclosed, POSTGRES)).toBeNull();
     });
   });
 
