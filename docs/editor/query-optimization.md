@@ -261,10 +261,14 @@ Three gaps are known and pinned by tests rather than claimed closed:
 - **A statement whose shape cannot be read at all** — an unclosed CTE list, or an undeterminable
   literal such as `'\'`, which closes the string in PostgreSQL and not in MySQL — hides what
   follows it. The text is a syntax error under at least one dialect, so the server rejects it
-  either way.
+  either way. This is also the one place the reading NARROWED: the text-scanning probe it replaced
+  found an `UPDATE … SET` written after such a literal, so `SELECT '\';` followed by a write
+  prompted before and does not now. Whether unresolvable text should ask instead is tracked as
+  #297, and the dialect-aware reading #292 asks for would settle where the literal ends.
 - **A multi-statement script is read as one statement.** `SELECT 1; DROP TABLE users` does not
   prompt (its first keyword is the `SELECT`), while `SELECT 1; UPDATE t SET x = 1` does, because
-  the unanchored probe finds it. Executing the destructive statement on its own always prompts.
+  the unanchored probe finds it. Executing the destructive statement on its own prompts, as long
+  as that statement's own shape can be read — the gap above is the exception.
 
 Four runs bypass the gate on purpose, all on the standalone path
 (`src/hooks/use-query-execution.ts`): an EXPLAIN run (see below), a Load-More page of a result the

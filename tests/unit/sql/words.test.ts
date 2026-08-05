@@ -135,10 +135,13 @@ describe("findCodeWord", () => {
    *   140 KB                          1025ms
    *   350 KB                          6406ms
    *
-   * A scanner that advances one span or one word at a time cannot do that: every
-   * input below is answered in a single pass. The bound is loose on purpose so it
-   * cannot flake on a slow runner while still failing outright if a backtracking
-   * pattern returns - the quadratic form is five times over it at 140 KB alone.
+   * A scanner that advances one span or one word at a time cannot do that. The rows
+   * expecting `-1` are the full-scan guards - they walk every byte before answering,
+   * so a backtracking pattern would blow the bound outright; the two rows expecting
+   * `0` return after the first word and pin the ANSWER rather than the time. The
+   * bound is loose on purpose so it cannot flake on a slow runner while still
+   * failing outright if a backtracking pattern returns - the quadratic form is five
+   * times over it at 140 KB alone.
    *
    * Correctness is asserted with the timing: a fast wrong answer is not a pass.
    */

@@ -328,9 +328,12 @@ const DANGEROUS_KEYWORDS = new Set(["DELETE", "DROP", "TRUNCATE", "ALTER", "GRAN
  * than asking. `SELECT '\';` + a following write is the case — the two dialect
  * readings of `'\'` end the string in different places, so `spans.ts` declines to
  * guess and everything after is inside a literal as far as this predicate can tell.
- * A test pins it. Reachable only from text carrying a backslash immediately before a
- * closing quote, and whether an unresolvable statement should ASK instead is a policy
- * question with its own UX cost, tracked separately rather than decided here.
+ * A test pins it. It is also the ONE input class this reading NARROWED: the text scan
+ * it replaced found an `UPDATE … SET` written after such a literal, so that script
+ * prompted before and does not now. Reachable only from text carrying a backslash
+ * immediately before a closing quote, and whether an unresolvable statement should ASK
+ * instead is a policy question with its own UX cost - tracked as #297, with the
+ * dialect-aware reading #292 asks for as the alternative, rather than decided here.
  */
 export function isDangerousQuery(query: string): boolean {
   const keyword = readOperativeKeyword(query)?.keyword;
