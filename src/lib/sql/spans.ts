@@ -117,6 +117,32 @@ function hasOddBackslashRunBefore(sql: string, from: number, at: number): boolea
  * append a bound to a DELETE. Callers already decline to rewrite what they cannot
  * read, so the cost of the safe answer is at most an unbounded read.
  */
+/**
+ * A `[…]` quoted identifier, whose closing bracket is escaped by doubling.
+ *
+ * Separate from `readQuoted` because that reader's delimiter opens and closes the
+ * span, and reusing it would read `[` as the closer too. No dialect gives a
+ * backslash meaning inside these, so one before the closing bracket is part of the
+ * name.
+ */
+function readBracketed(sql: string, index: number): SqlSpan {
+  let i = index + 1;
+
+  while (i < sql.length) {
+    if (sql[i] === "]") {
+      // A doubled closing bracket is how SQL Server writes a `]` inside a name.
+      if (sql[i + 1] === "]") {
+        i += 2;
+        continue;
+      }
+      return { kind: "quoted-identifier", end: i + 1, terminated: true };
+    }
+    i++;
+  }
+
+  return { kind: "quoted-identifier", end: sql.length, terminated: false };
+}
+
 function readQuoted(sql: string, index: number, quote: string, kind: SqlSpanKind, backslashEscapes: boolean): SqlSpan {
   let i = index + 1;
 
@@ -228,6 +254,22 @@ export function readSqlSpan(sql: string, index: number): SqlSpan | null {
   // dialect gives a backslash meaning inside them, so one before the closing
   // delimiter is simply part of the name.
   if (ch === "`") return readQuoted(sql, index, "`", "quoted-identifier", false);
+
+  // `[…]` quotes an identifier in SQL Server and SQLite, and everything between the
+  // brackets is the NAME - `SELECT [a--b] FROM t` selects a column called `a--b`.
+  // Leaving it as code let `statement-end.ts` read that `--` as trailing trivia, and
+  // the insert-before-trivia rewrite then spliced the bound INTO the name:
+  // `SELECT [a LIMIT 500--b] FROM t`, reported as limited. Emitting a corrupted
+  // statement is worse than any missed bound, which is why this is a span even
+  // though it is the one delimiter pair here that opens and closes with different
+  // characters. SQL Server's escape is a doubled closing bracket.
+  //
+  // ClickHouse spells an array with the same characters and nests them, so
+  // `[[1,2],[3,4]]` closes at the first single `]` under this reading and the rest
+  // is undeterminable. That costs a bound on a form which already lost it before
+  // this change (see the array note in `operative-keyword.ts`); telling the two
+  // apart needs the dialect, which this module does not have.
+  if (ch === "[") return readBracketed(sql, index);
 
   if (ch === "$") {
     const tagLength = measureDollarTag(sql, index);

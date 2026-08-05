@@ -87,40 +87,13 @@ function skipParenthesised(sql: string, open: number): number {
   return -1;
 }
 
-/**
- * The index past a `[…]` run, or `-1` when it never closes.
- *
- * Brackets are read HERE and not in `readSqlSpan`: in a name position `[…]` can
- * only be a quoted identifier, while elsewhere `a[1]` is array subscripting in
- * PostgreSQL and ClickHouse, which a literal reader must not swallow. Two readers
- * below want the run skipped whole - a name may be written `[my cte]`, and a
- * ClickHouse expression may be the array literal `[1, 2, 3]`, whose commas would
- * otherwise look like the end of a CTE-list element.
- *
- * The run is scanned for its `]` without consulting `readSqlSpan`, so a `]` written
- * inside a string closes it early (`WITH map['a]'] AS v SELECT 1` reads as
- * undeterminable and loses its bound). That is the safe direction and it is what a
- * bracketed NAME already did before this reader existed; closing it needs a
- * bracket run that skips spans, which is a change of its own.
- */
-function skipBracketed(sql: string, open: number): number {
-  let i = open + 1;
-
-  while (i < sql.length) {
-    if (sql[i] === "]") {
-      // MSSQL escapes a closing bracket by doubling it, the same rule the quoted
-      // forms use.
-      if (sql[i + 1] === "]") {
-        i += 2;
-        continue;
-      }
-      return i + 1;
-    }
-    i++;
-  }
-
-  return -1;
-}
+// A `[…]` run used to be scanned here, because a bracket is a quoted identifier in a
+// name position and array subscripting elsewhere. `readSqlSpan` reads it now: the
+// statement-end reader needed the same run to be opaque, and leaving two scanners
+// for one delimiter is what this folder exists to stop. Both callers below reach it
+// through the span branch, with identical behaviour - including that a `]` inside a
+// string still closes the run early (`WITH map['a]'] AS v SELECT 1` loses its bound,
+// issue #295), since neither reader recurses into a literal.
 
 /** The index past a CTE's name - a bare word or a quoted identifier - or `-1`. */
 function skipCteName(sql: string, index: number): number {
@@ -131,8 +104,6 @@ function skipCteName(sql: string, index: number): number {
     if (span.kind === "quoted-identifier" && span.terminated) return span.end;
     return -1;
   }
-
-  if (sql[index] === "[") return skipBracketed(sql, index);
 
   return readSqlWord(sql, index)?.end ?? -1;
 }
@@ -234,12 +205,6 @@ function skipExpressionElement(sql: string, index: number): number {
       // as part of the CTE list.
       if (depth < 0) return -1;
       i++;
-      continue;
-    }
-    if (ch === "[") {
-      const afterBracket = skipBracketed(sql, i);
-      if (afterBracket < 0) return -1;
-      i = afterBracket;
       continue;
     }
     // A comma at depth 0 ends the element, and this one got there without an `AS`,

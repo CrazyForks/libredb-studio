@@ -284,3 +284,31 @@ describe("readSqlSpan", () => {
     }
   });
 });
+
+// ─── Bracket-quoted identifiers ──────────────────────────────────────────────
+//
+// `[…]` quotes an identifier in SQL Server and SQLite, and everything inside it is
+// the NAME - a comment marker, a paren, a semicolon. Leaving it as code let the
+// statement-end reader treat the `--` in `SELECT [a--b] FROM t` as trailing trivia,
+// and #280's insert-before-trivia rewrite then spliced the bound INSIDE the
+// identifier: `SELECT [a LIMIT 500--b] FROM t`. Reported by review on PR #299.
+
+describe("readSqlSpan: bracket-quoted identifiers", () => {
+  test("reads a bracketed name as one opaque span", () => {
+    expect(spanOf("[Order Date]")).toBe("quoted-identifier|[Order Date]");
+    expect(spanOf("SELECT [a--b] FROM t", 7)).toBe("quoted-identifier|[a--b]");
+    expect(spanOf("[a/*b*/c]")).toBe("quoted-identifier|[a/*b*/c]");
+    expect(spanOf("[a;b]")).toBe("quoted-identifier|[a;b]");
+  });
+
+  test("a doubled closing bracket is an escape, not the end", () => {
+    // SQL Server spells a `]` inside a name by doubling it.
+    expect(spanOf("[a]]b]")).toBe("quoted-identifier|[a]]b]");
+  });
+
+  test("reports an unterminated bracket rather than guessing where it ends", () => {
+    const span = readSqlSpan("[abc", 0);
+    expect(span?.terminated).toBe(false);
+    expect(span?.end).toBe(4);
+  });
+});

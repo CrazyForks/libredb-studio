@@ -919,3 +919,29 @@ describe("a statement whose end may not be cut is not rewritten", () => {
     expect(result.wasLimited).toBe(true);
   });
 });
+
+// ─── The bound must never land inside a bracketed name (PR #299 review) ──────
+//
+// `[…]` quotes an identifier in SQL Server and SQLite, so a comment marker inside
+// one is part of the NAME. Reading it as trailing trivia made the insert-before-
+// trivia rewrite splice the bound INTO the identifier and still report success:
+// `SELECT [a--b] FROM t` came back as `SELECT [a LIMIT 500--b] FROM t`. That is a
+// regression this milestone introduced - before it, the bound was appended at the
+// end, which was harmless here.
+
+describe("applyQueryLimit: bracket-quoted identifiers", () => {
+  test("does not write the bound inside a bracketed name carrying a comment marker", () => {
+    const limited = applyQueryLimit("SELECT [a--b] FROM t", 500);
+
+    expect(limited.sql).toBe("SELECT [a--b] FROM t LIMIT 500");
+    expect(limited.wasLimited).toBe(true);
+  });
+
+  test("a doubled bracket inside the name does not end it either", () => {
+    expect(applyQueryLimit("SELECT [a]]b] FROM t", 500).sql).toBe("SELECT [a]]b] FROM t LIMIT 500");
+  });
+
+  test("a real trailing comment after a bracketed name is still trivia", () => {
+    expect(applyQueryLimit("SELECT [a--b] FROM t -- daily", 500).sql).toBe("SELECT [a--b] FROM t LIMIT 500 -- daily");
+  });
+});
