@@ -259,7 +259,7 @@ timeout → `TimeoutError`, etc.).
 ### 5.2 Automatic `LIMIT` injection
 
 `prepareQuery()` (inherited from `SQLBaseProvider`) protects the UI from runaway result sets. It
-runs the query through `analyzeQuery()` ([query-limiter.ts:59](../../src/lib/db/utils/query-limiter.ts))
+runs the query through `analyzeQuery()` ([query-limiter.ts:88](../../src/lib/db/utils/query-limiter.ts))
 and, **only for `SELECT`/CTE-`SELECT` queries that don't already have a `LIMIT`**, appends one via
 `applyQueryLimit()`:
 
@@ -274,9 +274,36 @@ and, **only for `SELECT`/CTE-`SELECT` queries that don't already have a `LIMIT`*
   already-limited check, so an annotated bounded query is not bounded twice. Before this, an
   annotated `SELECT` classified as an unknown statement type and returned **every** row while the
   UI badge reported it as not limited (#275).
+- A statement leading with `WITH` is typed by the keyword its CTE list **operates**
+  ([`operative-keyword.ts`](../../src/lib/sql/operative-keyword.ts)), so a data-modifying CTE
+  (`WITH t AS (UPDATE … RETURNING …) INSERT INTO … SELECT …`) is **not** bounded. This matters most on
+  PostgreSQL, where data-modifying CTEs are an everyday idiom and the appended `LIMIT` applied to the
+  rows the statement *writes*: it committed at most 500 of them while reporting a truncated result
+  set (#287). Undeterminable CTE shapes are likewise not bounded — an over-large read can be re-run,
+  a partly committed write cannot. Asserted at the shared seam in `tests/unit/db/sql-base.test.ts`,
+  since the behaviour is `SQLBaseProvider`'s for every SQL provider.
+- The clause is inserted at the end of the **statement** as
+  [`statement-end.ts`](../../src/lib/sql/statement-end.ts) delimits it — before any trailing comment
+  and before the terminating `;`, both re-attached verbatim — and the already-limited probes read the
+  same end. Appending after the trivia put the bound inside a trailing `-- note`, so the query ran
+  unbounded while the badge said it was capped; reading the bound off the same text made
+  `-- LIMIT 10` look like a real one, so nothing was injected (#280). A statement with no trailing
+  trivia is emitted exactly as before. A statement whose end may not be **cut** is returned untouched
+  with `wasLimited: false`, since a guess would place the bound after the `;` or in the middle of the
+  statement: a quote behind an odd backslash run (MySQL and PostgreSQL close it in different places)
+  and a trailing `#` run, which is a comment in MySQL and PostgreSQL's XOR operator here
+  (`SELECT flags # 5`).
 
 `prepareQuery()` is a *preparation* step (the UI calls it before `query()`); `query()` itself runs
 exactly the SQL it is handed.
+
+Which routes call it is a caller policy, not the provider's: `POST /api/db/query` and the transaction
+route's `query` action prepare every statement they are given, while `POST /api/db/multi-query` prepares
+the **last** statement of a script and only when it is a `SELECT` — so a non-final `SELECT` returns its
+full result set, which that route's own
+[section](../editor/query-optimization.md#multi-statement-runs) records rather than claims closed. It
+decided "is this a `SELECT`" with its own `/^\s*SELECT\b/i` until #281 and so skipped preparation for a
+comment-led final `SELECT`; it now reads `isSelectQuery()` from the same classifier as everything above.
 
 ### 5.3 Query cancellation
 

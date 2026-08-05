@@ -361,9 +361,10 @@ error, live-verified:
 works.
 
 `ClickHouseProvider.prepareQuery()`
-([index.ts:515](../../src/lib/db/providers/sql/clickhouse/index.ts)) detects a trailing `FORMAT` or
-`SETTINGS` clause with two patterns anchored at the **end** of the statement (after stripping one
-trailing semicolon, which the server accepts) and, when either matches, returns the query
+([index.ts:562](../../src/lib/db/providers/sql/clickhouse/index.ts)) detects a trailing `FORMAT` or
+`SETTINGS` clause with two patterns anchored at the **end** of the statement — as
+`src/lib/sql/statement-end.ts` delimits it, so the terminating semicolon and any trailing comment are
+outside what the patterns read — and, when either matches, returns the query
 **unchanged** with `wasLimited: false` rather than delegating to the inherited limiter. Anchoring at
 the end is what keeps the check off a statement that merely mentions the word: `SELECT * FROM t
 WHERE note = 'format'` and `SELECT name FROM system.settings` are ordinary statements that still get
@@ -372,12 +373,32 @@ or `SETTINGS` clause is expressing intent the editor must not silently rewrite, 
 favour not rewriting: rewriting wrongly turns a working statement into a syntax error, while leaving
 it alone at worst returns more rows than the page size.
 
+A hand-rolled semicolon strip used to stand in for that reading, so `... FORMAT TSV -- note` read as
+carrying no trailing clause at all. That was harmless only while the inherited limiter appended its
+bound after the comment, where the server never saw it; now that the bound is placed **before** the
+comment, the same miss would emit `... FORMAT TSV LIMIT n -- note` — the very `400` / code `62` above.
+Detection and placement therefore read one shared definition of where a statement ends. Where that
+reader refuses to let the statement be cut at all — an unterminated literal, or a trailing `#` run —
+the inherited limiter declines on its own, so such a statement is passed through untouched whatever
+this override answers.
+
 One false positive is accepted on purpose rather than fixed: a statement ending in a string literal
 that itself contains an assignment (`... WHERE note = 'SETTINGS foo = 1'`) is read as carrying a
 trailing clause, because ruling it out needs a string-literal-aware tokenizer. The cost of that false
 positive is only a missing row limit — the statement still runs and still returns correct rows —
 whereas the other direction would produce a hard syntax error, which is why the bias sits where it
 does.
+
+**Expression-form CTEs are limited too.** A CTE is ordinarily written `WITH <expr> AS <alias>` here —
+`WITH 1 AS one SELECT one, count(*) FROM events GROUP BY one`, `WITH now() AS t SELECT * FROM events
+WHERE ts < t` — which is not the `name AS (body)` shape the other dialects use. The shared statement
+typer (`src/lib/sql/operative-keyword.ts`) walks a CTE-list element in both shapes, so these type
+`SELECT` and receive the inherited bound. While it walked only the standard shape they typed `OTHER`
+and reached the server unbounded ([#291](https://github.com/libredb/libredb-studio/issues/291)) — on
+the one engine here whose ordinary result set is larger than a browser can hold. Nothing is made
+unsafe by reading the form: ClickHouse has no data-modifying CTE, so a missing bound was the whole
+cost. Detection and typing still agree on the same statement — `WITH 1 AS one SELECT one FORMAT TSV`
+comes back untouched, because the trailing-clause refusal above reads it as well.
 
 ### 3.9 Column types are the declared strings, verbatim
 

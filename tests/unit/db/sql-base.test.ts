@@ -554,5 +554,80 @@ describe("SQLBaseProvider", () => {
       expect(result.query).toBe("-- annotated\nSELECT * FROM users LIMIT 50");
       expect(result.wasLimited).toBe(true);
     });
+
+    // #287. This is the seam through which the misclassification reached the
+    // engine: a data-modifying CTE was typed SELECT, so a bound was appended to a
+    // statement that WRITES. In PostgreSQL the bound applies to the written rows,
+    // so the statement committed at most `limit` of them and reported a truncated
+    // result set - the one failure in this family that re-running cannot undo.
+    describe("a CTE that operates a write reaches the engine untouched", () => {
+      test.each<[string, string]>([
+        ["INSERT", "WITH t AS (UPDATE logs SET seen = true RETURNING id) INSERT INTO audit SELECT id FROM t"],
+        ["UPDATE", "WITH stale AS (SELECT id FROM sessions) UPDATE users SET flag = 1 FROM stale"],
+        ["DELETE", "WITH doomed AS (SELECT id FROM s) DELETE FROM users USING doomed WHERE users.id = doomed.id"],
+        [
+          "MERGE",
+          "WITH src AS (SELECT 1 AS id) MERGE INTO target USING src ON target.id = src.id WHEN MATCHED THEN DELETE",
+        ],
+      ])("passes a CTE operating an %s through byte-identical", (_label, sql) => {
+        const p = new TestSQLProvider(makeConfig("postgres"));
+
+        const result = p.prepareQuery(sql, { limit: 500 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+      });
+
+      test("still bounds a read-only CTE", () => {
+        const p = new TestSQLProvider(makeConfig("postgres"));
+        const sql = "WITH t AS (SELECT 1) SELECT * FROM t";
+
+        const result = p.prepareQuery(sql, { limit: 500 });
+
+        expect(result.query).toBe(`${sql} LIMIT 500`);
+        expect(result.wasLimited).toBe(true);
+      });
+    });
+
+    // #280. The bound used to be appended after everything, so a trailing line
+    // comment swallowed it: the engine ran the statement unbounded while the
+    // caller was handed `wasLimited: true` and the UI reported a capped result.
+    describe("a statement ending in a comment", () => {
+      test("gets its bound before the comment, not inside it", () => {
+        const p = new TestSQLProvider(makeConfig("postgres"));
+
+        const result = p.prepareQuery("SELECT * FROM users -- daily check", { limit: 50 });
+
+        expect(result.query).toBe("SELECT * FROM users LIMIT 50 -- daily check");
+        expect(result.wasLimited).toBe(true);
+      });
+
+      test("keeps its terminating semicolon outside the comment", () => {
+        const p = new TestSQLProvider(makeConfig("postgres"));
+
+        const result = p.prepareQuery("SELECT * FROM users; -- daily check", { limit: 50 });
+
+        expect(result.query).toBe("SELECT * FROM users LIMIT 50; -- daily check");
+      });
+
+      test("is bounded even when the comment contains a bound", () => {
+        const p = new TestSQLProvider(makeConfig("postgres"));
+
+        const result = p.prepareQuery("SELECT * FROM users -- LIMIT 10", { limit: 50 });
+
+        expect(result.query).toBe("SELECT * FROM users LIMIT 50 -- LIMIT 10");
+        expect(result.wasLimited).toBe(true);
+      });
+
+      test("keeps a real bound written before the comment", () => {
+        const p = new TestSQLProvider(makeConfig("postgres"));
+        const sql = "SELECT * FROM users LIMIT 10 -- deliberate";
+
+        const result = p.prepareQuery(sql, { limit: 50 });
+
+        expect(result.query).toBe(sql);
+        expect(result.wasLimited).toBe(false);
+      });
+    });
   });
 });
