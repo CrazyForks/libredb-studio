@@ -14,6 +14,8 @@ how the release pipeline publishes each channel. For a one-line-per-channel over
 | Snap | Ubuntu and other snapd systems | [Snap](#snap) |
 | Windows (winget / Chocolatey / portable zip) | Windows workstations | [Windows](#windows-winget--chocolatey--portable-zip) |
 | Desktop app (AppImage, .deb, FlatPark) | Linux desktops - an application window, no browser tab | [Desktop app](#desktop-app-appimage-debian-package-flatpark) |
+| Unraid | An Unraid server - one click from the Apps tab | [Unraid](#unraid-community-applications) |
+| Sealos | One-click managed Kubernetes, nothing to install locally | [Sealos](#sealos-app-store) |
 
 All non-Docker channels ship or download the same **standalone server payload** (Next.js
 standalone output, started with `node server.js`) built by
@@ -32,7 +34,8 @@ have Docker images only.
 
 ## Zero-config first run
 
-Every channel works with no configuration. When `JWT_SECRET` / `ADMIN_PASSWORD` are not set
+Every channel works with no configuration, except the two catalog templates that collect
+credentials in their own install form (see the last bullet). When `JWT_SECRET` / `ADMIN_PASSWORD` are not set
 (and the auth provider is not OIDC), the server generates them on first start, persists them in
 `<data dir>/auth-bootstrap.json` (file mode 0600), and prints the admin password **once** to the
 server log:
@@ -51,12 +54,19 @@ server log:
 - Explicitly set environment variables always take precedence; only missing values are generated.
 - If the data dir is not persisted (ephemeral container, no volume), new credentials are
   generated on every recreate.
+- **The two catalog templates are the exception**, because their install form asks for the
+  credentials up front: the [Unraid](#unraid-community-applications) template requires
+  `ADMIN_PASSWORD` and `JWT_SECRET`, and the [Sealos](#sealos-app-store) template collects an admin
+  password and sets `AUTH_BOOTSTRAP=off`. Both therefore start with credentials you chose, print no
+  generated-password banner, and write no `auth-bootstrap.json`. Zero-config describes what the
+  server does when a channel leaves those variables unset.
 
 **Strict mode:** set `AUTH_BOOTSTRAP=off` to disable generation and require explicit
 `JWT_SECRET` and `ADMIN_PASSWORD` (recommended for production; missing values then surface as a
 clear error on the login page instead of silently generated credentials in collected logs). Every
-channel, the Helm chart included, defaults to zero-config; strict mode is always opt-in.
-Unrecognized `AUTH_BOOTSTRAP` values log a warning and keep bootstrap on.
+channel that starts the server itself, the Helm chart included, defaults to zero-config and takes
+strict mode as an opt-in; the [Sealos](#sealos-app-store) template is the one channel that ships
+with it already on. Unrecognized `AUTH_BOOTSTRAP` values log a warning and keep bootstrap on.
 
 ## Network exposure (bind address)
 
@@ -819,6 +829,68 @@ flatpak --user uninstall -y org.libredb.Studio//stable
 flatpak --user remote-delete libredb-flatpark-local
 ```
 
+## App catalogs (Unraid, Sealos)
+
+Both channels install the same published container image through a catalog the platform itself
+publishes, so a user browsing that platform finds LibreDB Studio without ever visiting this repo.
+They are documented here rather than under `deploy/<provider>/` because neither descriptor lives in
+this repo: the Sealos template lives upstream in
+[`labring-actions/templates`](https://github.com/labring-actions/templates) and the Unraid template
+in [`libredb/unraid-templates`](https://github.com/libredb/unraid-templates). Catalog channels whose
+source descriptor *is* in this repo (CapRover, Railway, Dokploy, Kubero, Cosmos) keep their notes in
+`deploy/<provider>/README.md` instead. The full channel list is
+[`docs/CHANNELS.md`](CHANNELS.md).
+
+Both templates pin an explicit **version tag**, not `latest`, so a new release reaches these users
+only when the template is bumped - `on_demand` for both in
+[`distribution/channels.yaml`](../distribution/channels.yaml).
+
+### Unraid (Community Applications)
+
+Listed in [Community Applications](https://ca.unraid.net/apps/libredb-studio-0a5x41a1cy1kay) (CA)
+since 2026-08-04 ([issue #283](https://github.com/libredb/libredb-studio/issues/283)). In the Unraid
+web UI: **Apps** tab, search for **LibreDB Studio**, then **Install**.
+
+- **The web UI host port defaults to 3006**, mapped to container port 3000. Any free host port
+  works; the template steers away from 3000 because it commonly collides with other apps.
+- **App Data** is `/mnt/user/appdata/libredb-studio` mapped to `/app/data`, holding the server-side
+  SQLite storage (`STORAGE_SQLITE_PATH=/app/data/libredb-storage.db`) - that database is what
+  survives container updates and recreation. **No `auth-bootstrap.json` is written here**, because
+  the template always supplies `ADMIN_PASSWORD` and `JWT_SECRET` and generation short-circuits when
+  both are set: back up the database, and keep the credentials you typed into the template.
+- **Credentials are entered in the Add Container form**, not read back from a log: the template
+  marks `ADMIN_EMAIL`, `ADMIN_PASSWORD` (minimum 8 characters) and `JWT_SECRET` (minimum 32
+  characters) as required fields. That is a template choice for a NAS audience, not an app
+  requirement - see the exception noted under
+  [Zero-config first run](#zero-config-first-run).
+- `AUTH_COOKIE_SECURE=false` ships as the default because a LAN install is served over plain HTTP.
+  Set it to `true` once the app sits behind HTTPS (a reverse proxy); leaving it `false` on a
+  public host sends the session cookie in cleartext.
+- The container is unprivileged, on `bridge` networking, and needs no other service - databases are
+  reached over TCP from the Unraid host's network.
+
+Because the template repo is LibreDB-owned, a version bump is a commit in
+`libredb/unraid-templates` rather than a PR here or upstream; CA then serves it after its next
+catalog build, which is when Unraid offers the update.
+
+### Sealos (App Store)
+
+Listed in the [Sealos App Store](https://sealos.io/products/app-store/libredb-studio) since
+2026-08-04 ([issue #276](https://github.com/libredb/libredb-studio/issues/276),
+[labring-actions/templates#739](https://github.com/labring-actions/templates/pull/739)). Click
+**Deploy Now** and supply an administrator email and password (minimum 8 characters); the template
+provisions compute, networking, storage and ingress, so there is nothing to install locally.
+
+- **Storage** defaults to SQLite on a 1 GiB PVC. The template also offers **Use PostgreSQL
+  storage**, which provisions a KubeBlocks-managed PostgreSQL instance and points
+  `STORAGE_PROVIDER` / `STORAGE_POSTGRES_URL` at it - see [`docs/STORAGE.md`](STORAGE.md).
+- The template sets **`AUTH_BOOTSTRAP=off`** and generates `JWT_SECRET` itself, so the deployment
+  starts in [strict mode](#zero-config-first-run) with the password you entered - there is no
+  generated-credentials banner to read from the pod log.
+- Bumps go in as a template PR to `labring-actions/templates`. That repo's default branch is
+  **`kb-0.9`**, not `main` or `master`, which is what both the drift-check pin URL and any bump PR
+  must target.
+
 ## Building a standalone payload locally
 
 The single source of truth for the release archives also works locally (Linux and macOS; on
@@ -1071,8 +1143,8 @@ pin or editing a channel entry is always a human commit.
 |---|---|---|
 | 0 | Core registries, published directly by release CI | GitHub Releases, GHCR, Docker Hub, npm |
 | 1 | Packaged formats owned by this repo, CI-published | Helm, Homebrew tap, Snap, .deb/.rpm, desktop AppImage |
-| 2 | LibreDB-owned copies and listings, bumped by hand | CapRover mirror (deprecated), Railway, Koyeb button, Fly.io config, Render Blueprint |
-| 3 | Upstream community catalogs, bumped via PR | CapRover official, Dokploy, Cosmos, Kubero |
+| 2 | LibreDB-owned copies and listings, bumped by hand | Railway, Koyeb button, Fly.io config, Render Blueprint, Unraid CA template |
+| 3 | Upstream community catalogs, bumped via PR | CapRover official, Dokploy, Cosmos, Kubero, Sealos |
 | 4 | Partner or curated catalogs (not self-serve) | Rancher partner charts, Koyeb catalog, DO, winget, Chocolatey, Flathub |
 
 **Categories** (`category` on every channel) are the business-facing buckets rendered in
@@ -1193,10 +1265,13 @@ than under `deploy/<provider>/`: [`fly.toml`](../fly.toml) (Fly.io) and
 auto-detects the config at the working-directory root: `fly launch`/`fly deploy` read
 `./fly.toml` (see [docs/FLY.md](FLY.md)) and Render's Blueprint auto-detects `render.yaml`, so
 the documented "clone and deploy" flow only works from that location. Catalog-based channels
-(CapRover, Railway, Dokploy, Kubero, …) instead keep their source descriptor under
+(CapRover, Railway, Dokploy, Kubero, Cosmos) instead keep their source descriptor under
 `deploy/<provider>/`, because the consumable artifact lives in an external catalog and the
-in-repo file is only the source that gets pushed or PR'd upstream. Neither Fly.io nor Render has
-a marketplace or template gallery to publish into, which is why the repo file itself is the
+in-repo file is only the source that gets pushed or PR'd upstream. Two catalog channels keep **no**
+descriptor here at all — the Sealos template is authored in `labring-actions/templates` and the
+Unraid CA template in `libredb/unraid-templates` — so both are pinned with `remote_file` against
+those repos and documented under [App catalogs](#app-catalogs-unraid-sealos). Neither Fly.io nor
+Render has a marketplace or template gallery to publish into, which is why the repo file itself is the
 deliverable (`pin.strategy: local_file` for the version-pinned `fly.toml`; `none` for
 `render.yaml`, which builds from the repo Dockerfile and tracks whatever `main` builds).
 
