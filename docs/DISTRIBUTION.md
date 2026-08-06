@@ -836,10 +836,11 @@ publishes, so a user browsing that platform finds LibreDB Studio without ever vi
 They are documented here rather than under `deploy/<provider>/` because neither descriptor lives in
 this repo: the Sealos template lives upstream in
 [`labring-actions/templates`](https://github.com/labring-actions/templates) and the Unraid template
-in [`libredb/unraid-templates`](https://github.com/libredb/unraid-templates). Catalog channels whose
-source descriptor *is* in this repo (CapRover, Railway, Dokploy, Kubero, Cosmos) keep their notes in
-`deploy/<provider>/README.md` instead. The full channel list is
-[`docs/CHANNELS.md`](CHANNELS.md).
+in [`libredb/unraid-templates`](https://github.com/libredb/unraid-templates), and neither has a
+`deploy/<provider>/` folder here at all. Every other catalog channel does have one and keeps its
+notes in `deploy/<provider>/README.md` instead - CapRover and Railway alongside the source
+descriptor itself, Dokploy, Kubero and Cosmos as notes only, since those three descriptors are also
+authored upstream. The full channel list is [`docs/CHANNELS.md`](CHANNELS.md).
 
 Both templates pin an explicit **version tag**, not `latest`, so a new release reaches these users
 only when the template is bumped - `on_demand` for both in
@@ -1265,9 +1266,16 @@ than under `deploy/<provider>/`: [`fly.toml`](../fly.toml) (Fly.io) and
 auto-detects the config at the working-directory root: `fly launch`/`fly deploy` read
 `./fly.toml` (see [docs/FLY.md](FLY.md)) and Render's Blueprint auto-detects `render.yaml`, so
 the documented "clone and deploy" flow only works from that location. Catalog-based channels
-(CapRover, Railway, Dokploy, Kubero, Cosmos) instead keep their source descriptor under
-`deploy/<provider>/`, because the consumable artifact lives in an external catalog and the
-in-repo file is only the source that gets pushed or PR'd upstream. Two catalog channels keep **no**
+instead keep whatever they own under `deploy/<provider>/`, because the consumable artifact lives in
+an external catalog. Only **CapRover** and **Railway** own a source descriptor there
+(`deploy/caprover/libredb-studio.yml`, `deploy/railway/template.json`): the in-repo file is the
+source that gets pushed or PR'd upstream, which is why Railway is pinned `local_file`. CapRover is
+pinned `remote_file` even so - that pin must measure what the catalog actually serves, which leaves
+its in-repo descriptor unmeasured by any gate
+([#268](https://github.com/libredb/libredb-studio/issues/268)); it fell 45 patch versions behind the
+catalog before anyone noticed. **Dokploy**, **Kubero** and **Cosmos** keep only a README there -
+their descriptors are authored in the upstream catalog repo, so all three are pinned `remote_file`
+and a bump is an upstream PR with nothing to change here. Two catalog channels keep **no**
 descriptor here at all — the Sealos template is authored in `labring-actions/templates` and the
 Unraid CA template in `libredb/unraid-templates` — so both are pinned with `remote_file` against
 those repos and documented under [App catalogs](#app-catalogs-unraid-sealos). Neither Fly.io nor

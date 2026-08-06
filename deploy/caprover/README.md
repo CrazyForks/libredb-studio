@@ -53,10 +53,30 @@ Set these under the app's **App Configs** tab to extend the deployment:
 
 ## Maintaining this template
 
-When a new Studio version is released, bump the `defaultValue` of
-`$$cap_version` in `libredb-studio.yml` and submit an update PR to the official
-repo. Validate locally with the CapRover repo's tooling:
+When a new Studio version is released, bump the version in `libredb-studio.yml`
+and submit an update PR to the official repo. The version appears **twice** in
+that file — the `defaultValue` of `$$cap_version` and the example inside its
+`description` — and both must move together. Validate locally with the CapRover
+repo's tooling:
 
 ```bash
 npm ci && npm run validate_apps && npm run formatter
 ```
+
+Two things to know before you bump:
+
+- **Nothing verifies this file.** `bun run distribution:check` pins
+  `caprover-official` with `remote_file` against the catalog, which is
+  deliberate: that pin must measure what upstream actually serves. No gate
+  measures the copy in this folder, so it can silently fall behind a release.
+  Tracked in [#268](https://github.com/libredb/libredb-studio/issues/268).
+- **Check upstream first.** This folder leads and the catalog follows, but that
+  order has been broken once: [caprover/one-click-apps#1315](https://github.com/caprover/one-click-apps/pull/1315)
+  bumped the catalog to 0.9.59 directly, leaving this file on 0.9.14 until it
+  was resynced. Compare against the live template before assuming this copy is
+  ahead:
+
+  ```bash
+  curl -s https://raw.githubusercontent.com/caprover/one-click-apps/master/public/v4/apps/libredb-studio.yml \
+    | diff -u libredb-studio.yml -
+  ```
