@@ -3,7 +3,8 @@
 import React, { useState, useMemo } from "react";
 import { Wand2, X, Play, Copy, Check, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { TableSchema } from "@/lib/types";
+import { DatabaseType, TableSchema } from "@/lib/types";
+import { quoteLiteral } from "@/lib/sql/values";
 
 interface TestDataGeneratorProps {
   isOpen: boolean;
@@ -161,6 +162,7 @@ export function TestDataGenerator({
   onClose,
   tableName,
   tableSchema,
+  databaseType,
   queryLanguage,
   onExecuteQuery,
 }: TestDataGeneratorProps) {
@@ -201,26 +203,35 @@ export function TestDataGenerator({
       const values = cols.map((col) => {
         const gen = FAKE[col.faker.generator as keyof typeof FAKE];
         const val = gen ? gen(i) : `value_${i}`;
-        // Determine if value should be quoted
+        // Determine if value should be quoted. The generator is picked by column
+        // NAME and this test reads the column TYPE, so the two can disagree —
+        // `phone BIGINT` yields `+1-555-…`. The value itself decides, not the
+        // type alone: a value written unquoted IS statement grammar, so one that
+        // does not look like a number is quoted and the engine gets to object
+        // (PR #304 review).
         const type = col.type.toLowerCase();
-        if (type.includes("bool")) return val;
+        if (type.includes("bool") && /^(true|false)$/i.test(val)) return val;
         if (
-          type.includes("int") ||
-          type.includes("float") ||
-          type.includes("double") ||
-          type.includes("decimal") ||
-          type.includes("numeric") ||
-          type.includes("real")
+          (type.includes("int") ||
+            type.includes("float") ||
+            type.includes("double") ||
+            type.includes("decimal") ||
+            type.includes("numeric") ||
+            type.includes("real")) &&
+          /^-?\d+(\.\d+)?$/.test(val)
         )
           return val;
-        return `'${val.replace(/'/g, "''")}'`;
+        // No generator can produce a quote or a backslash today, so the quoting
+        // itself is shared rather than a fix: the next generator added inherits a
+        // literal the connected engine reads as data (#290).
+        return quoteLiteral(val, databaseType as DatabaseType | undefined);
       });
       return `(${values.join(", ")})`;
     });
 
     return `INSERT INTO ${tableName} (${colNames})\nVALUES\n  ${rows.join(",\n  ")};`;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tableSchema, columnConfigs, rowCount, queryLanguage, tableName, refreshKey]);
+  }, [tableSchema, columnConfigs, rowCount, queryLanguage, tableName, databaseType, refreshKey]);
 
   const handleCopy = () => {
     navigator.clipboard.writeText(generatedQuery);

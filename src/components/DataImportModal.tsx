@@ -17,7 +17,8 @@ import {
   Loader2,
   X,
 } from "lucide-react";
-import type { TableSchema } from "@/lib/types";
+import type { DatabaseType, TableSchema } from "@/lib/types";
+import { quoteLiteral } from "@/lib/sql/values";
 
 interface DataImportModalProps {
   isOpen: boolean;
@@ -90,25 +91,43 @@ export function parseJSON(text: string): ParsedData {
   return { headers, rows, totalRows: rows.length };
 }
 
+/**
+ * The shapes a value must have to be written into a statement unquoted. They are
+ * shared with `inferSqlType` on purpose: the type is inferred from a sample, so
+ * the same test has to be applied again to each value that is emitted — one
+ * predicate, used in both places, cannot drift from itself.
+ */
+const INTEGER_VALUE = /^-?\d+$/;
+const NUMERIC_VALUE = /^-?\d+(\.\d+)?$/;
+const BOOLEAN_VALUE = /^(true|false|0|1)$/i;
+
 export function inferSqlType(values: string[]): string {
   const nonEmpty = values.filter((v) => v !== "" && v !== null);
   if (nonEmpty.length === 0) return "TEXT";
 
-  const allIntegers = nonEmpty.every((v) => /^-?\d+$/.test(v));
+  const allIntegers = nonEmpty.every((v) => INTEGER_VALUE.test(v));
   if (allIntegers) return "INTEGER";
 
-  const allNumbers = nonEmpty.every((v) => /^-?\d+(\.\d+)?$/.test(v));
+  const allNumbers = nonEmpty.every((v) => NUMERIC_VALUE.test(v));
   if (allNumbers) return "NUMERIC";
 
-  const allBooleans = nonEmpty.every((v) => /^(true|false|0|1)$/i.test(v));
+  const allBooleans = nonEmpty.every((v) => BOOLEAN_VALUE.test(v));
   if (allBooleans) return "BOOLEAN";
 
   return "TEXT";
 }
 
-export function escapeSQL(value: string): string {
+/**
+ * Quote an imported cell as a SQL literal for the dialect the import will run on.
+ *
+ * These statements are handed to `onImport`, which executes them, so a cell of the
+ * uploaded file becomes SQL. Doubling the quote is enough only where a backslash
+ * is data: on a backslash-escaping dialect a cell ending in one would escape the
+ * closing quote and have the rest of the row read as statement text (#290).
+ */
+export function escapeSQL(value: string, dialect?: DatabaseType): string {
   if (value === "" || value === "null" || value === "NULL") return "NULL";
-  return `'${value.replace(/'/g, "''")}'`;
+  return quoteLiteral(value, dialect);
 }
 
 export function generateImportSQL(
@@ -117,6 +136,7 @@ export function generateImportSQL(
   createNewTable: boolean,
   newTableName: string,
   columnMapping: Record<string, string>,
+  dialect?: DatabaseType,
 ): string {
   if (!parsedData) return "";
 
@@ -125,13 +145,18 @@ export function generateImportSQL(
 
   const statements: string[] = [];
 
+  // One type per column, read from the first 100 rows and computed once. It used
+  // to be re-inferred for every cell, which re-scanned that sample rows × columns
+  // times for a single import.
+  const columnTypes = parsedData.headers.map((_, idx) =>
+    inferSqlType(parsedData.rows.slice(0, 100).map((r) => r[idx])),
+  );
+
   // CREATE TABLE if new
   if (createNewTable) {
-    const colDefs = parsedData.headers.map((h) => {
-      const colValues = parsedData.rows.slice(0, 100).map((r) => r[parsedData.headers.indexOf(h)]);
-      const sqlType = inferSqlType(colValues);
+    const colDefs = parsedData.headers.map((h, idx) => {
       const colName = columnMapping[h] || h;
-      return `  ${colName} ${sqlType}`;
+      return `  ${colName} ${columnTypes[idx]}`;
     });
     statements.push(`CREATE TABLE ${tableName} (\n${colDefs.join(",\n")}\n);`);
   }
@@ -144,13 +169,22 @@ export function generateImportSQL(
     const batch = parsedData.rows.slice(i, i + batchSize);
     const valueRows = batch.map((row) => {
       const values = row.map((val, idx) => {
-        const sqlType = inferSqlType(parsedData.rows.slice(0, 100).map((r) => r[idx]));
+        const sqlType = columnTypes[idx];
         if (val === "" || val === "NULL" || val === "null") return "NULL";
-        if (sqlType === "INTEGER" || sqlType === "NUMERIC" || sqlType === "BOOLEAN") {
-          if (sqlType === "BOOLEAN") return val.toLowerCase() === "true" || val === "1" ? "TRUE" : "FALSE";
-          return val;
+        // The type came from the first 100 rows, so every value after them is
+        // outside the evidence for it. Each one is tested again by the same
+        // predicate that typed the column, and one that fails falls through to a
+        // quoted literal: unquoted text is statement grammar, and a row past the
+        // sample used to be able to carry `0); DELETE FROM users; --` straight
+        // into an import the user then executes (PR #304 review).
+        if (sqlType === "BOOLEAN" && BOOLEAN_VALUE.test(val)) {
+          return val.toLowerCase() === "true" || val === "1" ? "TRUE" : "FALSE";
         }
-        return escapeSQL(val);
+        if (sqlType === "INTEGER" && INTEGER_VALUE.test(val)) return val;
+        if (sqlType === "NUMERIC" && NUMERIC_VALUE.test(val)) return val;
+        // A value the engine will refuse for its column is better than one it
+        // reads as SQL: the type error names the row, and nothing executes.
+        return escapeSQL(val, dialect);
       });
       return `  (${values.join(", ")})`;
     });
@@ -239,8 +273,16 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
   }, []);
 
   const generatedSQL = useMemo(
-    () => generateImportSQL(parsedData, targetTable, createNewTable, newTableName, columnMapping),
-    [parsedData, targetTable, createNewTable, newTableName, columnMapping],
+    () =>
+      generateImportSQL(
+        parsedData,
+        targetTable,
+        createNewTable,
+        newTableName,
+        columnMapping,
+        databaseType as DatabaseType | undefined,
+      ),
+    [parsedData, targetTable, createNewTable, newTableName, columnMapping, databaseType],
   );
 
   const handleImport = () => {

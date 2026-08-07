@@ -138,13 +138,13 @@ MongoDB, Redis, ClickHouse, Druid or Couchbase clients expose a fatal `error` ev
 
 ## Value interpolation
 
-### V1. Four call sites escape by doubling quotes only
+### V1. Query history records the placeholders, not the values that were bound
 
-`src/components/PivotTable.tsx`, `src/components/TestDataGenerator.tsx`, `src/components/Studio.tsx`
-and `src/components/DataImportModal.tsx` each build SQL by doubling quotes in a value, which a
-backslash-escaping dialect can still turn into SQL. The related inline-edit path
-(`src/hooks/use-inline-editing.ts`, a non-numeric primary-key value interpolated into `WHERE` with no
-escaping at all) is already covered by issue #290; these four are not.
+Since #290 the inline row editor sends `SET "name" = $1` with the value bound, and
+`use-query-execution` writes that text to history — a truthful record of the statement the engine
+ran, but no longer a record of what was written. Carrying the bound values as their own history
+field would restore the audit trail without putting them back into the SQL. Touches the history
+entry shape in `src/lib/storage`, so it is a schema change rather than a one-line fix.
 
 ---
 

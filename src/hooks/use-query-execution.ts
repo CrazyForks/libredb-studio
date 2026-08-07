@@ -19,6 +19,12 @@ export interface QueryExecutionOptions {
   offset?: number;
   unlimited?: boolean;
   skipSafety?: boolean;
+  /**
+   * Values for the statement's positional placeholders, bound by the driver
+   * instead of written into the SQL. A generated statement (the inline row editor,
+   * #290) carries its values here so that no value can be read as statement text.
+   */
+  params?: unknown[];
 }
 
 interface UseQueryExecutionParams {
@@ -137,7 +143,7 @@ export function useQueryExecution({
       }
 
       // Options extraction
-      const { limit = 500, offset = 0, unlimited = false } = executionOptions || {};
+      const { limit = 500, offset = 0, unlimited = false, params } = executionOptions || {};
 
       // isLoadingMore flag
       const isLoadMore = offset > 0;
@@ -199,8 +205,18 @@ export function useQueryExecution({
         const queryToRun = directExplainSql || queryToExecute;
 
         // Detect multi-statement queries (not for EXPLAIN or load-more or transaction)
+        //
+        // A parameterized statement never takes this route: `/api/db/multi-query`
+        // splits the payload and binds nothing, so the values would be dropped and
+        // the statement would run with unbound placeholders. Parameters may only
+        // travel to an endpoint that binds them (PR #304 review).
         const useMultiQuery =
-          !isExplain && !isLoadMore && !transactionActive && !isPlaygroundRun && isMultiStatement(queryToExecute);
+          !isExplain &&
+          !isLoadMore &&
+          !transactionActive &&
+          !isPlaygroundRun &&
+          !params &&
+          isMultiStatement(queryToExecute);
 
         // Use transaction endpoint if a transaction is active or in playground mode
         const useTransaction = (transactionActive || isPlaygroundRun) && !isExplain;
@@ -216,6 +232,10 @@ export function useQueryExecution({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...buildConnectionPayload(activeConnection),
+            // The parameter array travels beside the SQL on whichever endpoint the
+            // statement takes, and only when the caller supplied one: a request
+            // without values must stay a request without a `params` key (#290).
+            ...(params && { params }),
             ...(useTransaction
               ? { action: "query", sql: queryToExecute, options: { limit, offset, unlimited } }
               : {
@@ -239,6 +259,11 @@ export function useQueryExecution({
                 ...buildConnectionPayload(activeConnection),
                 sql: explainSql,
                 options: {},
+                // The explain SQL is the statement with a prefix, so its
+                // placeholders are the same ones in the same order and the same
+                // values bind them. Without this the plan request would run
+                // unbound and the panel would keep the previous plan (PR #304).
+                ...(params && { params }),
               }),
             });
           }

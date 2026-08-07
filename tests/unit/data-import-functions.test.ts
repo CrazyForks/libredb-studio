@@ -206,6 +206,12 @@ describe("escapeSQL", () => {
     expect(escapeSQL("it's a 'test'")).toBe("'it''s a ''test'''");
   });
 
+  test("doubles a backslash for a dialect that reads it as an escape", () => {
+    expect(escapeSQL("a\\b", "mysql")).toBe("'a\\\\b'");
+    expect(escapeSQL("a\\b", "postgres")).toBe("'a\\b'");
+    expect(escapeSQL("a\\b")).toBe("'a\\b'");
+  });
+
   test("returns NULL for empty string", () => {
     expect(escapeSQL("")).toBe("NULL");
   });
@@ -232,6 +238,69 @@ describe("generateImportSQL", () => {
     ],
     totalRows: 2,
   };
+
+  // The generated statements are handed straight to `onImport`, which executes
+  // them, so a cell of an imported file is a value that becomes SQL. On a
+  // backslash-escaping dialect a cell ending in `\` would escape the closing quote
+  // and the rest of the row would be read as statement text (#290).
+  test("escapes an imported cell for the dialect it will run on", () => {
+    const withBackslash: ParsedData = {
+      headers: ["path"],
+      rows: [["C:\\Users\\'; DROP TABLE users; --"]],
+      totalRows: 1,
+    };
+
+    const sql = generateImportSQL(withBackslash, "files", false, "", {}, "mysql");
+
+    expect(sql).toContain("('C:\\\\Users\\\\''; DROP TABLE users; --')");
+  });
+
+  // The column type is inferred from the first 100 rows only, and every value it
+  // typed as numeric used to be written into the statement verbatim. Row 101 is
+  // outside that sample, so it could carry anything — and these statements are
+  // executed by `onImport` (PR #304 review).
+  test("quotes a value that does not match the type inferred from the sample", () => {
+    const rows = Array.from({ length: 100 }, (_, i) => [String(i)]);
+    rows.push(["0); DELETE FROM users; -- "]);
+    const beyondTheSample: ParsedData = { headers: ["amount"], rows, totalRows: 101 };
+
+    const sql = generateImportSQL(beyondTheSample, "orders", false, "", {});
+
+    expect(sql).toContain("('0); DELETE FROM users; -- ')");
+    expect(sql).not.toContain("(0); DELETE FROM users; -- )");
+  });
+
+  test("quotes a value the sample typed as boolean but that is not one", () => {
+    // Not an injection — the old code answered FALSE for anything unrecognized,
+    // which silently wrote the wrong value rather than letting the engine object.
+    const rows = Array.from({ length: 100 }, () => ["true"]);
+    rows.push(["maybe"]);
+    const beyondTheSample: ParsedData = { headers: ["active"], rows, totalRows: 101 };
+
+    const sql = generateImportSQL(beyondTheSample, "flags", false, "", {});
+
+    expect(sql).toContain("('maybe')");
+  });
+
+  test("still writes a matching numeric value unquoted", () => {
+    const numeric: ParsedData = {
+      headers: ["amount", "ratio", "active"],
+      rows: [["42", "1.5", "true"]],
+      totalRows: 1,
+    };
+
+    expect(generateImportSQL(numeric, "orders", false, "", {})).toContain("(42, 1.5, TRUE)");
+  });
+
+  test("emits the standard form when no dialect is known", () => {
+    const withBackslash: ParsedData = {
+      headers: ["path"],
+      rows: [["C:\\Users"]],
+      totalRows: 1,
+    };
+
+    expect(generateImportSQL(withBackslash, "files", false, "", {})).toContain("('C:\\Users')");
+  });
 
   test("returns empty for null parsedData", () => {
     expect(generateImportSQL(null, "users", false, "", {})).toBe("");

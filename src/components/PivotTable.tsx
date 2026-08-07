@@ -3,11 +3,15 @@
 import React, { useState, useMemo, useCallback, useEffect } from "react";
 import { Columns3, GripVertical, ArrowRight } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { QueryResult } from "@/lib/types";
+import { DatabaseType, QueryResult } from "@/lib/types";
+import { quoteLiteral } from "@/lib/sql/values";
+import { quoteIdentifier } from "@/lib/sql/identifier";
 
 interface PivotTableProps {
   result: QueryResult | null;
   onLoadQuery?: (query: string) => void;
+  /** The connected engine, so a generated literal is quoted the way it reads it. */
+  databaseType?: string;
 }
 
 type AggFunction = "count" | "sum" | "avg" | "min" | "max";
@@ -37,7 +41,7 @@ export function aggregate(values: unknown[], fn: AggFunction): string {
   }
 }
 
-export function PivotTable({ result, onLoadQuery }: PivotTableProps) {
+export function PivotTable({ result, onLoadQuery, databaseType }: PivotTableProps) {
   const [rowField, setRowField] = useState<string | null>(null);
   const [colField, setColField] = useState<string | null>(null);
   const [valueField, setValueField] = useState<string | null>(null);
@@ -106,26 +110,36 @@ export function PivotTable({ result, onLoadQuery }: PivotTableProps) {
   // Generate SQL
   const generateSQL = useCallback(() => {
     if (!rowField) return "";
-    const select: string[] = [`"${rowField}"`];
-    const groupBy: string[] = [`"${rowField}"`];
+    // Every name here is arbitrary result data: a field is whatever the query
+    // aliased it to, and a pivot key is a value the rows carried. Both are quoted
+    // for the connected dialect rather than wrapped in a hard-coded `"` — that
+    // form is not even an identifier on MySQL, and a name holding the closing
+    // quote character would end the span and leave the rest to be parsed as SQL
+    // (#290, PR #304 review).
+    const dialect = databaseType as DatabaseType | undefined;
+    const quote = (name: string) => quoteIdentifier(name, dialect);
+    const select: string[] = [quote(rowField)];
+    const groupBy: string[] = [quote(rowField)];
 
     if (colField) {
       // Use CASE WHEN for pivot columns
       const colKeys = pivotData?.colKeys || [];
       for (const ck of colKeys) {
         if (ck === "__all__") continue;
-        const valExpr = valueField ? `"${valueField}"` : "1";
+        const valExpr = valueField ? quote(valueField) : "1";
+        // The same key is a VALUE on the left of the comparison and an IDENTIFIER
+        // as the column's alias, so it is quoted both ways in the same line.
         select.push(
-          `${AGG_LABELS[aggFunction]}(CASE WHEN "${colField}" = '${ck.replace(/'/g, "''")}' THEN ${valExpr} END) AS "${ck}"`,
+          `${AGG_LABELS[aggFunction]}(CASE WHEN ${quote(colField)} = ${quoteLiteral(ck, dialect)} THEN ${valExpr} END) AS ${quote(ck)}`,
         );
       }
     } else {
-      const valExpr = valueField ? `"${valueField}"` : "*";
-      select.push(`${AGG_LABELS[aggFunction]}(${valExpr}) AS "${aggFunction}_value"`);
+      const valExpr = valueField ? quote(valueField) : "*";
+      select.push(`${AGG_LABELS[aggFunction]}(${valExpr}) AS ${quote(`${aggFunction}_value`)}`);
     }
 
     return `SELECT\n  ${select.join(",\n  ")}\nFROM your_table\nGROUP BY ${groupBy.join(", ")}\nORDER BY ${groupBy.join(", ")};`;
-  }, [rowField, colField, valueField, aggFunction, pivotData]);
+  }, [rowField, colField, valueField, aggFunction, pivotData, databaseType]);
 
   if (!result || rows.length === 0) {
     return (
