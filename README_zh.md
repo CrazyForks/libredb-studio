@@ -75,8 +75,8 @@ PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Cou
 
 | 数据库 | 驱动 | 能力 |
 | :--- | :--- | :--- |
-| **PostgreSQL** | `pg` | 完整 SQL IDE、EXPLAIN 执行计划、事务、查询取消（`pg_cancel_backend`）、SSL/TLS、SSH 隧道 |
-| **MySQL** | `mysql2` | 完整 SQL IDE、EXPLAIN、事务、查询取消（`KILL QUERY`）、SSL/TLS、SSH 隧道 |
+| **PostgreSQL** | `pg` | 完整 SQL IDE、EXPLAIN 执行计划、事务、查询取消（`pg_cancel_backend`） |
+| **MySQL** | `mysql2` | 完整 SQL IDE、EXPLAIN、事务、查询取消（`KILL QUERY`） |
 | **Oracle** | `oracledb`（Thin 模式） | 完整 SQL IDE、`FETCH FIRST N ROWS` 分页、`V$` 监控视图、`ANALYZE TABLE`、`ALTER INDEX REBUILD`、事务 |
 | **SQL Server** | `mssql` (tedious) | 完整 SQL IDE、`TOP N` / `OFFSET FETCH` 分页、`sys.dm_*` DMV、`UPDATE STATISTICS`、`DBCC CHECKDB`、事务、自动识别 Azure SQL |
 | **SQLite** | `bun:sqlite` / `node:sqlite`（运行时自选） | 完整 SQL IDE，文件型或内存型数据库 |
@@ -85,6 +85,8 @@ PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Cou
 | **ClickHouse** | 无驱动，纯 HTTP（SQL 接口，8123 端口） | 完整 SQL IDE、JSON EXPLAIN 树、系统表 schema 自省、`OPTIMIZE TABLE` |
 | **Apache Druid** | 无驱动，纯 HTTP（`POST /druid/v2/sql`） | 只读 SQL IDE、原生查询 EXPLAIN 树、`INFORMATION_SCHEMA` 自省、`sys.*` 监控 |
 | **Redis** | `ioredis` | 命令编辑器、键浏览器、基于 INFO 的监控 |
+
+> **传输层安全是横向能力，不是逐引擎的。** SSH 隧道在 provider 建连之前就已建立，连接会被改写到本地端点，因此与具体引擎无关：只要连接配置了 host 和 port 就适用。改用连接串填写的连接（MongoDB、Couchbase、ClickHouse 支持这种方式）没有 host/port，因此不会走隧道；SQLite 同样两者都没有。SSL/TLS 面板目前在 PostgreSQL、MySQL、SQL Server、Couchbase、ClickHouse 和 Druid 上生效。Oracle、MongoDB 和 Redis 会忽略这个设置，所以这三个引擎是否加密，取决于连接串本身怎么写，而不是对话框里选了什么。
 
 > Redis 之所以能套进这套面向 SQL 的接口，靠的是一层约定。`getSchema()` 用非阻塞的 `SCAN`（**绝不用 `KEYS *`**）把键前缀归类成“表”，健康与指标来自 `INFO`，慢查询和会话来自 `SLOWLOG GET` / `CLIENT LIST`。
 
