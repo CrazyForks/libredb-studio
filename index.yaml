@@ -4,6 +4,65 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "Documented how to enforce rate limits at the ingress when running more than one replica: Studio's built-in limiter keeps its counters per process, so N replicas allow N times the configured budget"
+        - "Documented ALLOWED_ORIGINS, which a deployment needs when the ingress rewrites the Host header without setting x-forwarded-host - without it every state-changing request, including login, is refused with a 403"
+        - "Documented CSP_REPORT_ONLY, the runtime escape hatch for the enforced Content-Security-Policy, and how to set both variables through extraEnv"
+        - "No chart template changes - the rendered manifests are identical to 0.1.29"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.9.67
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.9.67
+    created: "2026-08-09T19:01:32.960279409Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: 5d831a506dbbd7d279b7b235831d5a18a56907935803f153d387ff5f229bacbf
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.30/libredb-studio-0.1.30.tgz
+    version: 0.1.30
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "Application updated to 0.9.67 - ClickHouse and Apache Druid are now supported databases, both spoken over their HTTP interfaces, so neither adds a driver dependency and the image size is unchanged"
         - "ClickHouse support covers the explorer, EXPLAIN plans, and the monitoring and maintenance surfaces the other providers expose; Apache Druid adds datasource browsing and plan reading over Druid SQL"
         - "Every SQL statement is now read with its own dialect's grammar, so statement boundaries, identifier quoting and row-limit injection stay correct on all ten engines"
@@ -1506,4 +1565,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-08-07T18:37:11.557326531Z"
+generated: "2026-08-09T19:01:32.953139972Z"
