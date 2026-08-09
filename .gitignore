@@ -166,5 +166,13 @@ docs/summaries/
 deploy/digitalocean/droplet/scripts/90-cleanup.sh
 deploy/digitalocean/droplet/scripts/99-img-check.sh
 
+# Local output if you add report/output flags to the security scanner commands
+# yourself - the copy-paste commands in CONTRIBUTING.md print to stdout and
+# write nothing by default. CI writes its reports to RUNNER_TEMP.
+/gitleaks-report.json
+/trivy-report.json
+/trivy-report.sarif
+/*.cdx.json
+
 
 

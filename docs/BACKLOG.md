@@ -532,3 +532,91 @@ to bound an attacker) is its own design problem this wave did not scope. Recorde
 this codebase has today, and it is still address-keyed. Done when a real, measured flood (not a
 hypothetical one) makes the keyed buckets' residual insufficient and a global ceiling's sizing can
 be grounded in that data rather than guessed.
+
+---
+
+## Security Phase 2 deferrals
+
+Each of these was decided during Phase 2, not overlooked. Delete an entry when
+the work lands. Lettered `C` (supply **C**hain) rather than `S`: the SQL
+statement-reading section above already owns `S1`-`S8`.
+
+### C1. No scan check is a required check
+
+Branch protection requires `Lint, Typecheck and Build` and `Unit & Integration
+Tests`. Phase 2 adds three scan jobs and promotes none of them, because promoting
+a check is a branch-protection change the repository owner makes, and because two
+of the three consult a vulnerability database that is rebuilt every six hours -
+making them required would import that schedule into the merge gate. **`Secret
+Scan` is the one candidate**: its verdict is a pure function of the scanned
+commit range and the pinned gitleaks digest, it needs no secrets so it works
+identically for fork pull requests, and it currently scans a pull request's
+commits in about 75 milliseconds. Done when the owner promotes it, or when this
+entry records why not.
+
+### C2. A failing scheduled scan notifies nobody but the owner
+
+`security-scan.yml`'s daily run fails when a critical fixable advisory lands, and
+GitHub emails the repository owner for a failed scheduled run. That is the whole
+notification path. `helm-index-check.yml` shows the alternative in this
+repository - a job with `issues: write` that maintains a single rolling issue -
+and it was not copied here because an auto-filed issue per advisory is how a
+security label becomes noise. Done when a real missed advisory shows the email is
+insufficient, at which point the rolling-issue pattern is the thing to copy.
+
+### C3. The image SBOM is a 30-day workflow artifact, not a durable asset
+
+It cannot be a release asset: `release-artifacts.yml` publishes the release
+before dispatching `docker-build-push.yml`, and immutable releases (#154) freeze
+the asset set at publish time. It is regenerable by anyone from an immutable
+public digest with one Trivy command, documented in `SECURITY.md`, so nothing is
+lost that cannot be recovered - what is missing is convenience and an attestation.
+The clean fix is a buildx SBOM attestation (`sbom: true` on
+`docker/build-push-action`), which attaches it to the image manifest where an
+image SBOM belongs. It was not taken in Phase 2 because it adds a step, and a
+failure mode, to the release-path Docker build - the most fragile CI surface in
+this repository. Done when the release chain has been quiet for a few releases and
+the change can be validated with a `workflow_dispatch` backfill first.
+
+### C4. No SBOM covers the operator image
+
+`operator-release.yml` builds a controller image that wraps the chart. Phase 2
+deliberately touched no release workflow other than `release-artifacts.yml`, and
+the operator image has a different lifecycle and a different consumer (OpenShift
+OperatorHub, which does its own scanning). Done when a certification requirement
+asks for one.
+
+### C5. Dependabot has alerts but no version-update configuration
+
+The repository has Dependabot alerts and secret scanning enabled, but there is no
+`.github/dependabot.yml`, so nothing opens a pull request for a bump. The
+dependency gate therefore reports advisories that a human has to act on by hand.
+Adding version updates is cheap and the reason it was not done here is scope, not
+disagreement - it also interacts with the 100 percent coverage gate and the
+required checks in ways worth thinking about once (a bot pull request must pass
+the same six gates). Done when `dependabot.yml` lands with a grouping strategy
+that does not produce one pull request per transitive package.
+
+### C6. `bun audit` cannot answer "is there a fix"
+
+It reports severity and vulnerable ranges and no fixed version, which is why
+Trivy owns the gate and `bun audit` is a job-summary second opinion. If bun adds
+fixed-version data, the container dependency in the local contributor workflow
+could be dropped entirely. Done when `bun audit --json` carries a fix field.
+
+### C7. The release SBOM does not describe the bundled Node.js runtime
+
+`packaging/linux/fetch-node.sh` and `packaging/windows/fetch-node.sh` download a
+pinned Node.js build and bundle it into every packaged artefact except the npm
+package itself - the standalone tarballs, the Windows zip, the `.deb` and `.rpm`
+packages, the snap, the AppImage and the desktop package. That runtime is the
+largest single binary in most of those artefacts, it is fetched by a shell
+script rather than resolved from a lockfile, and the CycloneDX SBOM Trivy
+generates from `bun.lock` never sees it - the document's only `node`-named
+component is `pkg:npm/@types/node`, a type-declarations package. `SECURITY.md`
+now says the SBOM covers "the dependency closure of" those artefacts rather than
+the artefacts themselves, which is the honest claim; this entry is the gap
+behind it. Done when the bundled runtime's version and provenance appear in the
+SBOM or a sibling document - a second Trivy pass over the `fetch-node.sh`
+scripts' pinned version, or a hand-maintained component entry, whichever ships
+without adding a new failure mode to the release chain.

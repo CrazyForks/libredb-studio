@@ -22,6 +22,13 @@ name: Release Artifacts
 # manifest in packaging/flatpak/ repacks the AppImage too, but only in
 # flatpak-smoke.yml now that the Flathub submission was declined - see that
 # directory's README.
+# The sbom job (security programme control 2.2) generates one CycloneDX
+# document from the repository's three lockfiles (bun.lock,
+# packaging/windows/launcher/go.mod, desktop/src-tauri/Cargo.lock) and
+# attaches it as libredb-studio-<version>.cdx.json. It covers the dependency
+# closure of every artifact this workflow builds; it does NOT cover the
+# container image, which docker-build-push.yml has not built yet at this
+# point in the chain - security-scan.yml generates that SBOM separately.
 #
 # DRAFT-FIRST FLOW (issue #154): the repository uses immutable releases, which
 # freeze a release's assets the moment it is published - post-publish uploads
@@ -479,6 +486,206 @@ jobs:
             commit -m "libredb-studio ${VERSION}"
           git -c http.extraheader="$AUTH_HEADER" push origin HEAD
 
+  sbom:
+    name: Generate and attach the SBOM
+    # Its own job rather than a step inside `publish`: the SBOM needs the
+    # dependency tree installed, because Trivy reads licences out of
+    # node_modules/*/package.json and emits a licence-free document without them
+    # (verified: 0 of 755 components carry a licence with node_modules absent,
+    # 330 of 755 with it present). `publish` deliberately does not install
+    # anything. Isolating it also means a reviewer can reject the SBOM without
+    # rejecting the artifact upload.
+    #
+    # One SBOM covers everything this release ships: Trivy finds bun.lock,
+    # packaging/windows/launcher/go.mod and desktop/src-tauri/Cargo.lock, which
+    # between them are the closure of the npm package, the four standalone
+    # tarballs, the win32 zip, the .deb and .rpm packages, the snap, the AppImage
+    # and the desktop .deb - all built from these lockfiles at this commit.
+    #
+    # The container image is NOT covered here and cannot be: this workflow
+    # publishes the release before dispatching docker-build-push.yml, so the
+    # image does not exist while the release can still receive assets, and
+    # immutable releases freeze the set at publish time. security-scan.yml
+    # generates the image SBOM daily instead, and SECURITY.md documents the
+    # one-command regeneration from the immutable digest.
+    needs: [guard, draft]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        uses: ./.github/actions/bun-install
+
+      - name: Check Docker Hub availability
+        # This job now sits on the release path: `publish-release` needs it.
+        # An anonymous pull of aquasec/trivy is subject to Docker Hub's
+        # per-address rate limit, and hosted runners share addresses - the
+        # same failure mode security-scan.yml documents for its own pulls.
+        # Optional: falls back to an anonymous pull when the repository has
+        # not configured Docker Hub credentials, same guard shape as
+        # docker-build-push.yml's own Docker Hub mirror step.
+        id: dockerhub
+        env:
+          DOCKER_HUB_TOKEN: ${{ secrets.DOCKER_HUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DOCKER_HUB_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DOCKER_HUB_TOKEN is not configured - pulling aquasec/trivy anonymously, subject to Docker Hub's per-address rate limit."
+          fi
+
+      - name: Log in to Docker Hub
+        if: steps.dockerhub.outputs.enabled == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ vars.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Generate the CycloneDX SBOM
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          # Trivy 0.73.0, pinned by digest. CycloneDX rather than SPDX: Trivy
+          # emits it natively for both a filesystem and an image, and it is what
+          # Dependency-Track and most procurement questionnaires consume.
+          #
+          # Not byte-reproducible across runs - the document carries a random
+          # serialNumber and a wall-clock timestamp - so it is generated exactly
+          # once, here, before the release is published. What is stable is the
+          # component set.
+          #
+          # Retried rather than run once: this is the most fragile CI surface
+          # in the repository (a failed release retries with a NEW patch
+          # version, never the same tag), so a transient Docker Hub rate limit
+          # or network blip must not be allowed to stall a release before
+          # publish.
+          #
+          # --user "$(id -u):$(id -g)": aquasec/trivy runs as root by default,
+          # so without this the bind-mounted output file lands on the host
+          # owned by root, mode 644. Reproduced 2026-08-09: the very next step
+          # patches this same file in place with Node's `fs.writeFileSync`,
+          # which for an EXISTING file opens it for write - permission this
+          # runner's own non-root user does not have on a root-owned file, so
+          # that step fails EACCES. This scanner needs no vulnerability-DB
+          # cache (`--scanners license` only), so running as the invoking user
+          # has no cache-ownership fallout to work around, unlike the
+          # `/root/.cache/trivy`-mounted scanners elsewhere in this
+          # repository, which stay root and are not touched by a host step
+          # afterward.
+          #
+          # Two other shapes were considered and rejected. `sudo chown` the
+          # file back after generation is reactive rather than preventing the
+          # wrong owner in the first place, and assumes passwordless sudo,
+          # which a self-hosted runner is not guaranteed to grant. Writing a
+          # sibling file and renaming over the original needs no privilege
+          # either (rename only needs write on the directory), but it moves
+          # the fix into the Node patch step where it looks like an
+          # unrelated stylistic choice - exactly the shape a future editor
+          # "simplifies" back into an in-place write without realising a
+          # permission fix depends on it. Fixing it here, on the line that
+          # creates the wrong owner, is the one shape where the fix and the
+          # defect it prevents stay next to each other.
+          attempt=0
+          until docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            -w /repo \
+            aquasec/trivy@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c fs \
+              --format cyclonedx \
+              --scanners license \
+              --skip-dirs .next \
+              --skip-dirs dist \
+              --skip-dirs coverage \
+              --skip-dirs sbom \
+              --output "/repo/sbom/libredb-studio-${VERSION}.cdx.json" \
+              .
+          do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::Failed to pull or run aquasec/trivy after 3 attempts." >&2
+              exit 1
+            fi
+            echo "Trivy pull/run failed (attempt $attempt/3) - retrying in 10s..."
+            sleep 10
+          done
+          ls -la sbom
+
+      - name: Name and version the SBOM's root component
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Trivy names the root component after its scan target - "." for a
+          # filesystem scan of the repository root - and leaves its version
+          # empty; neither is a flag `trivy fs` has. Leaving version unset
+          # matters beyond cosmetics: a CycloneDX consumer such as
+          # Dependency-Track keys a project by name+version, so successive
+          # releases' unpatched SBOMs would all collapse into one
+          # unversioned "libredb-studio" project, each overwriting the last.
+          node -e '
+            const fs = require("fs");
+            const file = process.argv[1];
+            const version = process.argv[2];
+            const doc = JSON.parse(fs.readFileSync(file, "utf8"));
+            if (doc.metadata && doc.metadata.component) {
+              doc.metadata.component.name = "libredb-studio";
+              doc.metadata.component.version = version;
+            }
+            fs.writeFileSync(file, JSON.stringify(doc, null, 2));
+          ' "sbom/libredb-studio-${VERSION}.cdx.json" "$VERSION"
+
+      - name: Verify the SBOM describes something
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A malformed or empty document uploads exactly as happily as a good
+          # one, and immutable releases mean the bad one is permanent. Assert the
+          # three properties that make it useful before it becomes unamendable:
+          # it parses, it is CycloneDX, and it found all three lockfiles.
+          node -e '
+            const fs = require("fs");
+            const file = process.argv[1];
+            const doc = JSON.parse(fs.readFileSync(file, "utf8"));
+            if (doc.bomFormat !== "CycloneDX") throw new Error("not a CycloneDX document");
+            const components = doc.components || [];
+            if (components.length < 100) throw new Error("only " + components.length + " components");
+            const apps = components.filter((c) => c.type === "application").map((c) => c.name);
+            for (const lock of ["bun.lock", "packaging/windows/launcher/go.mod", "desktop/src-tauri/Cargo.lock"]) {
+              if (!apps.includes(lock)) throw new Error("missing ecosystem: " + lock);
+            }
+            const licensed = components.filter((c) => (c.licenses || []).length > 0).length;
+            if (licensed === 0) throw new Error("no licence data - were dependencies installed?");
+            console.log("SBOM ok: " + components.length + " components, " + licensed + " with licences");
+          ' "sbom/libredb-studio-${VERSION}.cdx.json"
+
+      - name: Attest the SBOM
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: sbom/libredb-studio-*.cdx.json
+
+      - name: Upload the SBOM to the draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.guard.outputs.version }}
+        run: |
+          gh release upload "$TAG" sbom/libredb-studio-*.cdx.json \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
   linux-packages:
     name: Build .deb and .rpm (${{ matrix.arch }})
     # Turns the linux standalone tarballs into native packages (issue #112):
@@ -872,10 +1079,12 @@ jobs:
     # asset set on the draft, then flip it to published. Publishing is the
     # point of no return under immutable releases - after it, the asset set
     # can never be amended - so the verification runs strictly before it.
-    # `release: published` fires here, triggering npm-publish and
-    # docker-build-push exactly as before.
+    # `release: published` does fire here, but this runs under GITHUB_TOKEN and
+    # events it creates trigger no other workflow (the 0.9.46 incident) -
+    # npm-publish and docker-build-push are chained explicitly by the
+    # dispatch-downstream job below instead.
     name: Verify assets and publish release
-    needs: [guard, publish, linux-packages, desktop-appimage, snap]
+    needs: [guard, publish, sbom, linux-packages, desktop-appimage, snap]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -915,7 +1124,8 @@ jobs:
             "libredb-studio-desktop_${TAG}_amd64.deb" \
             "libredb-studio-desktop_${TAG}_amd64.deb.sha256" \
             "libredb-studio-desktop_${TAG}_arm64.deb" \
-            "libredb-studio-desktop_${TAG}_arm64.deb.sha256"; do
+            "libredb-studio-desktop_${TAG}_arm64.deb.sha256" \
+            "libredb-studio-${TAG}.cdx.json"; do
             if ! grep -Fqx "$asset" /tmp/assets.txt; then
               echo "::error::draft release '$TAG' is missing required asset '$asset' - refusing to publish an incomplete immutable release"
               missing=1

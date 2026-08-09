@@ -1,0 +1,564 @@
+name: Security Scan
+
+# Supply-chain scanning (security programme controls 2.1 and 2.2). Deliberately
+# NOT part of ci.yml: the dependency and image jobs depend on a vulnerability
+# database that is rebuilt every six hours, so their verdict can change with no
+# commit, and the repository's required checks must stay a function of the code
+# under review. Same reasoning that keeps SonarCloud out of the required set.
+#
+# WHICH SCANS CAN FAIL, AND WHICH ONLY REPORT
+#
+# "Fails" below means the job goes red, not that it blocks a merge: none of
+# these three is a required status check in branch protection today (see the
+# note after the list), so a failed job here is visible on the pull request
+# but does not by itself stop a maintainer from clicking merge.
+#
+#   secret-scan       fails. Its verdict is a pure function of the scanned commit
+#                     range and the pinned gitleaks digest - no feed can turn it
+#                     red overnight - and a secret in a diff is unambiguous and
+#                     fixable by the author. The range is resolved with `git
+#                     rev-list --count` under `set -e` before gitleaks ever
+#                     runs, and the scanned count is asserted non-zero on a
+#                     pull request, because gitleaks itself logs an
+#                     unresolvable range at ERROR and still exits 0.
+#   dependency-scan   reports on a pull request (job summary only) and gates on
+#                     main, the daily schedule and manual runs. An advisory
+#                     published overnight must not turn a contributor's unrelated
+#                     pull request red; the maintainer still learns within a day,
+#                     which is what control 2.1 asks for. GitHub emails the owner
+#                     when a scheduled run fails, so a red cron is not silent.
+#   image-scan        never fails. Measured 2026-08-09 against
+#                     node:24.16.0-trixie-slim: 4 critical and 18 high Debian
+#                     CVEs, and 167 of 168 findings have no fixed package. A gate
+#                     over that is a permanent red with nothing to do about it -
+#                     which is how a gate becomes a continue-on-error line.
+#
+# None of these is a required check today. If one is ever promoted, secret-scan
+# is the only candidate, for the determinism reason above.
+#
+# Scanners run as containers pinned by DIGEST rather than as third-party actions:
+# a supply-chain workflow should not add a third-party action to its own trust
+# chain, and a digest freezes the rule set together with the binary.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+  schedule:
+    # 03:37 UTC daily, clear of the other crons in this repository (05:23 daily,
+    # 06:00 and 06:41 Monday, 06:20 Friday). Daily, not weekly: the point of
+    # control 2.1 is to learn about a driver CVE before users do.
+    - cron: "37 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  # Keyed by ref AND by event: `push` to main and the daily `schedule` share the
+  # same github.ref (refs/heads/main), so keying by ref alone let a push cancel
+  # that day's only image scan mid-run - image-scan does not run on push at all,
+  # so the scan simply never happened - and a cancelled run sends no failed-run
+  # email, the only notification path BACKLOG C2 names. pull_request events
+  # already have distinct refs, so this changes nothing for them.
+  group: security-scan-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # gitleaks v8.30.1.
+  GITLEAKS_IMAGE: zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  # Trivy 0.73.0.
+  TRIVY_IMAGE: aquasec/trivy@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c
+
+jobs:
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # The scan reads git history, so the default single-commit checkout
+          # would make every range empty - and an empty range passes. The whole
+          # history is 753 commits / 14.5 MB and scans in about 1.1 seconds, so
+          # there is nothing here worth optimising.
+          fetch-depth: 0
+
+      - name: Resolve the commit range to scan
+        id: range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # Only the commits this pull request adds. `git log` already
+            # shows no diff at all for a merge commit by default - unrelated
+            # history is never re-presented, `--no-merges` was never needed
+            # for that - but a plain merge commit hides whatever its
+            # resolution introduced from BOTH parents, so a secret added only
+            # while resolving a conflict would never reach the scanner.
+            # `--diff-merges=first-parent` shows a merge commit's diff against
+            # the branch it was merged into, which is exactly the new content
+            # this pull request is adding, without the flood a full
+            # non-first-parent diff of the other side would produce. Verified
+            # 2026-08-09: a secret introduced only in a conflict resolution is
+            # invisible under `--no-merges` and reported under
+            # `--diff-merges=first-parent`, and a linear (no-merge) range
+            # scans identically either way.
+            #
+            # `range` is the ONE definition of what gets scanned. log_opts and
+            # commit_count are both derived from this single variable rather
+            # than each reconstructing "$BASE_SHA..$HEAD_SHA" separately - two
+            # independent constructions of the same range can diverge (a
+            # sabotage that flips the direction in log_opts alone would leave
+            # commit_count correct and non-zero while the scanner below reads
+            # the reversed, typically empty, direction and reports clean). One
+            # source cannot diverge from itself.
+            range="--diff-merges=first-parent $BASE_SHA..$HEAD_SHA"
+            echo "log_opts=$range" >> "$GITHUB_OUTPUT"
+            # `git rev-list --count` resolves that SAME range, under the same
+            # `set -e`. An unresolvable range - an unreachable base.sha after a
+            # force-push racing this run, a shallow checkout, `.git` as a file
+            # rather than a directory (the worktree case) - fails this step
+            # immediately instead of reaching the scanner below. Measured on
+            # the pinned digest: that scanner logs the same failure at ERROR
+            # ("fatal: Invalid revision range") and still exits 0, reporting
+            # "0 commits scanned" as "no leaks found". A verdict from zero
+            # scanned bytes must never look like a verdict from a clean scan.
+            count=$(git rev-list --count $range)
+            echo "commit_count=$count" >> "$GITHUB_OUTPUT"
+          else
+            # On main, the cron and a manual run: the whole history, so there
+            # is no equivalent base..head range to resolve or miscount - `--all`
+            # cannot hit the unresolvable-range failure this step guards
+            # against, which is why there is no commit_count, and no
+            # "Assert the scan covered commits" check, for these events. A
+            # decision, not an oversight.
+            #
+            # `--all` still has a failure mode the range branch above does
+            # not: a shallow checkout. `fetch-depth: 0` above makes one
+            # unlikely today, but nothing here re-derives that guarantee, and
+            # a shallow `--all` does not fail - it scans however many commits
+            # the shallow boundary left reachable and reports "no leaks
+            # found" over that truncated slice, which looks identical to a
+            # real clean scan of the full 753+ commits. `git rev-parse
+            # --is-shallow-repository` is the direct check for exactly that,
+            # so it is asserted here rather than trusted.
+            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+              echo "::error::This checkout is shallow, so --all would scan a truncated slice of history and could report a false clean. Checkout must use fetch-depth: 0." >&2
+              exit 1
+            fi
+            echo "log_opts=--all" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan for committed secrets
+        env:
+          LOG_OPTS: ${{ steps.range.outputs.log_opts }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$RUNNER_TEMP/gitleaks:/out" \
+            -w /repo \
+            "$GITLEAKS_IMAGE" git \
+              --no-banner \
+              --redact \
+              --config /repo/.gitleaks.toml \
+              --log-opts="$LOG_OPTS" \
+              --report-format json \
+              --report-path /out/gitleaks.json
+
+      - name: Assert the scan covered commits
+        # The range step above already validated the range resolves; this
+        # asserts it also resolved to something. Only on pull_request: `--all`
+        # has no single count worth asserting, and main/the cron/dispatch are
+        # not the racing-synchronize case this exists for.
+        if: github.event_name == 'pull_request'
+        env:
+          COMMIT_COUNT: ${{ steps.range.outputs.commit_count }}
+        run: |
+          set -euo pipefail
+          if [ "$COMMIT_COUNT" -eq 0 ]; then
+            echo "::error::The resolved commit range scanned 0 commits. A pull request always adds at least one commit, so an empty range here means gitleaks verified nothing while still reporting a pass - investigate before trusting this check." >&2
+            exit 1
+          fi
+          echo "Scanned $COMMIT_COUNT commit(s)."
+
+      - name: Report the findings
+        if: failure()
+        run: |
+          set -uo pipefail
+          report="$RUNNER_TEMP/gitleaks/gitleaks.json"
+          {
+            echo "## Committed secrets found"
+            echo
+            if [ -s "$report" ]; then
+              echo "| Rule | File | Line | Commit | Fingerprint |"
+              echo "| --- | --- | --- | --- | --- |"
+              jq -r '.[] | "| \(.RuleID) | \(.File) | \(.StartLine) | \(.Commit[0:8]) | \(.Fingerprint) |"' "$report"
+            else
+              echo "The scanner failed before producing a report - read the step log."
+            fi
+            echo
+            echo "**A hit is an incident, not a lint failure.** Rotate the credential first, then"
+            echo "remove it from the working tree. Do not rewrite history: forks and every"
+            echo "distribution channel already carry the old objects, so rotation is the only"
+            echo "remedy that works."
+            echo
+            echo "If the match is fabricated - a fixture, a placeholder, documented example copy -"
+            echo "copy the Fingerprint column above (commit:file:rule:startline) into"
+            echo "\`.gitleaksignore\` with a comment explaining why. That suppresses exactly this"
+            echo "finding; a real secret added later, even the same literal in a new commit,"
+            echo "is still reported. \`.gitleaks.toml\`'s \`[[allowlists]]\` is for a whole rule"
+            echo "being unconditionally noisy, not a single fixture; one without \`targetRules\`"
+            echo "is rejected by \`tests/unit/gitleaks-config.test.ts\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dependency-scan:
+    name: Dependency Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # For the SARIF upload. A fork pull request's token is read-only and does
+      # not get this, which is why the upload step below carries a guard: the
+      # findings reach a fork contributor through the job summary instead. Same
+      # constraint that keeps SonarCloud out of the required check set.
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        uses: ./.github/actions/bun-install
+
+      - name: Compute the database cache day
+        id: day
+        run: echo "value=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Trivy vulnerability database
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          # Rotated daily: upstream rebuilds every six hours, and a stale cache
+          # would report yesterday's verdict as today's. restore-keys still warms
+          # from the previous day so the repeated same-day runs on a busy pull
+          # request do not re-download.
+          key: trivy-db-${{ steps.day.outputs.value }}
+          restore-keys: trivy-db-
+
+      - name: Scan the lockfiles
+        env:
+          # Not a GHCR rate-limit workaround, despite what this comment used to
+          # claim: Trivy 0.73's default vulnerability-DB source is
+          # mirror.gcr.io, confirmed against this branch's own run logs, and
+          # that mirror is anonymous and needs no credential at all. These
+          # credentials are harmless to keep - GITHUB_TOKEN costs nothing and
+          # is available on fork pull requests too - but they are not what
+          # makes the DB download succeed.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy-cache" "$RUNNER_TEMP/trivy-out"
+          # No severity filter and nothing that can fail the job: this run only
+          # reports. Trivy finds three lockfiles here - bun.lock,
+          # packaging/windows/launcher/go.mod and desktop/src-tauri/Cargo.lock -
+          # so one scan covers the npm closure, the Windows launcher and the
+          # desktop shell.
+          docker run --rm \
+            -e TRIVY_USERNAME -e TRIVY_PASSWORD \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            -v "$RUNNER_TEMP/trivy-out:/out" \
+            -w /repo \
+            "$TRIVY_IMAGE" fs \
+              --scanners vuln \
+              --ignorefile /repo/.trivyignore.yaml \
+              --skip-dirs node_modules \
+              --skip-dirs .next \
+              --skip-dirs dist \
+              --skip-dirs coverage \
+              --format json \
+              --output /out/deps.json \
+              .
+
+      - name: Render the report
+        run: |
+          set -euo pipefail
+          # Both renderings come from the ONE scan above, so the summary a human
+          # reads and the SARIF the Security tab ingests can never disagree.
+          docker run --rm \
+            -v "$RUNNER_TEMP/trivy-out:/out" \
+            "$TRIVY_IMAGE" convert --format table --output /out/deps.txt /out/deps.json
+          docker run --rm \
+            -v "$RUNNER_TEMP/trivy-out:/out" \
+            "$TRIVY_IMAGE" convert --format sarif --output /out/deps.sarif /out/deps.json
+
+      - name: Publish the findings to the job summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## Dependency findings"
+            echo
+            echo "Source: \`bun.lock\`, \`packaging/windows/launcher/go.mod\`, \`desktop/src-tauri/Cargo.lock\`."
+            echo "Suppressions: \`.trivyignore.yaml\`."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/trivy-out/deps.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the findings to the security tab
+        # A fork pull request's token cannot write security events. Same guard
+        # shape as ci.yml's SonarCloud job, for the same reason.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-out/deps.sarif
+          # Without a category this run would overwrite CodeQL's own results for
+          # the same ref.
+          category: trivy-dependencies
+
+      - name: Second opinion from bun audit
+        # npm's own advisory feed, refreshed continuously rather than on
+        # trivy-db's six-hour rebuild, so it occasionally sees an advisory a few
+        # hours earlier. It reports no fixed-version data at all, so there is
+        # nothing here to gate on - and `|| true` because it exits 1 whenever it
+        # finds anything, which today is 85 findings. It is also the one command
+        # a contributor can run locally with no container.
+        run: |
+          set -uo pipefail
+          bun audit > "$RUNNER_TEMP/bun-audit.txt" 2>&1 || true
+          {
+            echo "## bun audit"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/bun-audit.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Gate: critical, fixable, unsuppressed"
+        # Not on a pull request: an advisory published overnight must not turn a
+        # contributor's unrelated change red. On main, the daily cron and a manual
+        # run it fails, and GitHub emails the repository owner when a scheduled
+        # run fails - which is how "learn before users do" reaches a human.
+        #
+        # A second `fs` run rather than a convert of the report above: verified
+        # 2026-08-09 that `trivy convert` does NOT honour --ignore-unfixed, so a
+        # convert-based gate would fail on findings nobody can fix. The
+        # database is already in the cache, so this costs seconds.
+        if: github.event_name != 'pull_request'
+        id: gate
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e TRIVY_USERNAME -e TRIVY_PASSWORD \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            -w /repo \
+            "$TRIVY_IMAGE" fs \
+              --scanners vuln \
+              --severity CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              --ignorefile /repo/.trivyignore.yaml \
+              --skip-dirs node_modules \
+              --skip-dirs .next \
+              --skip-dirs dist \
+              --skip-dirs coverage \
+              .
+
+      - name: Explain a failed gate
+        # Conditioned on the gate step's own outcome, not a bare failure() -
+        # which fires for ANY earlier failure in the job, including a Trivy DB
+        # download timeout or a `bun install` flake. Telling a contributor
+        # whose run died on a transient flake that a CRITICAL advisory is
+        # present and sending them to edit .trivyignore.yaml lands on the
+        # audience least able to diagnose it.
+        #
+        # `failure()` is required here, not implied: an `if:` with no status
+        # function gets `success() &&` prepended by GitHub Actions, and
+        # success() is already false once the gate step above has failed -
+        # `steps.gate.outcome == 'failure'` alone would never fire, on the one
+        # path where this explainer is the whole point.
+        if: failure() && steps.gate.outcome == 'failure'
+        run: |
+          {
+            echo "## The dependency gate failed"
+            echo
+            echo "A CRITICAL advisory with a fixed version is present in a lockfile and is not suppressed."
+            echo
+            echo "1. Take the fix. \`bun update <package>\` for a compatible bump, or bump the"
+            echo "   direct dependency that pins it. Commit \`bun.lock\`."
+            echo "2. If the fix cannot be taken yet, add an entry to \`.trivyignore.yaml\` with an"
+            echo "   \`expired_at\` no more than 90 days out and a \`statement\` that names the"
+            echo "   reachability argument or the blocking dependency. Trivy re-reports an expired"
+            echo "   entry, so the argument has to be made again rather than inherited."
+            echo "   \`tests/unit/trivyignore-policy.test.ts\` enforces both mechanically."
+            echo "3. Do not add \`continue-on-error\` to this step. If the threshold is wrong,"
+            echo "   change the threshold in review."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  image-scan:
+    name: Image Scan
+    # Not on a pull request: a pull request has no image of its own, and scanning
+    # the released :latest from a pull request would report findings that have
+    # nothing to do with the change under review. Not on a main push either: that
+    # push is racing docker-build-push.yml's own build for the same commit. The
+    # daily cron asks the only question worth asking here - what is in the image
+    # users are running right now.
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Pull the published image from GHCR.
+      packages: read
+      security-events: write
+    steps:
+      - name: Compute the database cache day
+        id: day
+        run: echo "value=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Trivy vulnerability database
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: trivy-db-${{ steps.day.outputs.value }}
+          restore-keys: trivy-db-
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve :latest to one digest
+        id: image
+        run: |
+          set -euo pipefail
+          # The vuln scan and the SBOM below are two separate `docker run`
+          # invocations several minutes apart. Resolving `:latest` in each
+          # independently means a release that retags `:latest` mid-run makes
+          # them describe two different images with no shared identity - the
+          # exact failure mode a digest-pinned reference exists to rule out
+          # everywhere else in this workflow. Resolved once, here, and every
+          # step below scans image_ref, never the bare tag.
+          digest=$(docker buildx imagetools inspect ghcr.io/libredb/libredb-studio:latest --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image_ref=ghcr.io/libredb/libredb-studio@$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Scan the published image
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ steps.image.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy-cache" "$RUNNER_TEMP/trivy-out"
+          # No severity filter and no exit code. This job's entire job is to make
+          # the OS layer visible: measured 2026-08-09, the runtime base image
+          # carries 4 critical and 18 high Debian CVEs of which 167 of 168
+          # findings have no fixed package available. There is nothing to gate on
+          # and pretending otherwise ends with the workflow disabled.
+          #
+          # ~/.docker/config.json carries the GHCR credentials from the login
+          # step, which is what lets Trivy resolve the image inside the container.
+          docker run --rm \
+            -e TRIVY_USERNAME -e TRIVY_PASSWORD \
+            -v "$HOME/.docker/config.json:/root/.docker/config.json:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            -v "$RUNNER_TEMP/trivy-out:/out" \
+            "$TRIVY_IMAGE" image \
+              --scanners vuln \
+              --format json \
+              --output /out/image.json \
+              "$IMAGE_REF"
+
+      - name: Render the report
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$RUNNER_TEMP/trivy-out:/out" \
+            "$TRIVY_IMAGE" convert --format table --severity CRITICAL,HIGH --output /out/image.txt /out/image.json
+          docker run --rm \
+            -v "$RUNNER_TEMP/trivy-out:/out" \
+            "$TRIVY_IMAGE" convert --format sarif --output /out/image.sarif /out/image.json
+
+      - name: Generate the image SBOM
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          # Not a release asset, and it cannot be one: release-artifacts.yml
+          # publishes the release BEFORE dispatching docker-build-push.yml, and
+          # immutable releases (#154) freeze the asset set at publish time. The
+          # source SBOM on the release covers the application closure; this one
+          # adds the Debian layer, and anyone can regenerate it from the immutable
+          # digest at any time with the command documented in SECURITY.md.
+          #
+          # Same $IMAGE_REF the vuln scan above used, not a second `:latest`
+          # resolved independently - a release retagging `:latest` between the
+          # two `docker run` invocations would otherwise make the report and
+          # this SBOM describe two different images with no shared identity.
+          docker run --rm \
+            -v "$HOME/.docker/config.json:/root/.docker/config.json:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            -v "$RUNNER_TEMP/trivy-out:/out" \
+            "$TRIVY_IMAGE" image \
+              --format cyclonedx \
+              --scanners license \
+              --output /out/image.cdx.json \
+              "$IMAGE_REF"
+
+      - name: Publish the findings to the job summary
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Published image: $IMAGE_REF"
+            echo
+            echo "Resolved from \`ghcr.io/libredb/libredb-studio:latest\` once, at the start of"
+            echo "this run, so the vulnerability report and the SBOM above describe the same"
+            echo "bytes even if a release retags \`:latest\` while this job is running."
+            echo
+            echo "Critical and high findings only. Most carry no fixed package - Debian's"
+            echo "security team has not shipped one - which is why this job reports and never"
+            echo "gates. The actionable subset is the one with a Fixed Version column entry:"
+            echo "that is a base-image bump in \`Dockerfile\`."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/trivy-out/image.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the findings to the security tab
+        uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-out/image.sarif
+          category: trivy-image
+
+      - name: Upload the image SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-sbom
+          path: ${{ runner.temp }}/trivy-out/image.cdx.json
+          if-no-files-found: error
+          retention-days: 30

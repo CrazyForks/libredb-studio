@@ -133,6 +133,58 @@ bun start      # Start production server
 bun lint       # Run ESLint
 ```
 
+### Security Scanning
+
+Two checks run against every pull request. Both are reproducible locally, and
+reproducing them is faster than waiting for CI.
+
+**Committed secrets.** This one can fail your pull request. It scans only the
+commits your branch adds:
+
+```bash
+docker run --rm -v "$PWD:/repo:ro" -w /repo \
+  zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+  git --no-banner --redact --config /repo/.gitleaks.toml \
+      --log-opts="--diff-merges=first-parent origin/main..HEAD"
+```
+
+If it reports a real credential, rotate it first — the value is already in every
+clone. If it reports a fixture or placeholder, copy the finding's own
+`Fingerprint` (`commit:file:rule:startline`, printed in the JSON report the
+command above can produce with `--report-format json`) into `.gitleaksignore`
+with a comment explaining why; that suppresses exactly this one finding, so a
+real secret added later — even the same fabricated literal, in a new commit —
+is still reported. `.gitleaks.toml`'s `[[allowlists]]` is for the narrower case
+of a whole rule being unconditionally noisy for a reviewable reason, not for a
+single fixture; an allowlist that names no `targetRules` is rejected by
+`tests/unit/gitleaks-config.test.ts`, because it would exempt that path from
+every rule the scanner has.
+
+**Vulnerable dependencies.** This one reports on pull requests and never fails
+them. The quickest local view needs no container:
+
+```bash
+bun audit
+```
+
+`bun audit` reports every severity and does not tell you whether a fix exists, so
+expect a long list; it is a starting point, not a verdict. The scan CI actually
+runs covers the npm, Rust and Go ecosystems together (`bun.lock`,
+`desktop/src-tauri/Cargo.lock`, the launcher's `go.mod`) and includes the
+fixed-version column `bun audit` lacks:
+
+```bash
+docker run --rm -v "$PWD:/repo:ro" -w /repo \
+  aquasec/trivy@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c \
+  fs --scanners vuln --ignorefile /repo/.trivyignore.yaml \
+     --skip-dirs node_modules --skip-dirs .next --skip-dirs dist --skip-dirs coverage .
+```
+
+Only a CRITICAL finding with an available fix gates anything, and only outside
+pull requests. If you hit one, take the fix and commit `bun.lock`. Suppressing it
+in `.trivyignore.yaml` is the last resort and requires a justification and an
+expiry date.
+
 ## Coding Guidelines
 
 ### TypeScript
