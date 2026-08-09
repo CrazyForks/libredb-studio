@@ -58,6 +58,12 @@ mock.module("@/lib/auth", () => ({
 // ─── Mock @/lib/audit BEFORE importing the route ────────────────────────────
 mock.module("@/lib/audit", () => ({
   getServerAuditBuffer: mock(() => mockBuffer),
+  // The POST handler calls sanitizeAuditInput directly and pushes the result to the buffer
+  // itself — deliberately NOT emitAuditEvent, which would also grant this route stdout emission
+  // (see the route's own comment for why). This mock is an identity passthrough: the real
+  // sanitizer's behavior is covered end-to-end by tests/security/audit-redaction.test.ts, so this
+  // file only needs to assert that the route wires the buffer correctly.
+  sanitizeAuditInput: mock((event: Record<string, unknown>) => event),
   AuditRingBuffer: class {},
   loadAuditFromStorage: mock(() => []),
   saveAuditToStorage: mock(() => {}),

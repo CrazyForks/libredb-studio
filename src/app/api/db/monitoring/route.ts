@@ -3,13 +3,19 @@ import { getOrCreateProvider } from "@/lib/db";
 import type { MonitoringOptions } from "@/lib/db/types";
 import { createErrorResponse } from "@/lib/api/errors";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
-import { getSession } from "@/lib/auth";
+import { guardRoute } from "@/lib/api/require-session";
 
 /**
  * POST /api/db/monitoring
  * Get comprehensive monitoring data for a database connection
  */
 export async function POST(req: NextRequest) {
+  // Moved ahead of body parsing, matching every other provider-reaching route: an unauthenticated
+  // or rate-limited caller no longer gets a body parsed on its behalf, and gets the promised
+  // denial audit instead of a 400 that never reached the guard.
+  const guard = await guardRoute({ route: "POST /api/db/monitoring", bucket: "query", request: req });
+  if ("response" in guard) return guard.response;
+
   try {
     // Handle empty or aborted requests
     let body;
@@ -23,12 +29,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Invalid JSON in request body" }, { status: 400 });
     }
 
-    const session = await getSession();
-    if (!session) {
-      return NextResponse.json({ error: "Authentication required" }, { status: 401 });
-    }
-
-    const connection = await resolveConnection(body, session);
+    const connection = await resolveConnection(body, guard.session);
     const { options } = body as { options?: MonitoringOptions };
 
     if (!connection.type) {

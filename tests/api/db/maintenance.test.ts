@@ -1,6 +1,7 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 import { createMockProvider } from "../../helpers/mock-provider";
+import { clearRateLimitState } from "@/lib/api/rate-limit";
 import {
   QueryError,
   DatabaseError,
@@ -28,7 +29,7 @@ const mockGetSession = mock(
 );
 
 // ─── Mock audit buffer ──────────────────────────────────────────────────────
-const mockAuditPush = mock(() => ({
+const mockAuditPush = mock((_event?: unknown) => ({
   id: "1",
   timestamp: new Date().toISOString(),
   type: "maintenance",
@@ -70,6 +71,10 @@ mock.module("@/lib/seed/resolve-connection", () => {
 
 mock.module("@/lib/audit", () => ({
   getServerAuditBuffer: () => ({ push: mockAuditPush }),
+  // The route calls emitAuditEvent (the sanitizing boundary), not buffer.push, directly. This
+  // delegates to the same push mock the test suite already exercises, so no assertion elsewhere
+  // needs to change target.
+  emitAuditEvent: (event: Record<string, unknown>) => mockAuditPush(event as never),
   AuditRingBuffer: class {},
   loadAuditFromStorage: () => [],
   saveAuditToStorage: () => {},
@@ -113,6 +118,7 @@ const validConnection = {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 describe("POST /api/db/maintenance", () => {
   beforeEach(() => {
+    clearRateLimitState();
     mockGetSession.mockClear();
     mockGetOrCreateProvider.mockClear();
     mockAuditPush.mockClear();
@@ -157,6 +163,28 @@ describe("POST /api/db/maintenance", () => {
     expect(data.message).toBe("OK");
   });
 
+  // Threat: runMaintenance() has already completed by the time emitAuditEvent runs (see the route's
+  // own comment). Before this fix, a broken audit sink shared the operation's try/catch, so a
+  // throw here would 500 a client that must not be told to retry an operation - possibly a
+  // destructive one, like "kill" - that already succeeded.
+  test("a broken audit sink does not turn a completed maintenance operation into a 500", async () => {
+    mockAuditPush.mockImplementationOnce(() => {
+      throw new Error("audit sink unavailable");
+    });
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ success: boolean; executionTime: number; message: string }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.success).toBe(true);
+    expect(data.message).toBe("OK");
+  });
+
   test("non-admin user returns 403", async () => {
     mockGetSession.mockImplementation(
       async (): Promise<{ role: string; username: string } | null> => ({ role: "user", username: "user" }),
@@ -174,7 +202,10 @@ describe("POST /api/db/maintenance", () => {
     expect(data.error).toContain("Unauthorized");
   });
 
-  test("no session returns 403", async () => {
+  // Guarded by guardRoute now: an unauthenticated caller is rejected at the session check,
+  // before the route's own admin-role check ever runs, so this is 401 ("not authenticated"),
+  // distinct from "non-admin user returns 403" above ("authenticated but forbidden").
+  test("no session returns 401", async () => {
     mockGetSession.mockImplementation(async () => null);
 
     const req = createMockRequest("/api/db/maintenance", {
@@ -185,8 +216,8 @@ describe("POST /api/db/maintenance", () => {
     const res = await POST(req as never);
     const data = await parseResponseJSON<{ error: string }>(res);
 
-    expect(res.status).toBe(403);
-    expect(data.error).toContain("Unauthorized");
+    expect(res.status).toBe(401);
+    expect(data.error).toContain("Authentication required");
   });
 
   test("missing connection returns 400", async () => {

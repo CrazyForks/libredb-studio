@@ -105,7 +105,41 @@ When using LibreDB Studio, please follow these security best practices:
   rather than knows — the table name behind an inline cell edit, read from a tab title or guessed
   from the query text — is validated as a bare identifier instead, and the edit is refused when it
   is not, because a guess cannot be safely quoted
-- Rate limiting should be implemented at the infrastructure level
+- Login attempts, the AI endpoints and every database-reaching route (query execution, schema
+  browsing, maintenance operations, and the admin fleet-health check) are rate limited in the
+  application. The counters live in the application process, so with more than one replica the
+  limits apply per replica; multi-replica deployments should enforce the same budgets at the
+  ingress as well (see `charts/libredb-studio/README.md`). The budgets are configurable through the
+  `RATE_LIMIT_*` environment variables documented in `.env.example`
+- Every state-changing request (`POST`, `PUT`, `PATCH`, `DELETE`) must carry an `Origin` (or
+  `Referer`) whose host matches the deployment's own host, as a second layer behind the
+  `SameSite=Lax` session cookie — except a request whose `Content-Type` is exactly
+  `application/json` and carries neither header at all, the one shape a cross-site browser cannot
+  forge; see `docs/API_DOCS.md`'s "CSRF: Origin Check" section for the full carve-out and why it is
+  safe. A non-browser client that does NOT send that content type (a webhook sender, for instance)
+  must send `Origin: <your public origin>` instead — that requirement is on clients which skip the
+  JSON carve-out, not on every non-browser client unconditionally. Deployments behind a reverse
+  proxy that rewrites `Host` set `ALLOWED_ORIGINS`
+- Every response that passes through the app's request middleware carries `Content-Security-Policy`,
+  `Strict-Transport-Security`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` and
+  `Permissions-Policy` (static assets and the storage-config bootstrap path are excluded from the
+  middleware and carry none of these — see `docs/BACKLOG.md`). `/api/db/health` is NOT excluded:
+  its `POST` handler is a session-gated, provider-reaching route like any other, so it goes through
+  the same Origin check and carries the same headers; `GET /api/db/health` is unaffected because
+  the Origin check exempts GET by method and the load-balancer/probe path stays a public route. The
+  CSP permits inline scripts, because the application is statically prerendered and its hydration
+  scripts are inline and nonce-less; what it does contain is where an injected script could send
+  data, not whether one can run. The CSP is enforced by default; if an upgrade breaks a blocked
+  resource, set `CSP_REPORT_ONLY=true` (no rebuild required — it is a runtime environment variable)
+  to downgrade it to report-only while you identify the violated directive
+- Logins, logouts, missing-session denials, Origin-mismatch denials and rate-limit trips are
+  written to the in-app audit log and emitted as one structured JSON line each on stdout, for
+  whatever log pipeline you already run. A denial based on ROLE rather than session or Origin — the
+  proxy's `/admin` redirect for a non-admin token, and the in-handler admin-only checks on
+  `admin/audit`, `admin/fleet-health` and `db/maintenance` — is not audited today; see
+  `docs/BACKLOG.md`. A failed login records the submitted email verbatim (truncated to 254
+  characters) as the event's actor, not just a real, known account: a user who mistypes their
+  password into the email field puts that password on a retained audit log line
 
 #### AI/LLM Integration
 - API keys are stored server-side only
