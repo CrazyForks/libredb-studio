@@ -158,6 +158,19 @@ export interface ProviderLabels {
   vacuumGlobalDesc: string;
 }
 
+/**
+ * Enforcement caps for a single statement executed through an agent read-only
+ * execution profile (#328). The timeout is enforced database-side
+ * (transaction-local), the row/byte caps result-side after the statement
+ * returns. Every field must be a positive integer — queryReadOnly refuses the
+ * whole call otherwise (fail closed).
+ */
+export interface ReadOnlyStatementBudget {
+  statementTimeoutMs: number;
+  maxResultRows: number;
+  maxResultBytes: number;
+}
+
 export interface PreparedQuery {
   query: string;
   wasLimited: boolean;
@@ -204,6 +217,16 @@ export interface DatabaseProvider {
    * @returns Query result with rows, fields, and execution time
    */
   query(sql: string, params?: unknown[]): Promise<QueryResult>;
+
+  /**
+   * Execute exactly one statement under the DATABASE's own read-only
+   * enforcement (#328): the engine, not a parser, rejects writes through this
+   * path. Optional on purpose — only providers with a verified database-native
+   * boundary implement it, and execution-profile acquisition
+   * (`acquireExecutionProfileProvider` in factory.ts) refuses provider types
+   * that lack it rather than falling back to `query()` (fail closed).
+   */
+  queryReadOnly?(sql: string, budget: ReadOnlyStatementBudget): Promise<QueryResult>;
 
   /**
    * Get full database schema
@@ -321,6 +344,23 @@ export interface ProviderOptions {
   ssl?: boolean | { rejectUnauthorized: boolean };
   /** Connection timezone */
   timezone?: string;
+}
+
+/**
+ * Server-injected construction context for an execution-profile provider
+ * (#328). Deliberately NOT a member of `ProviderOptions`: that object is
+ * caller-supplied and flows all the way into `getOrCreateProvider`, so a
+ * profile flag living there could be set — or cleared — by whoever builds the
+ * options for a request. Only `acquireExecutionProfileProvider` passes this.
+ */
+export interface ProviderExecutionContext {
+  /**
+   * Open the connection under the database's own read-only enforcement.
+   * Only providers whose read-only boundary is established at OPEN time read
+   * this (SQLite); PostgreSQL establishes it per transaction inside
+   * `queryReadOnly` instead, so its provider ignores the context.
+   */
+  readOnly?: boolean;
 }
 
 // ============================================================================

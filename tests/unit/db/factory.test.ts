@@ -1,5 +1,16 @@
-import { describe, test, expect, mock, beforeEach } from "bun:test";
-import type { DatabaseConnection } from "@/lib/db/types";
+import { describe, test, expect, mock, beforeEach, beforeAll, afterAll } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { DatabaseConnection, ReadOnlyStatementBudget } from "@/lib/db/types";
+import { ExecutionProfileError } from "@/lib/db/errors";
+
+/** Enforcement caps for the sqlite agent-profile assertions below. */
+const AGENT_BUDGET: ReadOnlyStatementBudget = {
+  statementTimeoutMs: 5_000,
+  maxResultRows: 100,
+  maxResultBytes: 64 * 1024,
+};
 
 // ============================================================================
 // Helper: build a minimal DatabaseConnection for a given type
@@ -25,9 +36,27 @@ function makeConnection(type: string, overrides: Partial<DatabaseConnection> = {
 // We do NOT mock provider module paths — that would poison other test files.
 // ============================================================================
 
+/**
+ * The privileges the mocked PostgreSQL role reports to the agent profile's
+ * open-time check. All false = a least-privilege role, which is what the profile
+ * requires: a read-only transaction does not stop server-side file access or
+ * program execution, so the role is part of that boundary (#328).
+ */
+let mockPgRolePrivileges: Record<string, boolean> = {
+  is_superuser: false,
+  reads_server_files: false,
+  writes_server_files: false,
+  executes_programs: false,
+};
+
+const mockPgQuery = async (sql?: string) =>
+  typeof sql === "string" && /is_superuser/i.test(sql)
+    ? { rows: [{ ...mockPgRolePrivileges }], fields: [] }
+    : { rows: [], fields: [] };
+
 const mockPgPool = {
-  query: async () => ({ rows: [], fields: [] }),
-  connect: async () => ({ query: async () => ({ rows: [], fields: [] }), release: () => {} }),
+  query: mockPgQuery,
+  connect: async () => ({ query: mockPgQuery, release: () => {} }),
   end: async () => {},
   on: () => {},
 };
@@ -213,10 +242,12 @@ const mockCreateSSHTunnel = mock(async () => ({
 
 const mockCloseSSHTunnel = mock(async () => {});
 
+const mockHasTunnel = mock(() => false);
+
 mock.module("@/lib/ssh/tunnel", () => ({
   createSSHTunnel: mockCreateSSHTunnel,
   closeSSHTunnel: mockCloseSSHTunnel,
-  hasTunnel: mock(() => false),
+  hasTunnel: mockHasTunnel,
   getTunnelInfo: mock(() => undefined),
 }));
 
@@ -240,6 +271,8 @@ const {
   getProviderCacheStats,
   evictIdleProviders,
   registerShutdownHandlers,
+  acquireExecutionProfileProvider,
+  getExecutionProfileCacheStats,
 } = await import("@/lib/db/factory");
 if (nodeEnvBefore === undefined) {
   delete (process.env as Record<string, string>).NODE_ENV;
@@ -433,6 +466,31 @@ describe("getOrCreateProvider", () => {
     expect(mockCreateSSHTunnel).toHaveBeenCalledTimes(1);
     const tunnel = (await mockCreateSSHTunnel.mock.results[0]?.value) as { close: ReturnType<typeof mock> } | undefined;
     expect(tunnel?.close).toHaveBeenCalledTimes(1);
+    expect(getProviderCacheStats().size).toBe(0);
+  });
+
+  test("does not close a pre-existing tunnel when provider connect fails", async () => {
+    // createSSHTunnel returns the existing tunnel for the connection id, so a
+    // failed connect must not tear down a tunnel another provider (e.g. an
+    // execution-profile one) is still using.
+    const conn = makeConnection("sqlite", {
+      id: "ssh-connect-fail-shared",
+      database: "bad\u0000path.db",
+      sshTunnel: {
+        enabled: true,
+        host: "bastion.example.com",
+        port: 22,
+        username: "admin",
+        authMethod: "password",
+        password: "secret",
+      },
+    } as Partial<DatabaseConnection>);
+    mockHasTunnel.mockReturnValueOnce(true);
+
+    await expect(getOrCreateProvider(conn)).rejects.toThrow(/NUL bytes/);
+
+    const tunnel = (await mockCreateSSHTunnel.mock.results[0]?.value) as { close: ReturnType<typeof mock> } | undefined;
+    expect(tunnel?.close).not.toHaveBeenCalled();
     expect(getProviderCacheStats().size).toBe(0);
   });
 });
@@ -685,5 +743,423 @@ describe("shutdown signal handlers", () => {
       provider.disconnect = realDisconnect;
       await clearProviderCache();
     }
+  });
+});
+
+// ─── acquireExecutionProfileProvider — agent read-only profile (#328) ──────
+
+describe("acquireExecutionProfileProvider", () => {
+  const pgConn = (overrides: Partial<DatabaseConnection> = {}) =>
+    makeConnection("postgres", { id: "pg-profile", ...overrides });
+
+  /**
+   * Deterministic clock for the two cross-cache eviction assertions below.
+   *
+   * Those tests need one cache entry to be older than `evictIdleProviders`'
+   * threshold while the other is younger. Sleeping for the gap makes that a race
+   * with CI scheduling jitter from BOTH sides: any delay between the second
+   * acquisition and the evict call ages the younger entry past the threshold too,
+   * and then both entries evict for a reason unrelated to the invariant under
+   * test. Both cache entries are stamped from `Date.now()` (the `set` calls in
+   * `getOrCreateProvider` and `acquireExecutionProfileProvider`) and compared
+   * against it in `evictIdleProviders`, so freezing it makes the age gap exact
+   * instead of probable — and keeps a security-relevant suite free of a flake
+   * class that would train maintainers to re-run it.
+   *
+   * This does NOT control the idle sweep: `startIdleSweep` runs on a real
+   * `setInterval` and is unaffected. Deliberately a local patch rather than
+   * bun:test's `setSystemTime`, which also moves `new Date()` — the narrower
+   * blast radius matches this file's other stub-and-restore helpers.
+   */
+  function installFakeClock(): { advance: (ms: number) => void; restore: () => void } {
+    const realNow = Date.now;
+    let current = realNow();
+    Date.now = () => current;
+    return {
+      advance: (ms: number) => {
+        current += ms;
+      },
+      restore: () => {
+        Date.now = realNow;
+      },
+    };
+  }
+
+  test("acquires a dedicated provider without touching the shared writable cache", async () => {
+    const shared = await getOrCreateProvider(pgConn());
+    const statsBefore = getProviderCacheStats();
+
+    const agent = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+
+    expect(agent).not.toBe(shared);
+    expect(getProviderCacheStats()).toEqual(statsBefore);
+    expect(getExecutionProfileCacheStats().size).toBe(1);
+  });
+
+  test("caches per (connection id, profile) and reuses the dedicated instance", async () => {
+    const first = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+    const second = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+
+    expect(second).toBe(first);
+    expect(getExecutionProfileCacheStats()).toEqual({ size: 1, connections: ["pg-profile"] });
+    expect(getProviderCacheStats().size).toBe(0);
+  });
+
+  test("shared-cache acquisitions leave the profile cache untouched", async () => {
+    await getOrCreateProvider(pgConn());
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("re-acquires when the cached profile provider is disconnected", async () => {
+    const first = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+    await first.disconnect();
+
+    const second = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+
+    expect(second).not.toBe(first);
+    expect(second.isConnected()).toBe(true);
+  });
+
+  test("refuses an unknown execution profile (fail closed)", async () => {
+    const error: unknown = await acquireExecutionProfileProvider(pgConn(), "agent-read-write" as never).catch(
+      (e: unknown) => e,
+    );
+
+    expect(error).toBeInstanceOf(ExecutionProfileError);
+    expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("UNSUPPORTED_PROFILE");
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("refuses a provider type without a database-native read-only wrapper", async () => {
+    const error: unknown = await acquireExecutionProfileProvider(
+      makeConnection("redis", { id: "redis-profile" }),
+      "agent-read-only",
+    ).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ExecutionProfileError);
+    expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("PROFILE_UNSUPPORTED_BY_PROVIDER");
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("refuses to vend a PostgreSQL profile whose role is too privileged, and caches nothing", async () => {
+    // The provider verifies the role at open (a read-only transaction does not
+    // stop COPY TO PROGRAM or pg_read_file), and the refusal has to reach the
+    // caller intact — not as a generic connection failure — with no half-built
+    // entry left in the profiled cache.
+    mockPgRolePrivileges = { ...mockPgRolePrivileges, executes_programs: true };
+    try {
+      const error: unknown = await acquireExecutionProfileProvider(pgConn({ id: "pg-privileged" }), "agent-read-only")
+        .then(() => null)
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(ExecutionProfileError);
+      expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("PROFILE_PRIVILEGES_TOO_BROAD");
+      expect(getExecutionProfileCacheStats().size).toBe(0);
+    } finally {
+      mockPgRolePrivileges = { ...mockPgRolePrivileges, executes_programs: false };
+    }
+
+    // The same connection is still usable on the editor path: the profile's
+    // requirement must not gate ordinary queries.
+    const shared = await getOrCreateProvider(pgConn({ id: "pg-privileged" }));
+    expect(shared.isConnected()).toBe(true);
+  });
+
+  test("uses the least-privilege agent credential for the profile provider only", async () => {
+    const conn = pgConn({ id: "pg-cred", agentUser: "agent_ro", agentPassword: "agent-secret" });
+
+    const agent = await acquireExecutionProfileProvider(conn, "agent-read-only");
+    const shared = await getOrCreateProvider(conn);
+
+    expect(agent.config.user).toBe("agent_ro");
+    expect(agent.config.password).toBe("agent-secret");
+    expect(shared.config.user).toBe("test");
+  });
+
+  test("denies when the agent credential is configured but unresolvable (fail closed)", async () => {
+    // "v9:a:b" carries an envelope version tag this build does not recognise —
+    // readSecret classifies it undecryptable, never plaintext.
+    const conn = pgConn({ id: "pg-bad-cred", agentUser: "agent_ro", agentPassword: "v9:a:b" });
+
+    const error: unknown = await acquireExecutionProfileProvider(conn, "agent-read-only").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ExecutionProfileError);
+    expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("AGENT_CREDENTIAL_UNRESOLVABLE");
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("denies an agent user without a password (fail closed)", async () => {
+    const conn = pgConn({ id: "pg-user-only", agentUser: "agent_ro" });
+
+    const error: unknown = await acquireExecutionProfileProvider(conn, "agent-read-only").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ExecutionProfileError);
+    expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("AGENT_CREDENTIAL_UNRESOLVABLE");
+  });
+
+  test("denies an agent password without a user (fail closed)", async () => {
+    const conn = pgConn({ id: "pg-password-only", agentPassword: "agent-secret" });
+
+    const error: unknown = await acquireExecutionProfileProvider(conn, "agent-read-only").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ExecutionProfileError);
+    expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("AGENT_CREDENTIAL_UNRESOLVABLE");
+  });
+
+  test("denies an agent credential on a connection-string connection", async () => {
+    // buildPoolConfig ignores user/password fields when a connection string is
+    // present, so the credential would be silently dropped — running the agent
+    // as the MORE privileged embedded user. Denying is the fail-closed choice.
+    const conn = pgConn({
+      id: "pg-cs-cred",
+      connectionString: "postgresql://app:pw@db.internal:5432/prod",
+      agentUser: "agent_ro",
+      agentPassword: "agent-secret",
+    });
+
+    const error: unknown = await acquireExecutionProfileProvider(conn, "agent-read-only").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ExecutionProfileError);
+    expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe(
+      "AGENT_CREDENTIAL_WITH_CONNECTION_STRING",
+    );
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("does not cache a profile provider whose connection failed", async () => {
+    const originalConnect = mockPgPool.connect;
+    mockPgPool.connect = async () => {
+      throw new Error("connection refused");
+    };
+    try {
+      await expect(acquireExecutionProfileProvider(pgConn(), "agent-read-only")).rejects.toThrow(
+        /connection refused|Failed to connect/,
+      );
+      expect(getExecutionProfileCacheStats().size).toBe(0);
+    } finally {
+      mockPgPool.connect = originalConnect;
+    }
+  });
+
+  test("creates the connection's SSH tunnel and connects the profile provider through it", async () => {
+    const conn = pgConn({
+      id: "pg-tunnel-profile",
+      host: "remote-db.example.com",
+      sshTunnel: {
+        enabled: true,
+        host: "bastion.example.com",
+        port: 22,
+        username: "admin",
+        authMethod: "password",
+        password: "secret",
+      },
+    });
+
+    const agent = await acquireExecutionProfileProvider(conn, "agent-read-only");
+
+    expect(mockCreateSSHTunnel).toHaveBeenCalledTimes(1);
+    expect(agent.config.host).toBe("127.0.0.1");
+    expect(agent.config.port).toBe(54321);
+  });
+
+  test("tears down a freshly created tunnel when the profile connection fails", async () => {
+    const conn = pgConn({
+      id: "pg-tunnel-fail",
+      sshTunnel: {
+        enabled: true,
+        host: "bastion.example.com",
+        port: 22,
+        username: "admin",
+        authMethod: "password",
+        password: "secret",
+      },
+    });
+    const originalConnect = mockPgPool.connect;
+    mockPgPool.connect = async () => {
+      throw new Error("connection refused");
+    };
+    try {
+      await expect(acquireExecutionProfileProvider(conn, "agent-read-only")).rejects.toThrow(
+        /connection refused|Failed to connect/,
+      );
+      const tunnel = (await mockCreateSSHTunnel.mock.results[0]?.value) as
+        | { close: ReturnType<typeof mock> }
+        | undefined;
+      expect(tunnel?.close).toHaveBeenCalledTimes(1);
+      expect(getExecutionProfileCacheStats().size).toBe(0);
+    } finally {
+      mockPgPool.connect = originalConnect;
+    }
+  });
+
+  test("evicting an idle shared provider keeps the tunnel of a live profile provider", async () => {
+    const clock = installFakeClock();
+    try {
+      await getOrCreateProvider(pgConn());
+      // The profiled provider arrives later, so only the shared entry is idle
+      // beyond the threshold below. The gap is injected, never slept for.
+      clock.advance(60);
+      await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+      mockCloseSSHTunnel.mockClear();
+
+      const evicted = await evictIdleProviders(30);
+
+      expect(evicted).toBe(1);
+      expect(getProviderCacheStats().size).toBe(0);
+      expect(getExecutionProfileCacheStats().size).toBe(1);
+      expect(mockCloseSSHTunnel).not.toHaveBeenCalled();
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("evicting an idle profile provider keeps the tunnel of a still-served connection", async () => {
+    const clock = installFakeClock();
+    try {
+      await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+      // The writable provider arrives later, so only the profiled entry is idle
+      // beyond the threshold below. The gap is injected, never slept for.
+      clock.advance(60);
+      await getOrCreateProvider(pgConn());
+      mockCloseSSHTunnel.mockClear();
+
+      const evicted = await evictIdleProviders(30);
+
+      expect(evicted).toBe(1);
+      expect(getExecutionProfileCacheStats().size).toBe(0);
+      expect(getProviderCacheStats().size).toBe(1);
+      expect(mockCloseSSHTunnel).not.toHaveBeenCalled();
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("eviction logs and continues when a profile provider disconnect fails", async () => {
+    const agent = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+    agent.disconnect = async () => {
+      throw new Error("disconnect failed");
+    };
+
+    const evicted = await evictIdleProviders(0);
+
+    expect(evicted).toBe(1);
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("removeProvider logs and continues when a profile provider disconnect fails", async () => {
+    const agent = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+    agent.disconnect = async () => {
+      throw new Error("disconnect failed");
+    };
+
+    await removeProvider("pg-profile");
+
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("clearProviderCache logs and continues when a profile provider disconnect rejects", async () => {
+    const agent = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+    agent.disconnect = async () => {
+      throw new Error("disconnect failed");
+    };
+
+    await clearProviderCache();
+
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("removeProvider also removes the connection's profile providers", async () => {
+    const agent = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+
+    await removeProvider("pg-profile");
+
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+    expect(agent.isConnected()).toBe(false);
+  });
+
+  test("evictIdleProviders sweeps idle profile providers and closes the connection's tunnel", async () => {
+    await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+
+    const evicted = await evictIdleProviders(0);
+
+    expect(evicted).toBe(1);
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+    expect(mockCloseSSHTunnel).toHaveBeenCalledWith("pg-profile");
+  });
+
+  test("clearProviderCache clears the profile cache too", async () => {
+    const agent = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+
+    await clearProviderCache();
+
+    expect(getExecutionProfileCacheStats().size).toBe(0);
+    expect(agent.isConnected()).toBe(false);
+  });
+
+  // ─── SQLite: read-only intent is injected server-side, never by a caller ──
+  // sqlite runs on the real driver here (no mock), so these assert the actual
+  // database boundary rather than factory bookkeeping.
+
+  describe("sqlite", () => {
+    let sqliteTmpDir: string;
+    let seeded = 0;
+
+    beforeAll(() => {
+      sqliteTmpDir = mkdtempSync(join(tmpdir(), "libredb-factory-sqlite-"));
+    });
+
+    afterAll(() => {
+      rmSync(sqliteTmpDir, { recursive: true, force: true });
+    });
+
+    /** A real on-disk sqlite connection with one seeded row. */
+    async function seedFileConnection(): Promise<DatabaseConnection> {
+      const conn = makeConnection("sqlite", {
+        id: `sqlite-agent-${++seeded}`,
+        database: join(sqliteTmpDir, `agent-${seeded}.db`),
+      });
+      const writer = await getOrCreateProvider(conn);
+      await writer.query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+      await writer.query("INSERT INTO t (id, v) VALUES (1, 'seeded')");
+      await removeProvider(conn.id);
+      return conn;
+    }
+
+    test("acquires a sqlite agent provider whose writes the database rejects", async () => {
+      const conn = await seedFileConnection();
+
+      const agent = await acquireExecutionProfileProvider(conn, "agent-read-only");
+
+      expect(await agent.queryReadOnly!("SELECT v FROM t", { ...AGENT_BUDGET })).toMatchObject({
+        rows: [{ v: "seeded" }],
+      });
+      await expect(agent.queryReadOnly!("INSERT INTO t (id, v) VALUES (2, 'agent')", AGENT_BUDGET)).rejects.toThrow();
+      expect(getExecutionProfileCacheStats()).toEqual({ size: 1, connections: [conn.id] });
+      expect(getProviderCacheStats().size).toBe(0);
+    });
+
+    test("a caller-supplied options object cannot put the shared provider into the read-only profile", async () => {
+      const conn = await seedFileConnection();
+
+      // ProviderOptions is caller-supplied and flows through getOrCreateProvider;
+      // the execution profile must be unreachable from it in either direction.
+      const shared = await getOrCreateProvider(conn, { readOnly: true } as never);
+
+      const insert = await shared.query("INSERT INTO t (id, v) VALUES (2, 'editor')");
+      expect(insert.rowCount).toBe(1);
+      expect(getExecutionProfileCacheStats().size).toBe(0);
+    });
+
+    test("refuses an in-memory sqlite target for the agent profile (fail closed)", async () => {
+      const conn = makeConnection("sqlite", { id: "sqlite-memory-agent", database: ":memory:" });
+
+      // Refused for being an in-memory target, not for the provider type
+      // lacking a read-only profile — the deny code has to say which.
+      const error: unknown = await acquireExecutionProfileProvider(conn, "agent-read-only").catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(ExecutionProfileError);
+      expect((error as ExecutionProfileError).reasonCode).toBe("PROFILE_UNSUPPORTED_TARGET");
+      expect(getExecutionProfileCacheStats().size).toBe(0);
+    });
   });
 });

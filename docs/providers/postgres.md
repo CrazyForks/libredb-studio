@@ -17,6 +17,7 @@
 | **Connection string** | Supported (`postgres://` / `postgresql://`) |
 | **Transactions** | Yes — explicit `BEGIN`/`COMMIT`/`ROLLBACK` with auto-rollback timeout |
 | **Query cancellation** | Yes — PID tracking + `pg_cancel_backend` |
+| **Agent read-only profile** | Yes — `BEGIN READ ONLY` + extended-protocol single statement (#328, §12) |
 | **Source** | [`src/lib/db/providers/sql/postgres.ts`](../../src/lib/db/providers/sql/postgres.ts) |
 | **Base** | [`src/lib/db/providers/sql/sql-base.ts`](../../src/lib/db/providers/sql/sql-base.ts) |
 | **Tests** | [`tests/integration/db/postgres-provider.test.ts`](../../tests/integration/db/postgres-provider.test.ts) |
@@ -502,9 +503,143 @@ syntax errors.
 
 ---
 
-## 12. Testing
+## 12. Agent read-only execution profile (#328)
 
-### 12.1 How the tests work
+The agent programme (epic #325) never talks to the shared, fully-privileged provider. It acquires
+a **dedicated provider keyed by (connection id, execution profile)** and runs every statement
+through `queryReadOnly()`, where the DATABASE — not a SQL parser — is the boundary.
+
+### 12.1 Acquisition (`acquireExecutionProfileProvider`, [factory.ts](../../src/lib/db/factory.ts))
+
+- The profiled cache is physically separate from `getOrCreateProvider`'s cache: an agent
+  acquisition never returns, inserts, or touches a shared writable entry (unit-tested in both
+  directions), so an agent execution can never be handed the editor's pool — and vice versa.
+- Provider types without a database-native read-only wrapper are refused with
+  `PROFILE_UNSUPPORTED_BY_PROVIDER`; there is no fallback to `query()`. A provider that supports the
+  profile but cannot apply it to *this* target refuses with `PROFILE_UNSUPPORTED_TARGET` (SQLite
+  does this for `:memory:` — see [sqlite.md §12.3](./sqlite.md#123-per-statement-execution-queryreadonly)).
+  Every refusal is an `ExecutionProfileError` carrying an `ExecutionProfileDenyCode`
+  ([errors.ts](../../src/lib/db/errors.ts)), so callers branch on the code, never on a message.
+- **The role is verified at open, not assumed** (see §12.3): a profile provider only connects if
+  its role is genuinely least-privilege. This applies whichever credential resolves below, because
+  an `agentUser` can be pointed at a superuser just as easily as a connection's own user can be one.
+- Optional least-privilege credential: `agentUser` / `agentPassword` on the connection
+  (`agentPassword` is secret-classified and sealed at rest by
+  [connection-secrets](../../src/lib/storage/connection-secrets.ts)). Resolution fails closed:
+
+  | Configuration | Outcome |
+  |---|---|
+  | Neither field set | Connection's own credentials — which must themselves pass the role check in §12.3 |
+  | Both set, password resolves | Profile pool authenticates as `agentUser` |
+  | Only one field set | `AGENT_CREDENTIAL_UNRESOLVABLE` — never a silent fallback to the more privileged default |
+  | Sealed password that does not open | `AGENT_CREDENTIAL_UNRESOLVABLE` |
+  | Combined with `connectionString` | `AGENT_CREDENTIAL_WITH_CONNECTION_STRING` — the pool config would silently drop the credential |
+
+- Lifecycle: profiled providers idle out on the same 30-minute sweep, are removed alongside
+  `removeProvider(connectionId)`, and share the connection's SSH tunnel (closed only once nothing
+  serves the connection anymore).
+
+### 12.2 Per-statement execution (`queryReadOnly`, [postgres.ts](../../src/lib/db/providers/sql/postgres.ts))
+
+Each call runs:
+
+```sql
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = <budget.statementTimeoutMs>;  -- dies with the transaction
+-- the single statement, sent on the extended query protocol
+ROLLBACK;                                                   -- always; the profile never commits
+DISCARD ALL;                                                -- session state a rollback keeps
+```
+
+`DISCARD ALL` is there because a rollback is not a full reset: an advisory lock taken inside the
+transaction survives it (verified on PostgreSQL 18), and nothing on the agent path is *required* to
+release one, so a pooled client would otherwise carry it into every later execution. It runs after the
+rollback because it cannot run inside a transaction block. A client that fails either step is
+destroyed rather than returned to the pool.
+
+Two server-enforced properties carry the security claim:
+
+1. **Writes are rejected by PostgreSQL itself** (SQLSTATE `25006`, *cannot execute … in a
+   read-only transaction*). No SQL classification happens in this path.
+2. **Single-statement is protocol-enforced**: the statement is sent with `queryMode: 'extended'`
+   (pg ≥ 8.11), and the server refuses multi-command strings in a Parse message (SQLSTATE `42601`)
+   before executing anything — so `SELECT 1; COMMIT; INSERT …` cannot commit its way out of the
+   read-only transaction the way it could on the simple protocol.
+
+A lone hostile statement cannot escape either — and the first of these is not theoretical:
+`SET TRANSACTION READ WRITE` **is accepted inside `BEGIN READ ONLY` and does relax the transaction**
+(verified on 18: a following `INSERT` committed), so what contains it is that it can only ever be
+the transaction's only statement before the `ROLLBACK`. A session-level `SET` reverts with the
+rollback (GUC changes are transactional); a bare `COMMIT` merely ends an empty read-only
+transaction. A client whose cleanup fails is destroyed (`release(error)`), never returned to the
+pool mid-transaction.
+
+The `ReadOnlyStatementBudget` (`statementTimeoutMs`, `maxResultRows`, `maxResultBytes`,
+[types.ts](../../src/lib/db/types.ts)) is validated as positive integers before any client is
+acquired — the timeout is interpolated into `SET LOCAL`, which takes no bind parameters — and the
+row/byte caps are enforced result-side after the statement returns.
+
+`queryReadOnly()` exists only on a provider opened under the profile: called on an ordinary
+provider it throws, because such a provider has had no role verification and would serve agent
+semantics without the boundary that makes them true.
+
+### 12.3 What the read-only transaction does NOT cover — and the role that does
+
+A read-only transaction forbids changing the **database**. It does not forbid a statement from
+reaching the **server**. Verified on PostgreSQL 18, all three of these succeeded inside
+`BEGIN READ ONLY` as a superuser:
+
+| Statement | What it did |
+|---|---|
+| `COPY (…) TO '<path>'` | wrote query results to an arbitrary server-side file |
+| `COPY (…) TO PROGRAM '<cmd>'` | ran a shell command as the server's OS user |
+| `SELECT pg_read_file('<path>')` | read an arbitrary server-side file |
+
+As a role with only `CONNECT`/`USAGE`/`SELECT`, the same three are refused — by **privileges**
+(`pg_write_server_files`, `pg_execute_server_program`, `pg_read_server_files` or superuser), not by
+the transaction. Two consequences the profile implements rather than documents as advice:
+
+1. **Opening the profile probes the role** and refuses with `PROFILE_PRIVILEGES_TOO_BROAD` unless
+   superuser and all three predefined-role memberships read back false
+   (`assertAgentRoleIsUnprivileged`, [postgres.ts](../../src/lib/db/providers/sql/postgres.ts)). The
+   probe uses `to_regrole`, so a server missing a predefined role answers `false` rather than
+   erroring. A server that answers nothing, or answers non-booleans, is refused too — an unproven
+   boundary is not a boundary. Every catalog function the probe calls is written `pg_catalog`-
+   qualified: `pg_catalog` is searched implicitly first only while it is not named in `search_path`,
+   so a path that names it explicitly behind another schema lets a shadow `pg_has_role()` answer
+   false for a superuser and defeat this check.
+
+   What the probe proves is **non-membership and non-superuser**, not the absence of the capability:
+   a role directly granted `EXECUTE` on `pg_read_file()` answers false to all four flags and can
+   still read server files. That is why the recipe below says grant nothing else. The probe also
+   runs **once, at open** — a profiled provider stays cached until the idle sweep, so a role granted
+   new privileges afterwards keeps serving from the already-verified pool until it is evicted or
+   `removeProvider` runs.
+2. **`SET TRANSACTION READ WRITE` really works** inside `BEGIN READ ONLY` (also verified on 18: the
+   following `INSERT` committed). What contains it is that it can only ever be the transaction's
+   ONLY statement, after which the profile rolls back — so the single-statement rule in §12.2 is
+   load-bearing, not decorative.
+
+Recommended role for an agent target:
+
+```sql
+CREATE ROLE libredb_agent LOGIN PASSWORD '<secret>';
+GRANT CONNECT ON DATABASE <db> TO libredb_agent;
+GRANT USAGE ON SCHEMA <schema> TO libredb_agent;
+GRANT SELECT ON ALL TABLES IN SCHEMA <schema> TO libredb_agent;
+-- Grant nothing else. In particular do NOT grant pg_read_server_files,
+-- pg_write_server_files, pg_execute_server_program, or superuser.
+```
+
+Per-table `SELECT` grants are also what bound which rows an agent can READ: the policy layer's
+catalog/schema allowlist screens the *declared* target, and only the grants bound what a hostile
+statement could reach instead.
+
+---
+
+## 13. Testing
+
+### 13.1 How the tests work
 
 Integration tests live in
 [`tests/integration/db/postgres-provider.test.ts`](../../tests/integration/db/postgres-provider.test.ts).
@@ -521,7 +656,7 @@ server.
 > process isolation via `tests/run-core.sh`); the coverage workflow uses `bun run test:coverage`
 > (also per-file). See [`CLAUDE.md`](../../CLAUDE.md).
 
-### 12.2 Coverage
+### 13.2 Coverage
 
 The suite (60+ tests) covers: validation (incl. connection-string bypass), connect/disconnect
 idempotency, **every SSL precedence branch**, query + PID tracking + error mapping, query
@@ -533,7 +668,7 @@ formatting, performance (incl. checkpoint fallback), slow queries (extension + `
 fallback), active sessions,
 table/index/storage stats, pool stats, capabilities, and `pg_stat_activity` passthrough.
 
-### 12.3 Run it
+### 13.3 Run it
 
 ```bash
 bun test tests/integration/db/postgres-provider.test.ts   # just this file (single process — safe)
@@ -541,7 +676,7 @@ bun run test:ci                                            # CI publish gate —
 bun run test:coverage                                      # CI coverage workflow — per-file core + components
 ```
 
-### 12.4 Optional: verifying against a live PostgreSQL
+### 13.4 Optional: verifying against a live PostgreSQL
 
 The committed tests are mock-based by design. To smoke-test against a real server:
 
@@ -554,9 +689,9 @@ The E2E suite (`e2e/`) has been verified against PostgreSQL 18.x.
 
 ---
 
-## 13. Usage examples
+## 14. Usage examples
 
-### 13.1 Programmatic (via the factory)
+### 14.1 Programmatic (via the factory)
 
 ```ts
 import { createDatabaseProvider } from '@/lib/db/factory';
@@ -574,7 +709,7 @@ const rels = await provider.getSchemaRelations();      // FKs + indexes to merge
 await provider.disconnect();
 ```
 
-### 13.2 Over the API
+### 14.2 Over the API
 
 - `POST /api/db/query` — run SQL (see [`API_DOCS.md`](../API_DOCS.md#post-apidbquery)).
 - `POST /api/db/schema/list` and `POST /api/db/schema/relations` — two-phase schema.
@@ -584,7 +719,7 @@ await provider.disconnect();
 
 ---
 
-## 14. Known limitations & future work
+## 15. Known limitations & future work
 
 - **`transactionsPerSecond` / `queriesPerSecond` are not reported** (`undefined`) — they require
   time-based sampling of `pg_stat_database`, which the single-shot metric call doesn't do.
@@ -604,7 +739,7 @@ await provider.disconnect();
 
 ---
 
-## 15. References
+## 16. References
 
 - Driver: [`pg` (node-postgres)](https://github.com/brianc/node-postgres)
 - Source: [`src/lib/db/providers/sql/postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)

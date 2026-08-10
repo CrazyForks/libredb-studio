@@ -3,7 +3,7 @@
  * Full PostgreSQL support with connection pooling
  */
 
-import { Pool, type PoolClient, type PoolConfig as PgPoolConfig } from "pg";
+import { Pool, type PoolClient, type PoolConfig as PgPoolConfig, type QueryConfig } from "pg";
 import { SQLBaseProvider } from "./sql-base";
 import {
   type DatabaseConnection,
@@ -15,6 +15,8 @@ import {
   type MaintenanceResult,
   type ProviderOptions,
   type ProviderCapabilities,
+  type ProviderExecutionContext,
+  type ReadOnlyStatementBudget,
   type SlowQuery,
   type ActiveSession,
   type DatabaseOverview,
@@ -25,7 +27,14 @@ import {
   type IndexStats,
   type StorageStats,
 } from "../../types";
-import { DatabaseConfigError, ConnectionError, QueryError, mapDatabaseError } from "../../errors";
+import {
+  DatabaseConfigError,
+  ConnectionError,
+  ExecutionProfileError,
+  QueryError,
+  mapDatabaseError,
+} from "../../errors";
+import { assertReadOnlyBudget, measureResultBytes } from "./read-only-budget";
 import { formatBytes } from "../../utils/pool-manager";
 
 // ============================================================================
@@ -505,6 +514,82 @@ const STORAGE_WAL_SQL = `
         `;
 
 // ============================================================================
+// Agent read-only execution profile (#328)
+// ============================================================================
+
+/**
+ * The capabilities a read-only TRANSACTION cannot contain, asked of the role
+ * the profile would run as.
+ *
+ * `to_regrole` keeps the query safe on a server where a predefined role is
+ * absent (it yields NULL, and `COALESCE` makes that a `false` rather than an
+ * error), so the check does not depend on the server's major version.
+ *
+ * Every catalog FUNCTION is schema-qualified because this query decides a
+ * security boundary. `pg_catalog` is searched implicitly first only while it is
+ * not named in `search_path`; once it is named explicitly, any schema ahead of
+ * it shadows built-ins, so `search_path = attacker_schema, pg_catalog` plus a
+ * shadow `pg_has_role()` would answer four falses for a superuser and defeat
+ * the one check meant to catch that role. `COALESCE` and `current_user` need no
+ * qualification (and accept none): they are SQL constructs the parser resolves,
+ * not functions that name resolution can redirect.
+ */
+const AGENT_ROLE_PRIVILEGE_SQL = `
+        SELECT pg_catalog.current_setting('is_superuser') = 'on' AS is_superuser,
+               COALESCE(
+                 pg_catalog.pg_has_role(current_user, pg_catalog.to_regrole('pg_read_server_files'), 'USAGE'),
+                 false
+               ) AS reads_server_files,
+               COALESCE(
+                 pg_catalog.pg_has_role(current_user, pg_catalog.to_regrole('pg_write_server_files'), 'USAGE'),
+                 false
+               ) AS writes_server_files,
+               COALESCE(
+                 pg_catalog.pg_has_role(current_user, pg_catalog.to_regrole('pg_execute_server_program'), 'USAGE'),
+                 false
+               ) AS executes_programs
+      `;
+
+const AGENT_ROLE_FORBIDDEN_CAPABILITIES = [
+  "is_superuser",
+  "reads_server_files",
+  "writes_server_files",
+  "executes_programs",
+] as const;
+
+/**
+ * Refuses a role whose privileges reach past the read-only transaction.
+ *
+ * `BEGIN READ ONLY` forbids changing the DATABASE. It does not forbid writing
+ * somewhere else: verified on PostgreSQL 18, a superuser session inside a
+ * read-only transaction still ran `COPY (…) TO '<path>'` (an arbitrary
+ * server-side file write), `COPY (…) TO PROGRAM '<cmd>'` (command execution as
+ * the server's OS user) and `pg_read_file()` (an arbitrary server-side file
+ * read). Only privileges refuse those — the same lesson the SQLite profile
+ * learned from `VACUUM INTO`: a control is a claim about one resource, so the
+ * question is always what else the statement can reach.
+ *
+ * Hence a least-privilege agent role is part of this profile's boundary rather
+ * than a recommendation, and it is VERIFIED at open instead of assumed from
+ * configuration: an admin can point `agentUser` at a superuser, and a
+ * connection's own user very often is one.
+ *
+ * Fails closed on anything it cannot read as four explicit `false`s — a server
+ * that answers nothing, or answers something else, leaves the boundary
+ * unproven.
+ */
+function assertAgentRoleIsUnprivileged(rows: unknown[]): void {
+  const row = rows[0] as Record<string, unknown> | undefined;
+  const held = AGENT_ROLE_FORBIDDEN_CAPABILITIES.filter((capability) => row?.[capability] !== false);
+  if (held.length > 0) {
+    throw new ExecutionProfileError(
+      `The agent read-only execution profile requires a least-privilege PostgreSQL role; this role is unverified or too broad (${held.join(", ")}). A read-only transaction does not stop server-side file access or program execution.`,
+      "PROFILE_PRIVILEGES_TOO_BROAD",
+    );
+  }
+}
+
+// ============================================================================
 // PostgreSQL Provider
 // ============================================================================
 
@@ -517,8 +602,15 @@ export class PostgresProvider extends SQLBaseProvider {
   private txTimeout: ReturnType<typeof setTimeout> | null = null;
   private static readonly TX_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
-  constructor(config: DatabaseConnection, options: ProviderOptions = {}) {
+  /** True when this instance was opened under the agent read-only profile. */
+  private readonly readOnlyProfile: boolean;
+
+  constructor(config: DatabaseConnection, options: ProviderOptions = {}, execution: ProviderExecutionContext = {}) {
     super(config, options);
+    // Server-injected only (see ProviderExecutionContext): the editor path
+    // builds providers from caller-supplied ProviderOptions, which has no route
+    // to this flag in either direction.
+    this.readOnlyProfile = execution.readOnly === true;
     this.validate();
   }
 
@@ -570,11 +662,33 @@ export class PostgresProvider extends SQLBaseProvider {
       this.attachPoolErrorListener(this.pool);
 
       const client = await this.pool.connect();
-      client.release();
+      try {
+        // Under the profile, the role itself is part of the boundary — verify it
+        // on the same client this connect already borrowed.
+        if (this.readOnlyProfile) {
+          assertAgentRoleIsUnprivileged((await client.query(AGENT_ROLE_PRIVILEGE_SQL)).rows);
+        }
+      } finally {
+        client.release();
+      }
 
       this.setConnected(true);
     } catch (error) {
       this.setError(error instanceof Error ? error : new Error(String(error)));
+      // The pool is built before anything that can fail here — the borrow, and
+      // under the profile the role probe. Whatever went wrong, the caller ends
+      // up without a usable provider, and `acquireExecutionProfileProvider`
+      // drops it WITHOUT calling disconnect(), so a pool left open here leaks
+      // its idle socket and timers with no reference left to close them. End it
+      // on every failed connect, not just the typed refusal.
+      const failedPool = this.pool;
+      this.pool = null;
+      await failedPool?.end().catch(() => {});
+      // A typed profile refusal keeps its identity: wrapping it would strip the
+      // deny reason code callers branch on.
+      if (error instanceof ExecutionProfileError) {
+        throw error;
+      }
       throw new ConnectionError(
         `Failed to connect to PostgreSQL: ${error instanceof Error ? error.message : error}`,
         "postgres",
@@ -725,6 +839,104 @@ export class PostgresProvider extends SQLBaseProvider {
       console.error("[Postgres] Failed to cancel query:", error);
       return false;
     }
+  }
+
+  // ============================================================================
+  // Agent Read-Only Execution Profile (#328)
+  // ============================================================================
+
+  /**
+   * Runs exactly one statement inside `BEGIN READ ONLY` with a
+   * transaction-local timeout, then rolls back and releases the client. The
+   * DATABASE is the boundary, twice over:
+   *
+   * - The read-only transaction makes the server itself reject any write that
+   *   reaches it (SQLSTATE 25006) — no SQL classification happens here.
+   * - The statement travels on the extended query protocol (`queryMode:
+   *   "extended"`, pg >= 8.11), whose Parse message the server refuses for
+   *   multi-command strings (SQLSTATE 42601) BEFORE executing anything. That
+   *   is what stops `SELECT 1; COMMIT; INSERT ...` from committing its way out
+   *   of the read-only transaction — on the simple protocol the server would
+   *   execute each command in turn, honoring the smuggled COMMIT.
+   *
+   * A single hostile statement cannot escape either: `SET TRANSACTION READ
+   * WRITE` would be the transaction's only statement before ROLLBACK, a lone
+   * COMMIT merely ends an empty read-only transaction, and a session-level
+   * `SET` reverts with the rollback (GUC changes are transactional).
+   *
+   * The row/byte caps are enforced result-side after the statement returns;
+   * the timeout is `SET LOCAL`, so it dies with the transaction.
+   */
+  public async queryReadOnly(sql: string, budget: ReadOnlyStatementBudget): Promise<QueryResult> {
+    this.ensureConnected();
+    assertReadOnlyBudget(budget, "postgres");
+    if (!this.readOnlyProfile) {
+      // A provider opened outside the profile has had no role verification, so
+      // its session may be able to write server files or run programs from
+      // inside a read-only transaction. Refuse rather than serve agent
+      // semantics without the boundary that makes them true.
+      throw new QueryError(
+        "Read-only execution requires a provider opened under the agent read-only profile",
+        "postgres",
+        sql,
+      );
+    }
+
+    return this.trackQuery(async () => {
+      const { result, executionTime } = await this.measureExecution(async () => {
+        const client = await this.pool!.connect();
+        try {
+          await client.query("BEGIN READ ONLY");
+          // SET cannot take bind parameters; the value is proven a positive
+          // integer by assertReadOnlyBudget above, so no text can pass through.
+          await client.query(`SET LOCAL statement_timeout = ${budget.statementTimeoutMs}`);
+          // @types/pg does not model queryMode yet; the runtime supports it
+          // since pg 8.11 (node_modules/pg/lib/query.js requiresPreparation).
+          const extendedQuery = { text: sql, queryMode: "extended" } as QueryConfig & { queryMode: "extended" };
+          return await client.query(extendedQuery);
+        } catch (error) {
+          throw mapDatabaseError(error, "postgres", sql);
+        } finally {
+          // The profile never commits. A client that cannot be reset is
+          // destroyed (release(error)), never returned to the pool mid-transaction.
+          try {
+            await client.query("ROLLBACK");
+            // Session state a rollback does NOT undo: an advisory lock taken
+            // inside the transaction survives it (verified on PostgreSQL 18) and
+            // no statement the agent path admits could release it, so a pooled
+            // client would carry it into every later execution. DISCARD ALL
+            // cannot run inside a transaction block, hence after the ROLLBACK.
+            await client.query("DISCARD ALL");
+            client.release();
+          } catch (cleanupError) {
+            client.release(cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)));
+          }
+        }
+      });
+
+      if (result.rows.length > budget.maxResultRows) {
+        throw new QueryError(
+          `Read-only execution exceeded the row budget: ${result.rows.length} rows > ${budget.maxResultRows} allowed`,
+          "postgres",
+          sql,
+        );
+      }
+      const resultBytes = measureResultBytes(result.rows);
+      if (resultBytes > budget.maxResultBytes) {
+        throw new QueryError(
+          `Read-only execution exceeded the byte budget: ${resultBytes} bytes > ${budget.maxResultBytes} allowed`,
+          "postgres",
+          sql,
+        );
+      }
+
+      return {
+        rows: result.rows,
+        fields: result.fields?.map((f) => f.name) ?? [],
+        rowCount: result.rowCount ?? 0,
+        executionTime,
+      };
+    });
   }
 
   // ============================================================================

@@ -675,3 +675,90 @@ reading the stored row before every write and preserving an existing envelope wh
 value is absent - which would also silently resurrect a password the user deliberately cleared, a
 worse bug than the one it fixes. Done when a design is found that distinguishes "the client never
 had this value" from "the client cleared this value" without adding a field to the stored shape.
+
+---
+
+## Agent M1 deferrals (#328)
+
+Each of these was decided while building the operation/policy layer, not overlooked. Delete an
+entry when the work lands.
+
+### A1. A SQLite agent statement can block the runtime for its whole duration
+
+`src/lib/db/providers/sql/sqlite.ts`'s `queryReadOnly` enforces `statementTimeoutMs` as a
+post-execution deadline: the result of an overrunning statement is refused, but the statement is
+never preempted. SQLite has no transaction-local statement timeout, and neither `bun:sqlite` nor
+`node:sqlite` exposes `sqlite3_interrupt` or a progress handler, so there is nothing to preempt it
+with. Because both drivers are synchronous, a hostile recursive CTE therefore blocks the whole
+runtime while it runs. This is the same property as the normal SQLite query path, but the input
+source is different in kind: there the SQL comes from an authenticated operator, here it comes from
+an agent. Done when either driver exposes an interrupt/progress hook, or agent SQLite execution
+moves to a worker that can be killed on deadline.
+
+### A2. `VACUUM INTO` can create an empty file at an agent-chosen path
+
+The SQLite agent profile's read-only open governs the target database file only; `VACUUM INTO
+'<path>'` writes to a *different* file and is refused by `PRAGMA query_only`, which the profile
+re-asserts and verifies before every statement. SQLite creates the destination file before the
+write is refused, so a zero-byte file can still appear at any path the server process can write to
+(no data reaches it - asserted on both adapters by file size). Closing this needs an authorizer
+callback, which `bun:sqlite` does not expose at all. Done when a control exists on both adapters,
+or when agent SQLite targets are constrained to an allowlisted directory (related: the base-dir
+allowlist proposed in issue #125).
+
+### A3. Out-of-scope READS have no database-native control on either provider
+
+Both agent profiles bound what a statement can WRITE with a database-native control. What it can
+READ is bounded only by the policy layer's declared-target allowlist plus the input-stage statement
+guard - and both of those read SQL, which this milestone treats as defense in depth rather than a
+boundary:
+
+- SQLite: `ATTACH` of an *existing* file succeeds on a read-only handle and its rows become
+  readable. No authorizer exists on `bun:sqlite`, so there is nothing engine-side to stop it
+  (docs/providers/sqlite.md section 12.3).
+- PostgreSQL: the read-only role can read every table its grants allow, whatever catalog or schema
+  the request declared. Per-table `SELECT` grants are the only real bound
+  (docs/providers/postgres.md section 12.3).
+
+Done when out-of-scope reads are refused by something that does not read SQL - a per-target grant
+set generated for the agent role, an allowlisted directory for SQLite targets, or an authorizer both
+adapters expose.
+
+### A4. No wall-clock deadline bounds an agent run
+
+`maxTotalRunMs` bounds the DATABASE time a run consumes: the execution layer reports each completed
+call's elapsed time and the tracker sums them. Nothing bounds the run's wall clock. Time between
+calls is not counted, so a run that spends minutes in model latency or waiting on a caller stays
+inside its budget indefinitely; parallel calls each contribute their own duration, so the sum can
+exceed real elapsed time; and a call admitted just under the limit can still overrun it by up to one
+statement timeout.
+
+This is deliberate at this layer. `ExecutionBudgetTracker` has no clock so that budget accounting
+stays deterministic under test, and database time is the bound that actually protects the database.
+The missing control is a run-level one: a runaway agent is bounded by how long it may run, not by
+how much database time it used.
+
+Done when the run loop owns a monotonic deadline per run, refuses to admit a call that cannot finish
+inside the remaining time, and clamps each effective statement timeout to what is left. That belongs
+with the WorkflowAgent run loop in M2 (#329), which is the first component that owns a run's
+lifetime.
+
+### A5. The PostgreSQL profile's regression tests model the server rather than run one
+
+`tests/integration/db/postgres-provider.test.ts` proves the read-only profile against a stateful
+hand-written engine mock. Every rule it models was verified against a live PostgreSQL 18 while the
+profile was built - read-only transaction rejection by engine state, the extended-protocol refusal of
+multi-command strings, `SET TRANSACTION READ WRITE` really relaxing the transaction, advisory locks
+surviving rollback - and the mock encodes them faithfully enough that bypass attempts fail on real
+modeled behavior (a write actually landing) rather than on protocol metadata.
+
+What it cannot catch is a future regression on the other side of the seam: a driver change, a server
+version that behaves differently, or a `pg` option that stops meaning what it meant. The assertions
+would stay green because the mock, not the server, defines the semantics. The repository's
+integration suites are mock-based by convention and CI runs no database service; the only real
+engine in the pipeline today is the throwaway PostgreSQL container behind
+`loop/scripts/functional-smoke.sh`.
+
+Done when a container-backed test proves, against a supported PostgreSQL, that a direct write and a
+multi-command escape are rejected through the profile under the resolved role. The cheapest path is
+extending the functional-smoke container rather than adding a service to every CI test job.

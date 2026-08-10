@@ -6,7 +6,8 @@
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { DatabaseConnection } from "@/lib/types";
-import { DatabaseConfigError } from "@/lib/db/errors";
+import type { ReadOnlyStatementBudget } from "@/lib/db/types";
+import { ConnectionError, DatabaseConfigError, ExecutionProfileError } from "@/lib/db/errors";
 
 // ============================================================================
 // Mock pg BEFORE importing the provider
@@ -23,7 +24,9 @@ let mockQueryFn: (
 
 const mockClient = {
   query: (sql: string, params?: unknown[]) => mockQueryFn(sql, params),
-  release: () => {},
+  // Real pg signature: release(err?) — an error argument destroys the client
+  // instead of returning it to the pool, which queryReadOnly relies on.
+  release: (_destroy?: Error) => {},
 };
 
 /**
@@ -1881,6 +1884,612 @@ describe("PostgresProvider", () => {
 
       expect(result.query).toBe(sql);
       expect(result.wasLimited).toBe(false);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // queryReadOnly — agent read-only execution profile (#328)
+  // --------------------------------------------------------------------------
+
+  describe("queryReadOnly (agent read-only execution profile)", () => {
+    /** Reads the first keyword the way the server would: past whitespace and comments. */
+    function engineLeadingKeyword(text: string): string {
+      let rest = text;
+      for (;;) {
+        const trimmed = rest.trimStart();
+        if (trimmed.startsWith("--")) {
+          const newline = trimmed.indexOf("\n");
+          rest = newline === -1 ? "" : trimmed.slice(newline + 1);
+          continue;
+        }
+        if (trimmed.startsWith("/*")) {
+          const close = trimmed.indexOf("*/");
+          rest = close === -1 ? "" : trimmed.slice(close + 2);
+          continue;
+        }
+        return (/^[A-Za-z]+/.exec(trimmed)?.[0] ?? "").toUpperCase();
+      }
+    }
+
+    function pgServerError(message: string, code: string): Error {
+      return Object.assign(new Error(message), { code });
+    }
+
+    /** The server executes each semicolon-separated command of a simple-protocol string in turn. */
+    function splitCommands(text: string): string[] {
+      // Naive split is faithful enough for this suite's corpus (no ';' inside literals).
+      return text
+        .split(";")
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0);
+    }
+
+    type EngineProtocol = "simple" | "extended";
+
+    /**
+     * A data-modifying CTE, the only shape that can carry a write under a `WITH`.
+     *
+     * A whole-text pattern, which `lib/sql/operative-keyword.ts` documents as the
+     * wrong reading for PRODUCTION code — deliberately kept here, where being
+     * stricter than the server only ever makes a hostile fixture easier to
+     * refuse. A read-only CTE that merely quotes a write keyword would be modeled
+     * as a write, so a future fixture of that shape must not be read as proof of
+     * anything.
+     */
+    function withCarriesWrite(text: string): boolean {
+      return /\b(?:INSERT|UPDATE|DELETE|MERGE)\b/i.test(text);
+    }
+
+    /**
+     * Stateful engine mock modeling the PostgreSQL behaviors this profile's
+     * security rests on, so the assertions hold even when product-side
+     * classification is bypassed. Every rule below was verified against a live
+     * PostgreSQL 18 rather than assumed:
+     *
+     * - a write executed inside a READ ONLY transaction fails with 25006 based
+     *   on the ENGINE's transaction state, no matter what the text looks like —
+     *   including a data-modifying CTE, which the server refuses while naming
+     *   the top-level statement ("cannot execute SELECT in a read-only
+     *   transaction"), and a write behind a comment;
+     * - `SET TRANSACTION READ WRITE` really DOES relax the transaction — it is
+     *   accepted inside `BEGIN READ ONLY` and a following write then commits.
+     *   That is why the profile's one-statement-per-transaction rule is
+     *   load-bearing rather than decorative, and modeling it faithfully is what
+     *   makes the pollution tests below mean something;
+     * - a session-level `SET` inside the transaction is reverted by ROLLBACK
+     *   (GUC changes are transactional), so it cannot leak into the next
+     *   execution on a pooled client;
+     * - `COPY … TO <file>` / `TO PROGRAM` are NOT refused by a read-only
+     *   transaction. Only privileges refuse them, which is why the profile
+     *   verifies the role at open;
+     * - the extended query protocol refuses multi-command strings with 42601
+     *   before executing anything;
+     * - the simple protocol EXECUTES multi-command strings sequentially and
+     *   honors transaction control, so an implementation that regressed to the
+     *   simple protocol would really COMMIT out of the read-only transaction
+     *   and apply the smuggled write — `appliedWrites` catches that.
+     *
+     * Protocol detection mirrors pg's requiresPreparation()
+     * (node_modules/pg/lib/query.js): named, extended-mode, or valued queries
+     * prepare; a bare string with no values stays on the simple protocol.
+     */
+    class ReadOnlyEngineMock {
+      txState: "none" | "read-only" | "read-write" | "aborted" = "none";
+      readonly statements: Array<{ text: string; protocol: EngineProtocol }> = [];
+      readonly appliedWrites: string[] = [];
+      readonly localTimeouts: number[] = [];
+      /** Files/programs a COPY reached — empty unless privileges allowed it. */
+      readonly serverFileWrites: string[] = [];
+      selectRows: Array<Record<string, unknown>> = [{ ok: 1 }];
+      failRollback = false;
+      /** What the role-privilege probe answers. All false = a least-privilege agent role. */
+      privileges: Record<string, boolean> = {
+        is_superuser: false,
+        reads_server_files: false,
+        writes_server_files: false,
+        executes_programs: false,
+      };
+      /** Rows the probe returns; overridable to model a server that answers nothing. */
+      privilegeRows: Array<Record<string, unknown>> | null = null;
+      privilegeProbes = 0;
+      /** The probe's SQL, kept so a test can assert how it names its built-ins. */
+      privilegeProbeText: string | null = null;
+      /** Set to model the probe itself failing (dropped socket, protocol error). */
+      privilegeProbeFailure: Error | null = null;
+      /** Session-level statement_timeout, and the value to restore on rollback. */
+      sessionTimeout = 30_000;
+      private sessionTimeoutBeforeTx: number | null = null;
+      /** Advisory locks held by the session. These survive ROLLBACK (verified on 18). */
+      readonly advisoryLocks: number[] = [];
+
+      static protocolOf(arg: unknown, params?: unknown[]): { text: string; protocol: EngineProtocol } {
+        if (typeof arg === "string") {
+          const extended = Array.isArray(params) && params.length > 0;
+          return { text: arg, protocol: extended ? "extended" : "simple" };
+        }
+        const config = arg as { text: string; name?: string; values?: unknown[]; queryMode?: string };
+        const extended =
+          config.queryMode === "extended" ||
+          Boolean(config.name) ||
+          (Array.isArray(config.values) && config.values.length > 0);
+        return { text: config.text, protocol: extended ? "extended" : "simple" };
+      }
+
+      async query(arg: unknown, params?: unknown[]) {
+        const { text, protocol } = ReadOnlyEngineMock.protocolOf(arg, params);
+        if (protocol === "extended") {
+          if (splitCommands(text).length > 1) {
+            throw pgServerError("cannot insert multiple commands into a prepared statement", "42601");
+          }
+          return this.execute(text, protocol);
+        }
+        let last: ReturnType<ReadOnlyEngineMock["execute"]> = { rows: [], fields: [], rowCount: 0 };
+        for (const command of splitCommands(text)) {
+          last = this.execute(command, protocol);
+        }
+        return last;
+      }
+
+      private rows(data: Array<Record<string, unknown>>) {
+        return { rows: data, fields: Object.keys(data[0] ?? {}).map((name) => ({ name })), rowCount: data.length };
+      }
+
+      /** A write attempt: refused by the transaction's access mode, else applied. */
+      private write(text: string, named: string) {
+        if (this.txState === "read-only") {
+          this.txState = "aborted";
+          throw pgServerError(`cannot execute ${named} in a read-only transaction`, "25006");
+        }
+        this.appliedWrites.push(text.trim());
+        return { rows: [], fields: [], rowCount: 1 };
+      }
+
+      private execute(text: string, protocol: EngineProtocol) {
+        const keyword = engineLeadingKeyword(text);
+        // The role-privilege probe the read-only profile runs at OPEN. Counted
+        // separately rather than pushed onto `statements`, which the tests read
+        // as "what one queryReadOnly call sent".
+        if (keyword === "SELECT" && /is_superuser/i.test(text)) {
+          this.privilegeProbes++;
+          this.privilegeProbeText = text;
+          if (this.privilegeProbeFailure) throw this.privilegeProbeFailure;
+          return this.rows(this.privilegeRows ?? [{ ...this.privileges }]);
+        }
+        this.statements.push({ text: text.trim(), protocol });
+        if (this.txState === "aborted" && keyword !== "ROLLBACK" && keyword !== "COMMIT") {
+          throw pgServerError(
+            "current transaction is aborted, commands ignored until end of transaction block",
+            "25P02",
+          );
+        }
+        switch (keyword) {
+          case "BEGIN":
+          case "START":
+            // Inside a transaction the server only warns; state is unchanged.
+            if (this.txState === "none") {
+              this.txState = /read\s+only/i.test(text) ? "read-only" : "read-write";
+              this.sessionTimeoutBeforeTx = this.sessionTimeout;
+            }
+            return { rows: [], fields: [], rowCount: 0 };
+          case "COMMIT":
+          case "END":
+            this.txState = "none";
+            this.sessionTimeoutBeforeTx = null;
+            return { rows: [], fields: [], rowCount: 0 };
+          case "ROLLBACK":
+            if (this.failRollback) {
+              throw pgServerError("server closed the connection unexpectedly", "08006");
+            }
+            this.txState = "none";
+            // GUC changes are transactional: a session-level SET made inside the
+            // transaction is undone here.
+            if (this.sessionTimeoutBeforeTx !== null) this.sessionTimeout = this.sessionTimeoutBeforeTx;
+            this.sessionTimeoutBeforeTx = null;
+            return { rows: [], fields: [], rowCount: 0 };
+          case "SET": {
+            const local = /^set\s+local\s+statement_timeout\s*=\s*(\d+)$/i.exec(text.trim());
+            if (local) {
+              this.localTimeouts.push(Number(local[1]));
+              return { rows: [], fields: [], rowCount: 0 };
+            }
+            const session = /^set\s+statement_timeout\s*=\s*(\d+)$/i.exec(text.trim());
+            if (session) {
+              this.sessionTimeout = Number(session[1]);
+              return { rows: [], fields: [], rowCount: 0 };
+            }
+            // Live-verified on PostgreSQL 18: accepted inside BEGIN READ ONLY,
+            // and the transaction really becomes writable.
+            if (/^set\s+transaction\s+read\s+write$/i.test(text.trim())) {
+              if (this.txState === "read-only") this.txState = "read-write";
+              return { rows: [], fields: [], rowCount: 0 };
+            }
+            return { rows: [], fields: [], rowCount: 0 };
+          }
+          case "COPY": {
+            // A read-only transaction does not refuse these; privileges do.
+            const toProgram = /\bto\s+program\b/i.test(text);
+            const privileged = toProgram ? this.privileges.executes_programs : this.privileges.writes_server_files;
+            if (!privileged) {
+              this.txState = "aborted";
+              throw pgServerError(
+                toProgram
+                  ? "permission denied to COPY to or from an external program"
+                  : "permission denied to COPY to a file",
+                "42501",
+              );
+            }
+            this.serverFileWrites.push(text.trim());
+            return { rows: [], fields: [], rowCount: 1 };
+          }
+          case "DISCARD":
+            // Session state a rollback does not undo. Cannot run inside a
+            // transaction block, which is why the profile issues it after the
+            // ROLLBACK rather than instead of it.
+            this.advisoryLocks.length = 0;
+            return { rows: [], fields: [], rowCount: 0 };
+          case "WITH":
+            // The CTE list is a preamble: a `WITH` that carries a write is a
+            // write, and one that does not is an ordinary read.
+            return withCarriesWrite(text) ? this.write(text, "SELECT") : this.rows(this.selectRows);
+          case "SELECT": {
+            // An advisory lock is session state, not transaction state: taking
+            // one inside a read-only transaction succeeds and outlives the
+            // rollback.
+            const lock = /pg_advisory_lock\(\s*(\d+)\s*\)/i.exec(text);
+            if (lock) {
+              this.advisoryLocks.push(Number(lock[1]));
+              return this.rows([{ pg_advisory_lock: "" }]);
+            }
+            return this.rows(this.selectRows);
+          }
+          case "EXPLAIN":
+          case "SHOW":
+            return this.rows(this.selectRows);
+          default:
+            // Everything else counts as a write attempt (conservative server model).
+            return this.write(text, keyword);
+        }
+      }
+    }
+
+    function roBudget(overrides: Partial<ReadOnlyStatementBudget> = {}): ReadOnlyStatementBudget {
+      return { statementTimeoutMs: 4500, maxResultRows: 100, maxResultBytes: 1_000_000, ...overrides };
+    }
+
+    let engine: ReadOnlyEngineMock;
+    let releaseSpy: ReturnType<typeof spyOn<typeof mockClient, "release">>;
+
+    beforeEach(async () => {
+      engine = new ReadOnlyEngineMock();
+      mockQueryFn = (sql: string, params?: unknown[]) => engine.query(sql, params);
+      // The third argument is the server-injected execution context: `queryReadOnly`
+      // exists only on a provider opened under the profile, so that the role
+      // verification below can never be skipped by reaching for the method on an
+      // ordinary provider.
+      provider = new PostgresProvider(makePgConfig(), {}, { readOnly: true });
+      await provider.connect();
+      // Installed after connect() so the counts below are wrapper-only.
+      releaseSpy = spyOn(mockClient, "release");
+    });
+
+    afterEach(() => {
+      releaseSpy.mockRestore();
+    });
+
+    test("runs exactly one statement inside BEGIN READ ONLY with a transaction-local timeout, then rolls back and releases", async () => {
+      const result = await provider.queryReadOnly("SELECT 1 AS ok", roBudget());
+
+      expect(result.rows).toEqual([{ ok: 1 }]);
+      expect(result.fields).toEqual(["ok"]);
+      expect(result.rowCount).toBe(1);
+      expect(result.executionTime).toBeGreaterThanOrEqual(0);
+      expect(engine.statements.map((s) => s.text)).toEqual([
+        "BEGIN READ ONLY",
+        "SET LOCAL statement_timeout = 4500",
+        "SELECT 1 AS ok",
+        "ROLLBACK",
+        // Session state the rollback does not undo (see the advisory-lock case).
+        "DISCARD ALL",
+      ]);
+      // The statement itself travels on the extended protocol — that is what
+      // makes single-statement a server-enforced property (42601), not a parse.
+      expect(engine.statements[2]?.protocol).toBe("extended");
+      expect(engine.localTimeouts).toEqual([4500]);
+      expect(releaseSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test("the database itself rejects a write attempted through the agent path", async () => {
+      await expect(provider.queryReadOnly("INSERT INTO t (id) VALUES (1)", roBudget())).rejects.toThrow(
+        /read-only transaction/,
+      );
+
+      expect(engine.appliedWrites).toEqual([]);
+      expect(engine.statements.at(-1)?.text).toBe("DISCARD ALL");
+      expect(releaseSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test("the normal editor path on the same connection still writes", async () => {
+      // The editor holds its own, unprofiled provider (getOrCreateProvider's
+      // cache entry) — the regression pin for #328: gating the agent path must
+      // not gate the editor.
+      const editor = new PostgresProvider(makePgConfig());
+      await editor.connect();
+      const result = await editor.query("INSERT INTO t (id) VALUES (1)");
+
+      expect(result.rowCount).toBe(1);
+      expect(engine.appliedWrites).toEqual(["INSERT INTO t (id) VALUES (1)"]);
+      await editor.disconnect();
+    });
+
+    test("refuses queryReadOnly on a provider that was not opened under the profile", async () => {
+      const unprofiled = new PostgresProvider(makePgConfig());
+      await unprofiled.connect();
+
+      // Fail closed, and for the reason the SQLite profile fails closed too: a
+      // provider opened outside the profile has had no role verification, so
+      // running the statement there would be the fail-open this layer prevents.
+      await expect(unprofiled.queryReadOnly("SELECT 1", roBudget())).rejects.toThrow(/read-only profile/i);
+      expect(engine.statements).toEqual([]);
+      await unprofiled.disconnect();
+    });
+
+    test("multi-statement input cannot smuggle transaction control past the read-only boundary", async () => {
+      await expect(
+        provider.queryReadOnly("SELECT 1; COMMIT; INSERT INTO t (id) VALUES (1)", roBudget()),
+      ).rejects.toThrow(/multiple commands/);
+
+      expect(engine.appliedWrites).toEqual([]);
+      // The server refused at parse time: nothing ran between SET LOCAL and ROLLBACK.
+      expect(engine.statements.map((s) => s.text)).toEqual([
+        "BEGIN READ ONLY",
+        "SET LOCAL statement_timeout = 4500",
+        "ROLLBACK",
+        "DISCARD ALL",
+      ]);
+    });
+
+    test("a transaction-control statement as the single statement leaves no residue", async () => {
+      const result = await provider.queryReadOnly("COMMIT", roBudget());
+
+      expect(result.rows).toEqual([]);
+      expect(engine.appliedWrites).toEqual([]);
+      expect(engine.txState).toBe("none");
+      expect(releaseSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test("rejects a malformed budget before any statement reaches the session", async () => {
+      const hostileTimeouts = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648, "50; COMMIT"];
+      for (const statementTimeoutMs of hostileTimeouts) {
+        await expect(
+          provider.queryReadOnly("SELECT 1", roBudget({ statementTimeoutMs: statementTimeoutMs as never })),
+        ).rejects.toThrow(/budget/i);
+      }
+      await expect(provider.queryReadOnly("SELECT 1", roBudget({ maxResultRows: 0 }))).rejects.toThrow(/budget/i);
+      await expect(provider.queryReadOnly("SELECT 1", roBudget({ maxResultBytes: -5 }))).rejects.toThrow(/budget/i);
+
+      expect(engine.statements).toEqual([]);
+      expect(releaseSpy).not.toHaveBeenCalled();
+    });
+
+    test("enforces the row budget result-side", async () => {
+      engine.selectRows = [{ id: 1 }, { id: 2 }, { id: 3 }];
+
+      await expect(provider.queryReadOnly("SELECT id FROM t", roBudget({ maxResultRows: 2 }))).rejects.toThrow(
+        /row budget/i,
+      );
+      expect(engine.statements.at(-1)?.text).toBe("DISCARD ALL");
+      expect(releaseSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test("enforces the byte budget result-side", async () => {
+      engine.selectRows = [{ blob: "x".repeat(64) }];
+
+      await expect(provider.queryReadOnly("SELECT blob FROM t", roBudget({ maxResultBytes: 16 }))).rejects.toThrow(
+        /byte budget/i,
+      );
+      expect(engine.statements.at(-1)?.text).toBe("DISCARD ALL");
+    });
+
+    test("a client that cannot roll back is destroyed, never returned to the pool", async () => {
+      engine.failRollback = true;
+
+      const result = await provider.queryReadOnly("SELECT 1 AS ok", roBudget());
+
+      expect(result.rows).toEqual([{ ok: 1 }]);
+      expect(releaseSpy).toHaveBeenCalledTimes(1);
+      expect(releaseSpy.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+    });
+
+    test("requires a connected provider", async () => {
+      const cold = new PostgresProvider(makePgConfig(), {}, { readOnly: true });
+
+      await expect(cold.queryReadOnly("SELECT 1", roBudget())).rejects.toThrow(/connect/i);
+      expect(engine.statements).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // What the read-only TRANSACTION does not cover (verified on PostgreSQL 18)
+    // ------------------------------------------------------------------------
+
+    test("verifies at open that the agent role holds no server-file or program privilege", async () => {
+      // The probe is part of opening the profile, not of every statement.
+      expect(engine.privilegeProbes).toBe(1);
+      expect(provider.isConnected()).toBe(true);
+    });
+
+    test("schema-qualifies every built-in the privilege probe calls", () => {
+      // pg_catalog is searched implicitly FIRST only while it is NOT named in
+      // search_path; once it is named explicitly, a schema ahead of it shadows
+      // built-ins. So `search_path = attacker_schema, pg_catalog` plus a shadow
+      // pg_has_role()/current_setting() makes this probe answer four falses for
+      // a superuser — defeating the one check meant to catch exactly that role.
+      // Whoever can plant prompt-injection text in a table can often also create
+      // a function, so the two reach the same attacker. Qualifying costs nothing.
+      // Only real catalog FUNCTIONS are shadowable, so only they are listed:
+      // COALESCE and CURRENT_USER are SQL constructs the parser handles, cannot
+      // be schema-qualified at all, and no user function can intercept them.
+      const probe = engine.privilegeProbeText;
+      expect(probe).toBeTruthy();
+      for (const builtin of ["current_setting", "pg_has_role", "to_regrole"]) {
+        expect(probe).not.toMatch(new RegExp(String.raw`(?<!pg_catalog\.)\b${builtin}\s*\(`, "i"));
+      }
+    });
+
+    test("ends the pool when the privilege probe itself fails", async () => {
+      // The typed refusal path already ends the pool. This is the other way out
+      // of connect() after the pool exists: the probe query rejecting on a
+      // dropped socket or protocol error. The factory does not disconnect a
+      // provider whose connect() threw, so a pool left open here leaks its idle
+      // socket and timers with nothing holding a reference to close them.
+      engine.privilegeProbeFailure = new Error("connection terminated unexpectedly");
+      const failing = new PostgresProvider(makePgConfig(), {}, { readOnly: true });
+      const endSpy = spyOn(MockPool.prototype, "end");
+
+      const error = await failing.connect().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(ConnectionError);
+      expect(failing.isConnected()).toBe(false);
+      expect(endSpy).toHaveBeenCalled();
+      endSpy.mockRestore();
+      engine.privilegeProbeFailure = null;
+    });
+
+    test.each([
+      ["a superuser", "is_superuser"],
+      ["a role that can read server files", "reads_server_files"],
+      ["a role that can write server files", "writes_server_files"],
+      ["a role that can run server programs", "executes_programs"],
+    ])("refuses to open the profile for %s", async (_label, capability) => {
+      // A read-only transaction forbids changing the DATABASE. It does not stop
+      // `COPY … TO '<path>'`, `COPY … TO PROGRAM '<cmd>'` or `pg_read_file()` —
+      // all three succeeded inside BEGIN READ ONLY as a superuser on PostgreSQL
+      // 18. Only privileges refuse them, so a role that holds any of these has
+      // no read-only boundary and the profile refuses to vend it.
+      engine.privileges = { ...engine.privileges, [capability]: true };
+      const privileged = new PostgresProvider(makePgConfig(), {}, { readOnly: true });
+      // The pool is constructed inside connect(), so the spy goes on the
+      // prototype rather than on an instance that does not exist yet.
+      const endSpy = spyOn(MockPool.prototype, "end");
+
+      const error = await privileged.connect().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(ExecutionProfileError);
+      expect((error as ExecutionProfileError).reasonCode).toBe("PROFILE_PRIVILEGES_TOO_BROAD");
+      expect(privileged.isConnected()).toBe(false);
+      // The pool exists before the refusal; leaving it would leak its sockets
+      // for a provider the caller can never use.
+      expect(endSpy).toHaveBeenCalled();
+      endSpy.mockRestore();
+    });
+
+    test.each([
+      ["no rows", []],
+      ["a row without the expected fields", [{ ok: 1 }]],
+      ["a row whose flags are not booleans", [{ is_superuser: "off" }]],
+    ])("fails closed when the privilege probe answers %s", async (_label, rows) => {
+      engine.privilegeRows = rows as Array<Record<string, unknown>>;
+      const unverifiable = new PostgresProvider(makePgConfig(), {}, { readOnly: true });
+
+      await expect(unverifiable.connect()).rejects.toThrow(ExecutionProfileError);
+      expect(unverifiable.isConnected()).toBe(false);
+    });
+
+    test("the profile only ever exists for a role the engine refuses COPY to", async () => {
+      // Together with the refusals above, this is the whole story for the
+      // exfiltration family: the engine permits COPY under a read-only
+      // transaction, so the control is the role — and for a role that reached
+      // the profile, the engine itself denies it.
+      await expect(provider.queryReadOnly("COPY (SELECT 1) TO PROGRAM 'sh -c id'", roBudget())).rejects.toThrow(
+        /permission denied/i,
+      );
+      await expect(provider.queryReadOnly("COPY (SELECT 1) TO '/tmp/stolen.txt'", roBudget())).rejects.toThrow(
+        /permission denied/i,
+      );
+
+      expect(engine.serverFileWrites).toEqual([]);
+      expect(engine.appliedWrites).toEqual([]);
+    });
+
+    test("a data-modifying CTE is rejected by the engine while a read-only CTE succeeds", async () => {
+      engine.selectRows = [{ n: 1 }];
+      const read = await provider.queryReadOnly(
+        "WITH recent AS (SELECT id FROM t) SELECT count(*) AS n FROM recent",
+        roBudget(),
+      );
+      expect(read.rows).toEqual([{ n: 1 }]);
+
+      await expect(
+        provider.queryReadOnly(
+          "WITH moved AS (INSERT INTO archive SELECT * FROM t RETURNING id) SELECT count(*) FROM moved",
+          roBudget(),
+        ),
+      ).rejects.toThrow(/read-only transaction/);
+
+      // The pair is the point: a mock that blanket-refused every `WITH` would
+      // pass the second assertion for the wrong reason and fail the first.
+      expect(engine.appliedWrites).toEqual([]);
+    });
+
+    test("a write hidden behind a comment is rejected by the engine, not by inspecting the text", async () => {
+      await expect(provider.queryReadOnly("/* SELECT */ INSERT INTO t (id) VALUES (1)", roBudget())).rejects.toThrow(
+        /read-only transaction/,
+      );
+      await expect(provider.queryReadOnly("-- SELECT 1\nUPDATE t SET id = 2", roBudget())).rejects.toThrow(
+        /read-only transaction/,
+      );
+
+      expect(engine.appliedWrites).toEqual([]);
+    });
+
+    test("relaxing the transaction access mode cannot reach a second statement", async () => {
+      // The escape is real: this statement genuinely makes the transaction
+      // writable (live-verified). What stops it is that it is the transaction's
+      // ONLY statement — the next execution begins its own READ ONLY
+      // transaction on the pooled client.
+      await provider.queryReadOnly("SET TRANSACTION READ WRITE", roBudget());
+      expect(engine.txState).toBe("none");
+
+      await expect(provider.queryReadOnly("INSERT INTO t (id) VALUES (1)", roBudget())).rejects.toThrow(
+        /read-only transaction/,
+      );
+      expect(engine.appliedWrites).toEqual([]);
+      expect(engine.statements.filter((s) => s.text === "BEGIN READ ONLY")).toHaveLength(2);
+    });
+
+    test("a session-level SET does not survive into the next execution on the pooled client", async () => {
+      await provider.queryReadOnly("SET statement_timeout = 0", roBudget());
+
+      // The first assertion documents the model (GUCs are transactional, so the
+      // ROLLBACK restored the session value); the load-bearing one is the
+      // second — the next execution installs its own transaction-local timeout
+      // from the budget whatever the session carries.
+      expect(engine.sessionTimeout).toBe(30_000);
+      await provider.queryReadOnly("SELECT 1 AS ok", roBudget({ statementTimeoutMs: 1234 }));
+      expect(engine.localTimeouts).toEqual([4500, 1234]);
+    });
+
+    test("session state a rollback does NOT undo is discarded before the client goes back to the pool", async () => {
+      // Verified on PostgreSQL 18: an advisory lock taken inside BEGIN READ ONLY
+      // survives the ROLLBACK, and nothing on the agent path is REQUIRED to
+      // release it (`pg_advisory_unlock_all()` would, but a hostile statement has
+      // no reason to send it), so a pooled client would otherwise carry the lock
+      // into every later execution. `DISCARD ALL` — which cannot run inside a
+      // transaction block, hence after the rollback — makes "rolled back and
+      // released" true for session state too, without relying on goodwill.
+      await provider.queryReadOnly("SELECT pg_advisory_lock(101)", roBudget());
+
+      expect(engine.advisoryLocks).toEqual([]);
+      expect(engine.statements.map((s) => s.text)).toEqual([
+        "BEGIN READ ONLY",
+        "SET LOCAL statement_timeout = 4500",
+        "SELECT pg_advisory_lock(101)",
+        "ROLLBACK",
+        "DISCARD ALL",
+      ]);
     });
   });
 });
