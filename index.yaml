@@ -4,6 +4,70 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "Security release. This is the first published version carrying a four-phase security programme; every item below is new to a released artefact"
+        - "Security headers on every response, including an ENFORCED Content-Security-Policy, HSTS, Referrer-Policy, Permissions-Policy and frame-ancestors"
+        - "State-changing requests are checked against Origin, as a second cross-site-request-forgery layer behind SameSite=lax cookies"
+        - "Login, database and AI routes are rate limited; login failures are capped per client address and per submitted account, counted per process"
+        - "Every authentication transition emits one structured JSON audit line on stdout under the libredb.audit.v1 schema"
+        - "Stored database credentials are encrypted at rest with AES-256-GCM when STORAGE_PROVIDER is sqlite or postgres. Set STORAGE_ENCRYPTION_KEY from outside the mounted volume to protect a backup or snapshot as well as the database file"
+        - "Two cross-site-scripting sinks and an unauthenticated image proxy were removed, and the production build now type-checks"
+        - "ACTION MAY BE REQUIRED. An ingress that rewrites Host without setting x-forwarded-host must set ALLOWED_ORIGINS to this deployment public origin, or every state-changing request is refused with 403"
+        - "Track app release 0.10.0 (appVersion bump; default image tag follows)"
+      artifacthub.io/containsSecurityUpdates: "true"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.10.0
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.10.0
+    created: "2026-08-10T09:17:51.500593672Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: b185690ca5e418bcda9c55161bc3714295dc2e3e58c830f9fcbccb897d022886
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.31/libredb-studio-0.1.31.tgz
+    version: 0.1.31
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "Documented how to enforce rate limits at the ingress when running more than one replica: Studio's built-in limiter keeps its counters per process, so N replicas allow N times the configured budget"
         - "Documented ALLOWED_ORIGINS, which a deployment needs when the ingress rewrites the Host header without setting x-forwarded-host - without it every state-changing request, including login, is refused with a 403"
         - "Documented CSP_REPORT_ONLY, the runtime escape hatch for the enforced Content-Security-Policy, and how to set both variables through extraEnv"
@@ -1565,4 +1629,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-08-09T19:01:32.953139972Z"
+generated: "2026-08-10T09:17:51.493168368Z"
