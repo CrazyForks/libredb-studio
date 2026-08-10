@@ -32,15 +32,30 @@ Tags carry **no `v` prefix**: `0.9.65`, not `v0.9.65`.
 
 Direct pushes to `main` need the user's explicit authorization; otherwise open a PR.
 
+**Order matters here.** Hand-edit the chart FIRST, run `chart:bump` LAST. `chart:bump` is what
+refreshes `operator/helm-charts/libredb-studio/` from `charts/libredb-studio/`; a hand edit made
+afterwards leaves that vendored copy stale, `chart:check` fails on the mismatch, and `chart:bump`
+will not re-bump a version that is already in sync to repair it.
+
 ```bash
-# 1. package.json "version" -> the new patch version, by hand
+# 1. package.json "version" -> the new version, by hand
+# 2. charts/libredb-studio/Chart.yaml artifacthub.io/changes -> rewrite by hand, see below
 bun run chart:bump            # Chart.yaml version+appVersion, image tag, chart README, operator chart copy
 make -C operator bundle       # CSV version + controller image tag (reads package.json)
 ```
 
-Then, **by hand**, rewrite `charts/libredb-studio/Chart.yaml`'s `artifacthub.io/changes` entries for
-the new version. `chart:bump` does NOT touch them - its `Track app release` regex no longer matches
-the current wording, so a stale changelog ships to ArtifactHub silently.
+**Rewrite `artifacthub.io/changes` by hand, every release.** `chart:bump` *does* rewrite it, but only
+to the single generic line `Track app release <version> (appVersion bump; default image tag follows)`
+- its regex matches that wording and replaces it in place. So the failure mode is not a stale
+changelog, it is a **meaningless** one: for a release carrying
+`artifacthub.io/containsSecurityUpdates: "true"`, that one line is the entire changelog an operator
+reads when deciding whether to upgrade. Write real entries, and keep one `Track app release` line
+**last** so the next `chart:bump` can still find and update it. Each entry must be a single-line
+**double-quoted** string - `scripts/sync-chart-version.mjs` enforces it, because ArtifactHub
+permanently skips a chart version over unquoted `{}:[],&*#?|-<>=!%@`.
+
+There is no second chance: once the chart version publishes, #167 blocks republishing it, so that
+version's changelog is frozen as shipped.
 
 Validate before committing:
 
@@ -48,6 +63,8 @@ Validate before committing:
 bun run format && bun run lint && bun run typecheck && bun run knip && bun run test && bun run build
 bun run test:coverage && bun run coverage:check     # 100% is a hard gate
 bun run chart:check                                 # appVersion == package.json, changes-annotation quoting
+bun run readme:check                                # localized READMEs match README.md
+bun run security:check                              # docs/SECURITY.md vs the repository, both directions
 helm lint charts/libredb-studio --strict
 make -C operator bundle && git diff --exit-code operator/   # only AFTER committing, see below
 ```
@@ -67,16 +84,20 @@ uncommitted bump edits always read as drift. CI runs it against the committed st
 
 ## Phase 2 - Verify main before tagging
 
-All five workflows must be green **on the bump commit**, because the tag will point at it:
+All six workflows must be green **on the bump commit**, because the tag will point at it:
 
 ```bash
 gh run list --limit 6 --json name,status,conclusion,headSha \
   --jq '.[] | select(.headSha=="<bump-sha>") | "\(.name)\t\(.status)\t\(.conclusion // "-")"'
 ```
 
-Expected: `CI`, `Docker Build and Push`, `Platform Integration Check`, `CodeQL Advanced` all success,
-and `Helm Chart Release` success with its publish jobs **skipped** - the image gate refuses to publish
-a chart whose `appVersion` image does not exist yet. A skipped publish here is correct, not a failure.
+Expected: `CI`, `Docker Build and Push`, `Platform Integration Check`, `CodeQL Advanced` and
+`Security Scan` all success, and `Helm Chart Release` success with its publish jobs **skipped** - the
+image gate refuses to publish a chart whose `appVersion` image does not exist yet. A skipped publish
+here is correct, not a failure; confirm it rather than assuming, because a chart published before the
+app leaves the chain nothing to publish and #167 then blocks the retry. `Security Scan` joined this
+list in 0.10.0 and is not a required check, so a red one does not block a merge - but on a release
+commit, treat it as blocking anyway.
 (Run this same query after tagging and `Release Artifacts` joins the list: the tag points at the bump
 commit, so it shares the SHA.)
 
@@ -130,8 +151,13 @@ never use `gh pr checks --watch --required` right after a push: with no runs reg
 
 The publish step verifies a fixed list of 22 **required** assets and refuses to publish an incomplete
 release, so `Verify assets and publish release` is the single step that tells you whether the release
-went public. The published release carries more than 22 when optional channels ran - the two `.snap`
-files are not in the required list, because the snap jobs skip cleanly without store credentials.
+went public. Read that job's conclusion and the release's own `isDraft` - never infer publication from
+the run's overall conclusion, in either direction.
+
+The published release carries more than 22 assets: the two `.snap` files are outside the required list
+because the snap jobs are credential-gated, but the store credentials are live, so they publish rather
+than skip. 0.10.0 landed 20 jobs green with **nothing** skipped and 25 assets. If you ever see snap
+skipping, that is an expired credential rather than the designed path.
 
 ## Phase 6 - Verify the published state
 
@@ -195,7 +221,8 @@ true on a tag ref.
 
 | Trap | What happens |
 |---|---|
-| `artifacthub.io/changes` left stale | ArtifactHub shows the previous release's changelog for the new chart |
+| `artifacthub.io/changes` left to `chart:bump` | ArtifactHub shows one generic `Track app release` line as the whole changelog - and on a release flagged `containsSecurityUpdates`, that is the text an operator upgrades or does not upgrade on. Frozen once the chart publishes (#167) |
+| Chart hand-edited AFTER `chart:bump` | `operator/helm-charts/` keeps the pre-edit copy, `chart:check` fails on the mismatch, and `chart:bump` will not re-bump an already-in-sync version to fix it. Edit first, bump last |
 | Chart version already released | Republishing rewrites the released chart's gh-pages index digest and OCI content (#167). `chart:check` blocks it; `force_republish` is the only escape hatch, for an asset-uploaded-but-index-failed run |
 | Unquoted `{}:[],&*#?\|-<>=!%@` in a changes entry | ArtifactHub hard-skips that chart version, permanently |
 | `packaging/flatpark/` bumped as part of a release | Do not touch it. FlatPark's bot has owned the pin since the 0.9.62 submission merged - it re-runs `resolve-update.sh` after each of our releases and rewrites its own copy, so this directory drifts by design (it still reads 0.9.62) and must stay out of release work. Bumping half of it fails `tests/unit/flatpark-descriptor.test.ts`, which requires the metainfo's newest `<release>` to equal the version the manifest pins as extra-data |
