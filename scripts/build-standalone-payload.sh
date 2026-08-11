@@ -9,8 +9,8 @@
 #   - .next/static                  -> .next/static
 #   - public                        -> public
 #   - node_modules/better-sqlite3   -> native binding for server storage
-#   - node_modules/bindings         -> better-sqlite3 runtime dependency
-#   - node_modules/file-uri-to-path -> bindings runtime dependency
+#                                      (self-contained since v13: N-API
+#                                      prebuilds live inside the package)
 #   - node_modules/@libredb/libredb -> lazy-imported, not seen by file tracing
 #   - seed-assets/                  -> vendored sample DB templates (fs-read
 #                                      at runtime, not seen by file tracing)
@@ -147,28 +147,40 @@ cp -R public "$PAYLOAD_DIR/public"
 # but `next build` copies any .env* it finds into the standalone output).
 rm -f "$PAYLOAD_DIR"/.env "$PAYLOAD_DIR"/.env.*
 
-for pkg in better-sqlite3 bindings file-uri-to-path; do
-  if [ ! -d "node_modules/$pkg" ]; then
-    echo "node_modules/$pkg not found - run 'bun install --frozen-lockfile' first" >&2
-    exit 1
-  fi
-done
-
-# The payload runs under `node`, so the better-sqlite3 native binding must
-# match node's ABI - not the ABI of whatever runtime happened to install it
-# (bun-compiled or stale bindings fail with ERR_DLOPEN_FAILED). Probe with an
-# actual Database construction (a bare require does not dlopen the binding)
-# and rebuild against the current node if it does not load.
-if ! node -e "require('./node_modules/better-sqlite3')(':memory:').close()" 2>/dev/null; then
-  echo "==> better-sqlite3 binding does not load under $(node --version) - rebuilding"
-  npm rebuild better-sqlite3
-  node -e "require('./node_modules/better-sqlite3')(':memory:').close()"
+if [ ! -d "node_modules/better-sqlite3" ]; then
+  echo "node_modules/better-sqlite3 not found - run 'bun install --frozen-lockfile' first" >&2
+  exit 1
 fi
 
-for pkg in better-sqlite3 bindings file-uri-to-path; do
-  rm -rf "${PAYLOAD_DIR:?}/node_modules/$pkg"
-  cp -R "node_modules/$pkg" "$PAYLOAD_DIR/node_modules/$pkg"
-done
+# Probe the native binding with an actual Database construction (a bare require
+# does not dlopen it). better-sqlite3 v13 is N-API, so this no longer guards an
+# ABI mismatch between the installing runtime and `node` - that class of failure
+# is gone. What it still catches is a tree with no loadable prebuild for this
+# platform: an incomplete install, or a target the package does not cover.
+#
+# There is deliberately no automatic rebuild here. Under v12 the fallback was
+# `npm rebuild better-sqlite3`, which worked because the package declared
+# `install: prebuild-install || node-gyp rebuild`. v13 declares no install
+# lifecycle and sets `gypfile: false`, so npm queues no node-gyp command and the
+# same call now reports "rebuilt dependencies successfully" while building
+# nothing - a silent no-op that would hide this failure behind a bare Node stack
+# trace on the next line. Automating a real source build instead would put
+# python3 and a C++ toolchain on the macOS and Windows release runners to
+# recover a case that cannot arise on a complete install: v13 prebuilds every
+# target this script accepts (linux/darwin x64+arm64, win32-x64). So: fail with
+# the diagnosis and hand over the one-off command.
+if ! node -e "require('./node_modules/better-sqlite3')(':memory:').close()" 2>/dev/null; then
+  TARGET="$(node -p 'process.platform')-$(node -p 'process.arch')"
+  echo "better-sqlite3 has no loadable prebuild for ${TARGET} under $(node --version)." >&2
+  echo "Since v13 the package ships an N-API prebuild for every target this script accepts," >&2
+  echo "so this normally means an incomplete node_modules - reinstall with 'bun install --frozen-lockfile'." >&2
+  echo "On a target the package genuinely does not cover, build the binding once by hand:" >&2
+  echo "  npm exec node-gyp -- rebuild --directory node_modules/better-sqlite3" >&2
+  exit 1
+fi
+
+rm -rf "${PAYLOAD_DIR:?}/node_modules/better-sqlite3"
+cp -R "node_modules/better-sqlite3" "$PAYLOAD_DIR/node_modules/better-sqlite3"
 
 if [ ! -d node_modules/@libredb/libredb ]; then
   echo "node_modules/@libredb/libredb not found - run 'bun install --frozen-lockfile' first" >&2

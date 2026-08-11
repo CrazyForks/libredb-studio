@@ -14,16 +14,18 @@ import { DEFAULT_STORAGE_SQLITE_PATH } from "@/lib/data-dir";
 let Database: any;
 
 /**
- * better-sqlite3 ships a native binding compiled against the Node 24 ABI
- * (release CI / Docker build). Loading it under an older Node fails with an
- * ABI mismatch that reads like an installation bug - translate it into an
- * actionable message instead.
+ * better-sqlite3 has shipped N-API prebuilds since v13, so its binding is no
+ * longer tied to the ABI of the Node that installed it and this guard should
+ * not fire through a normal install. It stays for the cases that still can:
+ * a pinned older better-sqlite3 (v12 and earlier compiled per Node ABI), or a
+ * node_modules assembled from mixed installs. Either way the raw failure reads
+ * like an installation bug - translate it into an actionable message.
  *
  * Only the NODE_MODULE_VERSION text (emitted by Node's module-register
  * check) is treated as an ABI mismatch. A bare ERR_DLOPEN_FAILED is NOT
  * enough: missing shared libraries, a libc mismatch, or a corrupted file
  * also surface as ERR_DLOPEN_FAILED - on any Node version - and must keep
- * their original error rather than a misleading "requires Node 24" claim.
+ * their original error rather than a misleading ABI claim.
  */
 function isNodeAbiMismatch(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -73,8 +75,12 @@ export class SQLiteStorageProvider implements ServerStorageProvider {
       logger.error("SQLite storage initialization failed", error, { provider: "sqlite", path: this.dbPath });
       if (isNodeAbiMismatch(error)) {
         throw new Error(
-          `Server-side SQLite storage (STORAGE_PROVIDER=sqlite) requires Node.js 24+: the bundled better-sqlite3 native module targets the Node 24 ABI and cannot load on Node ${process.versions.node}. ` +
-            "Run the server under Node 24 LTS, or use STORAGE_PROVIDER=postgres or STORAGE_PROVIDER=local instead. " +
+          // Deliberately NOT phrased as a floor ("Node 24 or newer"): a native
+          // binding loads only on the exact ABI it was built against, so a
+          // NEWER Node fails here too and would read such a message as already
+          // satisfied.
+          `Server-side SQLite storage (STORAGE_PROVIDER=sqlite) cannot start on Node ${process.versions.node}: the better-sqlite3 native module in this install was built for a different Node ABI and cannot load here. ` +
+            "better-sqlite3 13 ships N-API prebuilds that work across Node majors, so this normally means a pinned older better-sqlite3 or an incomplete node_modules - reinstall dependencies, or use STORAGE_PROVIDER=postgres or STORAGE_PROVIDER=local instead. " +
             `Underlying error: ${error instanceof Error ? error.message : String(error)}`,
           { cause: error },
         );

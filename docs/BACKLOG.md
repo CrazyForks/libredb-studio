@@ -762,3 +762,54 @@ engine in the pipeline today is the throwaway PostgreSQL container behind
 Done when a container-backed test proves, against a supported PostgreSQL, that a direct write and a
 multi-command escape are rejected through the profile under the resolved role. The cheapest path is
 extending the functional-smoke container rather than adding a service to every CI test job.
+
+### A6. Druid's hand-written bigint serializer predates the Node 24 floor
+
+`src/lib/db/providers/sql/druid/http-transport.ts` splices the parameters array into the query
+envelope by hand so a `bigint` literal reaches Druid unquoted. The reason recorded in `docs/providers/druid.md` was that
+`JSON.rawJSON` (ES2025 JSON source text, V8 12.4 / Node 22.2) could not be depended on while
+`engines.node` was `">=20.9.0"`.
+
+That constraint is gone: issue #326 raised the floor to `">=24.0.0"`, so `JSON.rawJSON` is available
+on every supported runtime. The hand-serializer is not wrong and is fully covered, so it was left
+alone rather than rewritten inside a runtime-baseline change - swapping a correctness-critical
+escaping path belongs in a change whose tests are about that path.
+
+Done when the splice is replaced by `JSON.rawJSON` with the existing bigint fixtures still green,
+or when this entry is deleted with a note that the hand-serializer is the preferred implementation.
+
+### A7. TypeScript 7 compiles this project cleanly but the lint layer cannot follow yet
+
+Probed while raising the Node baseline (#326): `tsc --noEmit` under **typescript@7.0.2** (the native
+Go port) reports **zero errors** on this repository and finishes in **1.8s against 7.7s** for the
+6.0.3 JavaScript compiler - a 4x wall-clock improvement on the `typecheck` gate.
+
+It cannot be adopted yet, and the blocker is upstream of typescript-eslint rather than in it.
+**TypeScript 7 ships no in-process compiler API at all.** Measured against the published packages:
+
+```
+typescript@7.0.2               -> require("typescript") exports: version, versionMajorMinor
+typescript@7.1.0-dev.20260810.1 -> require("typescript") exports: version, versionMajorMinor
+```
+
+`ts.createProgram` and `ts.Extension` are `undefined`. Everything that builds a program in-process -
+typescript-eslint, `eslint-config-next`, tsup's declaration build - has nothing to call. The repo's
+type-aware ESLint layer guards `src/app/api` and `src/lib/db` against floating promises, so dropping
+it to move the compiler is not a trade worth making.
+
+typescript-eslint's own tracking issue is
+[#10940](https://github.com/typescript-eslint/typescript-eslint/issues/10940) ("Use TS 7 (tsgo /
+typescript-go) for type information"), open and labelled **blocked by external API**; a maintainer
+put it as "there is nothing we can do about this until TS 7 provides an API". Note that
+[#12518](https://github.com/typescript-eslint/typescript-eslint/issues/12518) reads as *not planned*
+in the GitHub UI - that is how a close-as-duplicate renders, not a statement of intent.
+
+An interim option exists if the 4x typecheck gain is wanted before then: Microsoft documents running
+[6.0 and 7.0 side by side](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/#running-side-by-side-with-typescript-6.0)
+- keep `typescript@6` as the peer typescript-eslint resolves, add `typescript-7` as an npm alias, and
+point a second script at it. The cost is two compilers in the lockfile and a second source of truth
+about what type-checks; today that divergence is zero, since 7.0.2 already reports no errors here.
+
+Done when TypeScript exposes an API 7.x tooling can build on and typescript-eslint's peer range
+follows, at which point this is a one-line dependency bump plus a re-run of the gates: the compiler
+side is already proven green.

@@ -12,9 +12,13 @@ RUN apt-get update && apt-get install -y python3 make g++ --no-install-recommend
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 
-# Build with Node.js to avoid Bun/QEMU segfaults on ARM64
-# trixie-slim: must match the oven/bun deps stage glibc (Debian 13 / glibc 2.41),
-# otherwise native modules (better-sqlite3) compiled in deps fail to load here.
+# Build with Node.js to avoid Bun/QEMU segfaults on ARM64.
+# trixie-slim keeps the toolchain consistent with the oven/bun deps stage, but
+# it is no longer load-bearing for the native module: better-sqlite3 v13 ships
+# every prebuild inside the package and picks one in the RUNNING process
+# (lib/binding.js reads process.platform/arch and detects musl via
+# process.report), so neither the ABI nor the libc of the installing stage
+# constrains the stage that requires it.
 FROM node:24.16.0-trixie-slim AS builder
 WORKDIR /usr/src/app
 COPY --from=deps /usr/src/app/node_modules ./node_modules
@@ -56,10 +60,12 @@ RUN mkdir -p .next data
 COPY --from=builder /usr/src/app/.next/standalone ./
 COPY --from=builder /usr/src/app/.next/static ./.next/static
 
-# Copy better-sqlite3 native binding for server storage support
+# Copy better-sqlite3 native binding for server storage support. Since v13 the
+# package is N-API and self-contained: lib/binding.js resolves
+# ../prebuilds/<platform>-<arch>.node relative to itself, so the former
+# bindings + file-uri-to-path runtime dependencies are gone (they are no longer
+# in the lockfile at all). Keep in sync with scripts/build-standalone-payload.sh.
 COPY --from=builder /usr/src/app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
-COPY --from=builder /usr/src/app/node_modules/bindings ./node_modules/bindings
-COPY --from=builder /usr/src/app/node_modules/file-uri-to-path ./node_modules/file-uri-to-path
 # prebuild-install is only needed at build time, not runtime
 
 # Copy the embedded LibreDB database package. The libredb provider lazy-imports

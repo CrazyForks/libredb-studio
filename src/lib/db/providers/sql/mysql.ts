@@ -27,6 +27,27 @@ import {
 import { DatabaseConfigError, ConnectionError, QueryError, mapDatabaseError } from "../../errors";
 import { formatBytes } from "../../utils/pool-manager";
 
+/**
+ * mysql2 3.23 narrowed `execute`'s values parameter from `any` to a concrete
+ * `ExecuteValues` union that excludes `undefined`. The provider interface every
+ * driver implements passes `unknown[]` - it cannot be narrowed here without
+ * narrowing it for MongoDB and Redis too - so the array is cast at this one
+ * boundary.
+ *
+ * The cast changes nothing about what reaches the server: mysql2 validates
+ * every bind value itself and REJECTS `undefined` outright ("Bind parameters
+ * must not contain undefined. To pass SQL NULL specify JS null", thrown from
+ * lib/base/connection.js). It is not coerced to NULL, before or after this
+ * change - callers wanting SQL NULL must pass `null`. The new typing states
+ * that rule; this cast keeps the runtime rule as the thing that enforces it.
+ *
+ * Derived from the method signature rather than importing `ExecuteValues` by
+ * name, so a future rename in mysql2 surfaces as a type error here instead of
+ * an unresolved import.
+ */
+type ExecuteParams = Parameters<PoolConnection["execute"]>[1];
+const asExecuteParams = (params?: unknown[]): ExecuteParams => params as ExecuteParams;
+
 // ============================================================================
 // SQL Statements
 // ============================================================================
@@ -416,7 +437,7 @@ export class MySQLProvider extends SQLBaseProvider {
           if (queryId) {
             this.runningQueryThreadIds.set(queryId, conn.threadId);
           }
-          const [rows, fields] = await conn.execute<RowDataPacket[]>(sql, params);
+          const [rows, fields] = await conn.execute<RowDataPacket[]>(sql, asExecuteParams(params));
           return { rows, fields };
         } catch (error) {
           throw mapDatabaseError(error, "mysql", sql);
@@ -526,7 +547,7 @@ export class MySQLProvider extends SQLBaseProvider {
     return this.trackQuery(async () => {
       const { result, executionTime } = await this.measureExecution(async () => {
         try {
-          const [rows, fields] = await this.txConn!.execute<RowDataPacket[]>(sql, params);
+          const [rows, fields] = await this.txConn!.execute<RowDataPacket[]>(sql, asExecuteParams(params));
           return { rows, fields };
         } catch (error) {
           throw mapDatabaseError(error, "mysql", sql);
@@ -551,7 +572,10 @@ export class MySQLProvider extends SQLBaseProvider {
 
     const conn = await this.pool!.getConnection();
     try {
-      const [tablesRows] = await conn.execute<RowDataPacket[]>(SCHEMA_TABLES_SQL, [this.config.database]);
+      const [tablesRows] = await conn.execute<RowDataPacket[]>(
+        SCHEMA_TABLES_SQL,
+        asExecuteParams([this.config.database]),
+      );
 
       const schemas: TableSchema[] = [];
 
@@ -614,7 +638,10 @@ export class MySQLProvider extends SQLBaseProvider {
       const [connRows] = await conn.execute<RowDataPacket[]>("SHOW STATUS LIKE 'Threads_connected'");
       const activeConnections = parseInt(connRows[0]?.Value || "0");
 
-      const [sizeRows] = await conn.execute<RowDataPacket[]>(DATABASE_SIZE_MB_SQL, [this.config.database]);
+      const [sizeRows] = await conn.execute<RowDataPacket[]>(
+        DATABASE_SIZE_MB_SQL,
+        asExecuteParams([this.config.database]),
+      );
       const databaseSize = `${sizeRows[0]?.size_mb || 0} MB`;
 
       const [hitRows] = await conn.execute<RowDataPacket[]>(BUFFER_CACHE_HIT_RATIO_SQL);
@@ -622,7 +649,10 @@ export class MySQLProvider extends SQLBaseProvider {
 
       let slowQueries: SlowQuery[] = [];
       try {
-        const [slowRows] = await conn.execute<RowDataPacket[]>(HEALTH_SLOW_QUERIES_SQL, [this.config.database]);
+        const [slowRows] = await conn.execute<RowDataPacket[]>(
+          HEALTH_SLOW_QUERIES_SQL,
+          asExecuteParams([this.config.database]),
+        );
         slowQueries = slowRows.map((r) => ({
           query: r.query || "",
           calls: parseInt(r.calls || "0"),
@@ -632,7 +662,10 @@ export class MySQLProvider extends SQLBaseProvider {
         slowQueries = [{ query: "Performance schema not available", calls: 0, avgTime: "N/A" }];
       }
 
-      const [sessionRows] = await conn.execute<RowDataPacket[]>(HEALTH_ACTIVE_SESSIONS_SQL, [this.config.database]);
+      const [sessionRows] = await conn.execute<RowDataPacket[]>(
+        HEALTH_ACTIVE_SESSIONS_SQL,
+        asExecuteParams([this.config.database]),
+      );
 
       const activeSessions: ActiveSession[] = sessionRows.map((r) => ({
         pid: r.pid,
@@ -718,7 +751,7 @@ export class MySQLProvider extends SQLBaseProvider {
   }
 
   private async getAllTablesForMaintenance(conn: PoolConnection): Promise<string> {
-    const [rows] = await conn.execute<RowDataPacket[]>(MAINTENANCE_TABLES_SQL, [this.config.database]);
+    const [rows] = await conn.execute<RowDataPacket[]>(MAINTENANCE_TABLES_SQL, asExecuteParams([this.config.database]));
 
     return rows.map((r) => this.escapeIdentifier(r.TABLE_NAME)).join(", ");
   }
@@ -750,13 +783,22 @@ export class MySQLProvider extends SQLBaseProvider {
       const maxConnections = parseInt(maxConnRows[0]?.Value || "151");
 
       // Get database size
-      const [sizeRows] = await conn.execute<RowDataPacket[]>(OVERVIEW_DATABASE_SIZE_SQL, [this.config.database]);
+      const [sizeRows] = await conn.execute<RowDataPacket[]>(
+        OVERVIEW_DATABASE_SIZE_SQL,
+        asExecuteParams([this.config.database]),
+      );
       const databaseSizeBytes = parseInt(sizeRows[0]?.size_bytes || "0");
 
       // Get table and index count
-      const [countRows] = await conn.execute<RowDataPacket[]>(OVERVIEW_OBJECT_COUNTS_SQL, [this.config.database]);
+      const [countRows] = await conn.execute<RowDataPacket[]>(
+        OVERVIEW_OBJECT_COUNTS_SQL,
+        asExecuteParams([this.config.database]),
+      );
 
-      const [tableCountRows] = await conn.execute<RowDataPacket[]>(OVERVIEW_TABLE_COUNT_SQL, [this.config.database]);
+      const [tableCountRows] = await conn.execute<RowDataPacket[]>(
+        OVERVIEW_TABLE_COUNT_SQL,
+        asExecuteParams([this.config.database]),
+      );
 
       return {
         version: `MySQL ${version}`,
@@ -824,9 +866,10 @@ export class MySQLProvider extends SQLBaseProvider {
 
     const conn = await this.pool!.getConnection();
     try {
-      const [rows] = await conn.execute<RowDataPacket[]>(`${SLOW_QUERIES_BODY_SQL} LIMIT ${Number(limit)};`, [
-        this.config.database,
-      ]);
+      const [rows] = await conn.execute<RowDataPacket[]>(
+        `${SLOW_QUERIES_BODY_SQL} LIMIT ${Number(limit)};`,
+        asExecuteParams([this.config.database]),
+      );
 
       return rows.map((r) => ({
         queryId: r.query_id || undefined,
@@ -852,9 +895,10 @@ export class MySQLProvider extends SQLBaseProvider {
 
     const conn = await this.pool!.getConnection();
     try {
-      const [rows] = await conn.execute<RowDataPacket[]>(`${ACTIVE_SESSIONS_BODY_SQL} LIMIT ${Number(limit)};`, [
-        this.config.database,
-      ]);
+      const [rows] = await conn.execute<RowDataPacket[]>(
+        `${ACTIVE_SESSIONS_BODY_SQL} LIMIT ${Number(limit)};`,
+        asExecuteParams([this.config.database]),
+      );
 
       return rows.map((r) => {
         const durationSeconds = parseInt(r.duration_seconds || "0");
@@ -880,7 +924,7 @@ export class MySQLProvider extends SQLBaseProvider {
 
     const conn = await this.pool!.getConnection();
     try {
-      const [rows] = await conn.execute<RowDataPacket[]>(TABLE_STATS_SQL, [schema]);
+      const [rows] = await conn.execute<RowDataPacket[]>(TABLE_STATS_SQL, asExecuteParams([schema]));
 
       return rows.map((r) => {
         const tableSizeBytes = parseInt(r.table_size_bytes || "0");
@@ -914,7 +958,7 @@ export class MySQLProvider extends SQLBaseProvider {
 
     const conn = await this.pool!.getConnection();
     try {
-      const [rows] = await conn.execute<RowDataPacket[]>(INDEX_STATS_SQL, [schema]);
+      const [rows] = await conn.execute<RowDataPacket[]>(INDEX_STATS_SQL, asExecuteParams([schema]));
 
       // Get index sizes from INNODB_SYS_INDEXES if available
       const indexSizes: Record<string, number> = {};
@@ -958,7 +1002,7 @@ export class MySQLProvider extends SQLBaseProvider {
       const stats: StorageStats[] = [];
 
       // Get database size
-      const [dbRows] = await conn.execute<RowDataPacket[]>(STORAGE_STATS_SQL, [this.config.database]);
+      const [dbRows] = await conn.execute<RowDataPacket[]>(STORAGE_STATS_SQL, asExecuteParams([this.config.database]));
 
       if (dbRows.length > 0) {
         const sizeBytes = parseInt(dbRows[0].size_bytes || "0");
