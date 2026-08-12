@@ -166,6 +166,36 @@ real scope, which closes the documentation half; the UI half is still open. Eith
 providers (oracledb supports TLS through the connect string, `mongodb` through `tls` options,
 `ioredis` through `tls`) or hide the panel where it cannot be honoured.
 
+### D3. Testing a connection to an already-open embedded file fails on its own exclusive lock
+
+`POST /api/db/test-connection` calls `createDatabaseProvider` directly
+(`src/app/api/db/test-connection/route.ts:28`) rather than going through the cached provider, which is
+right for testing credentials the server has never seen — and wrong for an engine that permits one
+writer. If the connection under test points at a file the cached provider already holds, the second
+open is refused by the first:
+
+```
+[DB] Creating libredb provider for "Sample (LibreDB)"      <- cached, holds the file
+[DB] Creating libredb provider for "My Sample"             <- the test, same file
+ConnectionError: LibreDB file is already open by another process (exclusive lock).
+```
+
+Deterministic, not a race: it reproduces every time on the active LibreDB connection. The visible
+consequence is worse than a failed test, because the connection modal tests before it saves — so
+**editing the built-in LibreDB sample is impossible**, and the edit is discarded with only a toast
+about a connection error, which reads as if the sample itself were broken. Reproduced against a
+production build on 2026-08-12 while verifying the seed-eligibility fix (PR #336).
+
+This is the phenomenon an earlier session recorded and then RETRACTED as unreproducible. The
+retraction of the *explanation* stands — it was attributed to a read-then-write window in the provider
+cache, which was read out of the code and never demonstrated, and is not what happens. The phenomenon
+is real; the earlier attempts to reproduce it simply never went through the modal's test path.
+
+Done when testing a connection that resolves to an already-open single-writer file reuses the open
+provider instead of opening a second handle, or the test is skipped with an honest message for engines
+that cannot be opened twice. Whichever is chosen, the modal must not present a lock conflict as a
+failed connection test.
+
 ---
 
 ## Value interpolation
@@ -1329,32 +1359,27 @@ Done when the provenance branch lives in a standalone-only component and `Bottom
 children, or when Phase 4's surface unification decides the embedded shell gets an agent surface after
 all — at which point this stops being dormant rather than being removed.
 
-### B22. Seed connections are classified browser-only, so the rail cannot start a run out of the box
+### B23. Seed eligibility is decided against a browser snapshot, not the live descriptor
 
-`buildConnectionPayload` (`src/hooks/use-connection-payload.ts`) returns a server-resolvable
-`{ connectionId }` only when a connection carries BOTH `managed` and `seedId`. The two connections a
-zero-config deployment ships — `seed:libredb-embedded-sample` and `seed:sqlite-embedded-sample` — are
-written with `seedId` set and **`managed: false`**, so they fall to the `{ connection }` branch.
-`Studio.tsx` therefore passes `connectionId={null}` to the rail, which renders its browser-only
-caveat and disables Start.
+`resolveAgentRunConnectionId` (`src/hooks/use-connection-payload.ts`) decides whether an editable
+seed copy may start a run by comparing it against the descriptors in `useConnectionManager`'s
+`servedSeeds` — the response of the last `GET /api/connections/managed`, fetched at mount and during
+the pending-seed poll. The run-start route then resolves `seed:<id>` again, through
+`getSeedConnectionById`, whose config loader re-reads the seed file after its own TTL
+(`SEED_CACHE_TTL_MS`, 60s by default).
 
-The caveat is factually wrong for these two. `POST /api/agent/runs` with
-`{"connectionId":"seed:sqlite-embedded-sample"}` resolves server-side and drives the run — verified in
-a container against the 0.11.0 image with `LIBREDB_AGENT_ENABLED=true`, reaching the model adapter.
-So the id the rail refuses to send is one the route accepts.
+So there is a window. An operator who repoints a seed at a different database while a session is open
+leaves that session comparing against the OLD descriptor: the local copy still matches it, the rail
+still offers Start, and the run resolves the NEW target. That is the same silent wrong-database
+outcome the comparison exists to prevent, reached from the server side instead of the browser side.
 
-The practical effect is the whole surface: a default deployment has only these two connections, so
-enabling the runtime yields a rail that can never start anything. Confirmed against a **cleared**
-`localStorage`, so it is the seed writer's own output rather than stale browser state. Neither the six
-gates nor the component tests can see it — the tests supply `connectionId` directly, and no test
-asserts what the seed writer produces against what `buildConnectionPayload` requires.
+Two things bound it. It needs a server-side seed change mid-session, not a user action; and the same
+staleness already applies to an admin-managed connection, which has always sent `seed:<id>` for every
+query while the sidebar showed whatever the last fetch returned. This is therefore a property of
+resolving by id at all, not something the editable-copy path introduced — but the copy path is the
+one whose documentation promises a match, so it is the one that overstates.
 
-Two readings, and they need different fixes. If `managed` is meant to track "the server can resolve
-this", the seed writer is wrong and should set it, or `buildConnectionPayload` should treat `seedId`
-alone as sufficient. If `managed` means "an operator declared this connection" and seeds are
-deliberately outside agent scope, the code is right and the rail's caveat is the thing that misleads —
-it should say seeds are out of scope rather than claiming the connection is browser-only.
-
-Done when a default deployment can either start a run on a seed connection, or explains accurately why
-it cannot — and when a test pins the seed writer's output against the payload builder's requirement,
-so the two cannot drift apart again.
+Done when the run-start route validates the descriptor the browser believed it was starting against —
+a fingerprint sent with the request and compared server-side, refusing with a distinct reason when it
+has moved — rather than the client's snapshot being the only check. Until then `docs/AGENT.md` says
+the comparison is against the last fetch, not against the live descriptor.
