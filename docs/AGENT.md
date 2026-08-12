@@ -108,7 +108,25 @@ database would investigate the seed and report on it as though it were the one o
 
 A run emits a closed set of **semantic events**, and they are the whole of what the UI renders:
 `run-started`, `context-captured`, `statement-drafted`, `tool-invoked`, `tool-completed`,
-`tool-refused`, `report-composed`, `run-finished`.
+`tool-refused`, `report-composed`, `closing-statement`, `run-finished`.
+
+**`closing-statement` is the model's closing prose, and it is deliberately not a report.** It carries
+no citations and claims none, which is why it has its own kind rather than a lenient
+`report-composed`: a claim without evidence is inexpressible by design, and planning mode — which has
+no tools and so can never produce evidence — could therefore never say anything at all. Its whole
+output is one of these. An agent run's is an aside, except when it is the only thing the run left
+behind, which is exactly when it is worth seeing. It is written only when the prose is non-empty.
+
+**`run-finished` carries how the loop ended**, as `stopReason`: `report-composed`, `model-stopped`,
+`cancelled`, `deadline-exceeded`, `model-timeout` or `turn-limit`. This is what separates *succeeded*
+from *answered* — a run that stopped because the model composed a cited report and one that stopped
+because the model had nothing more to say are both `succeeded`, and only this says which. The rail
+reads it and states the difference. What it still cannot do is put that difference in the STATUS
+itself; the vocabulary for that arrives with M3's goal verifiers (`docs/BACKLOG.md` B24).
+
+`stopReason` sits beside `reason`, which says why a drive died before or outside the loop. They
+answer different questions and are mutually exclusive in practice; when both are present, `reason`
+is the one a user reads, because a dead drive is the more specific account of an ending.
 
 ## Durability and resume
 
@@ -225,8 +243,17 @@ agent's privileges.
 | `maxResultRows` / `maxResultBytes` | 200 / 256 KiB | Compared after the driver has materialised the rows, so an oversized read is refused but still paid for at the database. |
 | `maxConcurrentExecutions` | 1 | The loop is sequential; a run cannot fan out. |
 | Run deadline | 300 s | **Wall clock**, including model latency. |
+| One model call | 90 s | Whichever of this and the run's remaining time is smaller applies. |
 | Repair attempts | 3 | Statements that failed **at the database**. |
 | Model turns per drive | 16 | A backstop for a loop that never reaches the database. |
+
+**The per-call ceiling exists because the run deadline used to be the only bound on a single
+request.** A measured run ended at exactly 300.0 s with a two-event ledger: one call never answered
+and spent a budget meant to cover a whole investigation, while the rail showed nothing moving for
+five minutes. Turns on this workload land in seconds, so a call that reaches 90 s is not coming back.
+The two bounds stay distinct in what they report — `model-timeout` says a request never returned and
+starting again is reasonable; `deadline-exceeded` says the run used its time — and when less than the
+ceiling remains, the run's own reason is the one given.
 
 **The run deadline** is a monotonic per-run clock with an injected time source, and it answers two
 questions before every call: may this call start (`INSUFFICIENT_TIME_REMAINING` if its minimum
@@ -459,6 +486,8 @@ declared-target allowlist, the statement guard and the role's own grants are the
   markup.
 - **B23** — seed eligibility is decided against the browser's last descriptor fetch, so a seed
   repointed server-side mid-session is not seen until the next fetch.
+- **B24** — a run that ends without a cited report is still `succeeded`; the timeline says so, the
+  status cannot, and the vocabulary that would (`needs_input`) arrives with M3's goal verifiers.
 
 ## Related documentation
 
