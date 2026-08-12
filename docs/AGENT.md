@@ -416,6 +416,8 @@ declared-target allowlist, the statement guard and the role's own grants are the
   kind, in the chat surface as much as in the agent.
 - **B21** — the published package's `BottomPanel` carries the agent-provenance branch as dormant
   markup.
+- **B22** — a zero-config deployment's seed connections are classified browser-only, so the rail
+  disables Start on the only connections it has, while the route resolves those same ids server-side.
 
 ## Related documentation
 
