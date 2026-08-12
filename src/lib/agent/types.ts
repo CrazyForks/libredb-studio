@@ -76,12 +76,48 @@ export type AgentRunStatus = "queued" | "running" | AgentRunTerminalStatus;
  * specific label would be a claim the classifier cannot support.
  */
 export type AgentRunFailureReason =
-  /** No usable model: unconfigured, refused credentials, or unreachable. */
+  /** No usable model: unconfigured, or the provider could not be reached. */
   | "model-unavailable"
+  /**
+   * The provider is there and answering, and is refusing on volume. The only model
+   * failure that fixes itself, and the one worth telling apart from the rest: a
+   * misconfiguration needs an operator, a quota needs a minute.
+   */
+  | "model-rate-limited"
+  /** The provider rejected the credentials. An operator fixes this; retrying does not. */
+  | "model-unauthorized"
+  /**
+   * The connection's engine has no database-native read-only execution profile, so
+   * this run could never have been permitted on it. A property of the connection the
+   * user chose, not a fault of the server — which is why it is not `internal`.
+   */
+  | "engine-unsupported"
   /** The run's persisted connection no longer resolves on the server. */
   | "connection-unresolvable"
   /** Anything else. Deliberately unspecific; the log carries the detail. */
   | "internal";
+
+/**
+ * How the loop ended — a different question from `AgentRunFailureReason`, which says
+ * why a drive died before or outside the loop.
+ *
+ * This is the run's own account of itself, and it is what makes the difference between
+ * "succeeded" and "answered" legible. A run that stops because the model composed a
+ * cited report and a run that stops because the model simply had nothing more to say
+ * are both `succeeded`; only this says which. Recording it is what lets a reader — the
+ * rail, or a later verifier — tell a finished investigation from an abandoned one.
+ */
+export type AgentRunStopReason =
+  /** The model called `compose_report`; the run answered with citations. */
+  | "report-composed"
+  /** The model stopped calling tools. A planning run's normal end; an agent run's silence. */
+  | "model-stopped"
+  /** A cancellation was requested and observed between turns. */
+  | "cancelled"
+  /** The wall-clock budget ran out. */
+  | "deadline-exceeded"
+  /** The model-turn ceiling was reached with work still in flight. */
+  | "turn-limit";
 
 /**
  * Who started the run, persisted at start and the sole authority for authorizing
@@ -221,6 +257,23 @@ export type AgentRunEvent =
   | (AgentRunEventBase & { readonly kind: "tool-refused"; readonly stepId: string; readonly refusal: AgentToolRefusal })
   | (AgentRunEventBase & { readonly kind: "report-composed"; readonly claims: readonly AgentReportClaim[] })
   | (AgentRunEventBase & {
+      /**
+       * The model's closing prose, recorded because it is otherwise lost.
+       *
+       * Deliberately NOT a report: it carries no citations and claims none, which is
+       * exactly why it has its own kind rather than a lenient `report-composed`. A
+       * planning run's whole output is one of these — that mode has no tools, so it
+       * can never produce evidence and could never have composed a report. An agent
+       * run's is an aside, and when it is the only thing a run left behind, that is
+       * itself worth seeing.
+       *
+       * Written only when the prose is non-empty: an empty entry would record that
+       * the model spoke when it did not.
+       */
+      readonly kind: "closing-statement";
+      readonly text: string;
+    })
+  | (AgentRunEventBase & {
       readonly kind: "run-finished";
       readonly status: AgentRunTerminalStatus;
       /**
@@ -233,6 +286,12 @@ export type AgentRunEvent =
        * reason visible only in the server log.
        */
       readonly reason?: AgentRunFailureReason;
+      /**
+       * How the loop itself ended, when the loop is what ended it. Absent on a run
+       * the drive failed out of — those carry `reason` instead, and the two are
+       * mutually exclusive by construction rather than by convention.
+       */
+      readonly stopReason?: AgentRunStopReason;
     });
 
 /**
