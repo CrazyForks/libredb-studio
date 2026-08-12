@@ -60,13 +60,21 @@ import {
   type AgentToolContext,
   type AgentToolName,
   type AgentToolOutcome,
+  comparePlansTool,
   composeReportTool,
   inspectPlanTool,
+  recommendChangeTool,
   inspectSchemaTool,
   runReadQueryTool,
   selectAgentTools,
 } from "./tools";
-import type { AgentRunEvent, AgentRunRecord, AgentRunStopReason, AgentRunTerminalStatus } from "./types";
+import type {
+  AgentRunEvent,
+  AgentRunRecord,
+  AgentRunStopReason,
+  AgentRunTerminalStatus,
+  AgentRunWorkflowType,
+} from "./types";
 import { UNTRUSTED_CONTENT_BEGIN, UNTRUSTED_CONTENT_END, fenceUntrustedContent } from "./untrusted-content";
 
 /** Everything a tool call needs EXCEPT what the run's own record decides. */
@@ -103,8 +111,18 @@ export interface AgentInvestigationResult {
   readonly text: string;
 }
 
-/** The three tools that reach the database. `compose_report` is handled apart. */
-type DatabaseToolName = Exclude<AgentToolName, "compose_report">;
+/**
+ * The tools that reach the database. The ledger-only ones are handled apart.
+ *
+ * Exclusion rather than enumeration, and that matters: `invokeDatabaseTool`'s
+ * dispatch ends in a fall-through to `inspect_plan`, so a new tool name that is not
+ * excluded here compiles and is silently routed to the wrong tool with a mis-cast
+ * argument list. Adding a tool means deciding, here, which side it is on.
+ */
+type DatabaseToolName = Exclude<AgentToolName, LedgerOnlyToolName>;
+
+/** Tools that record what the run already established and reach nothing. */
+type LedgerOnlyToolName = "compose_report" | "compare_plans" | "recommend_change";
 
 // ============================================================================
 // Prompting
@@ -134,9 +152,58 @@ const PLANNING_RULES = [
   "Answer with a plan in prose: what you would inspect, in what order, and what each step would establish.",
 ].join(" ");
 
+/**
+ * What each workflow is FOR, said to the model (#330 T3).
+ *
+ * A total record, so a workflow added to the contract stops this file compiling
+ * until someone decides what to ask of it. Appended to `AGENT_RULES` and never to
+ * `PLANNING_RULES`: planning is toolless, and telling it to call tools would be
+ * asking for something the mode cannot do.
+ *
+ * The optimization block names `inspect_schema`'s index selector explicitly, and
+ * that is not padding. A live run on 2026-08-12 reached for
+ * `PRAGMA index_list('a'); PRAGMA index_list('b')` — multi-statement text, refused
+ * by the statement guard before the database — because the obvious route to an
+ * index inventory is closed and nothing had said which one is open.
+ */
+/** What the run is FOR. Said in BOTH modes — a plan for an optimization is still about one. */
+const WORKFLOW_OBJECTIVES: Readonly<Record<AgentRunWorkflowType, string>> = Object.freeze({
+  investigation: "Your objective is a question about this database. Answer it from what you establish.",
+  "query-optimization":
+    "Your objective is a statement that is too slow. What matters is HOW the engine reaches its rows, and what change would make it reach them differently.",
+  "database-assessment":
+    "Your objective is the state of this database itself: where its data is incomplete, inconsistent or surprising.",
+} satisfies Record<AgentRunWorkflowType, string>);
+
+/**
+ * How to pursue the objective WITH THE TOOLS. Agent mode only, which is the whole
+ * reason this is a second record rather than one.
+ */
+const WORKFLOW_TOOL_RULES: Readonly<Record<AgentRunWorkflowType, string>> = Object.freeze({
+  investigation: "Report what the evidence supports, and nothing further.",
+  "query-optimization": [
+    'Read the existing indexes with inspect_schema and kind="indexes" — a multi-statement PRAGMA or SHOW is refused before the database.',
+    "Inspect the plan of the current statement, then of your rewrite, and call compare_plans with the two artifact ids. They must name two different plans.",
+    "Every plan you can obtain is an ESTIMATE: nothing is executed, and there are no timings. Say so rather than implying a measurement.",
+    "Propose changes with recommend_change. They are offered to the user and never applied by this run.",
+  ].join(" "),
+  "database-assessment": "Report what the evidence supports, and nothing further.",
+} satisfies Record<AgentRunWorkflowType, string>);
+
+/**
+ * What the run is FOR is said in both modes; how to pursue it with tools is said
+ * only where there are tools.
+ *
+ * The split was found by review. A planning run of a query optimization is an
+ * ordinary thing to ask for — "how would you make this faster?" — and the epic pins
+ * mode and workflow as INDEPENDENT axes. Folding the workflow into the agent branch
+ * left a planning run unable to be about anything in particular, which contradicts
+ * the axis argument this repository had just written down. Toollessness bears on
+ * which TOOLS a run is offered, not on what the run is about.
+ */
 function systemPrompt(record: AgentRunRecord): string {
-  const mode = record.mode === "agent" ? AGENT_RULES : PLANNING_RULES;
-  return `You are the LibreDB Studio database investigator. ${mode} ${SHARED_RULES}`;
+  const rules = record.mode === "agent" ? `${AGENT_RULES} ${WORKFLOW_TOOL_RULES[record.workflowType]}` : PLANNING_RULES;
+  return `You are the LibreDB Studio database investigator. ${rules} ${WORKFLOW_OBJECTIVES[record.workflowType]} ${SHARED_RULES}`;
 }
 
 // ============================================================================
@@ -197,6 +264,25 @@ function describePriorProgress(record: AgentRunRecord): string | null {
       lines.push(describeSettled(event, tools.get(event.stepId) ?? "a tool"));
     } else if (event.kind === "report-composed") {
       lines.push(`A report of ${event.claims.length} claim(s) was composed.`);
+    } else if (event.kind === "plan-comparison") {
+      /*
+        Found by review on #344. Both of these are durable and NON-terminal, so a
+        drive can die after appending one — and a resumed run that was not told
+        would compare the same two plans again. Worse, after the artifact store has
+        released them it would be refused with `PLAN_RESULT_RELEASED` and be sent
+        looking for a mistake it had not made: the comparison it wanted is already
+        on its own ledger.
+
+        The statements are quoted rather than the plans: the plans carry table and
+        index names, which are untrusted input, and the summary is structural.
+      */
+      lines.push(
+        `Two plans were already compared: ${event.before.sql} reaches its rows by ${event.before.summary.access}, and ${event.after.sql} by ${event.after.summary.access}. That comparison is recorded and must not be made again.`,
+      );
+    } else if (event.kind === "recommendation") {
+      lines.push(
+        `A ${event.change} was already recommended and is recorded: ${event.statement}. Do not propose it a second time.`,
+      );
     }
   }
 
@@ -638,7 +724,11 @@ async function handleCall(input: {
     return { kind: "answered", text: unknownToolText(call.toolName) };
   }
 
+  // The ledger-only tools, before any step identity is derived: they settle no step
+  // because they perform no effect, so there is nothing to write ahead of.
   if (call.toolName === "compose_report") return composeReport(service, context, call.input);
+  if (call.toolName === "compare_plans") return comparePlans(service, context, call.input);
+  if (call.toolName === "recommend_change") return recommendChange(service, context, call.input);
 
   const name = call.toolName as DatabaseToolName;
   const stepId = deriveStepId(name, call.input);
@@ -703,6 +793,43 @@ async function handleCall(input: {
  * started, and the artifacts a claim may cite are exactly the entries that were
  * added while the loop was running.
  */
+/**
+ * The before/after plan comparison, recorded and NOT terminal.
+ *
+ * A comparison is a finding, not a conclusion: the run goes on to cite it. That is
+ * the difference from `compose_report`, which is the one tool whose success ends the
+ * loop — and it is why this returns `answered` rather than `reported`.
+ *
+ * The record is re-read for the same reason the report re-reads it: the artifacts a
+ * comparison may cite are exactly the entries added while the loop was running.
+ */
+async function comparePlans(service: AgentRunService, context: AgentToolContext, input: unknown): Promise<CallResult> {
+  const { record } = await service.resume(context.runId);
+  const outcome = comparePlansTool(context, record, input);
+  if (outcome.kind === "unavailable") return { kind: "answered", text: outcome.modelText };
+
+  await service.recordEvent(context.runId, {
+    kind: "plan-comparison",
+    before: outcome.before,
+    after: outcome.after,
+  });
+  return { kind: "answered", text: outcome.modelText };
+}
+
+/** A proposed change, recorded and offered to the user. Nothing here executes it. */
+async function recommendChange(
+  service: AgentRunService,
+  context: AgentToolContext,
+  input: unknown,
+): Promise<CallResult> {
+  const { record } = await service.resume(context.runId);
+  const outcome = recommendChangeTool(context, record, input);
+  if (outcome.kind === "unavailable") return { kind: "answered", text: outcome.modelText };
+
+  await service.recordEvent(context.runId, { kind: "recommendation", ...outcome.recommendation });
+  return { kind: "answered", text: outcome.modelText };
+}
+
 async function composeReport(service: AgentRunService, context: AgentToolContext, input: unknown): Promise<CallResult> {
   // `resume` rather than `status`: it is the read that REFUSES a run which has
   // ended or vanished, so the report is verified against a live run's own log

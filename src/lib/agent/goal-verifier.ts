@@ -46,7 +46,7 @@ import type { AgentReportClaim, AgentRunEvent, AgentRunMode, AgentRunRecord, Age
  * rule that changes its mind is a new id rather than the same one meaning
  * something else.
  */
-export type AgentGoalVerifierId = "agent-planning.1" | "agent-investigation.1";
+export type AgentGoalVerifierId = "agent-planning.1" | "agent-investigation.1" | "agent-query-optimization.1";
 
 /**
  * What a run was required to produce and did not. Deliberately a closed union of
@@ -61,6 +61,14 @@ export type AgentGoalShortfall =
   | "empty-evidence"
   /** A planning run left no prose at all — the mute run of #341 F1. */
   | "no-plan"
+  /**
+   * A query-optimization run never compared two plans.
+   *
+   * The template's own artifact. A run that recommends a rewrite without having
+   * looked at what the engine does differently has recommended it on the strength
+   * of its own opinion, and that is precisely what this workflow exists not to do.
+   */
+  | "no-plan-comparison"
   /**
    * The run was stopped before it could conclude. Substituted for the missing
    * output rather than reported alongside it: a user's stop is not a defect of the
@@ -80,25 +88,19 @@ export interface AgentGoalVerdict {
 export const AGENT_PLANNING_VERIFIER: AgentGoalVerifierId = "agent-planning.1";
 
 /**
- * Workflow type → the rule that judges an AGENT run of it (#330 T2).
+ * A rule and the id that names it, which are two halves of ONE decision.
  *
- * A total record, so a workflow type added to the contract stops this file compiling
- * until somebody decides what "answered" means for it.
- *
- * All three name `agent-investigation.1` today, and that is a claim rather than a
- * placeholder: composing claims that rest on something the run actually read is the
- * BASELINE every workflow has to meet, whatever else it is asked for. M3's templates
- * ADD requirements to it — a before/after plan artifact for query optimization, a
- * graded profile for a database assessment — and each of those arrives as its own
- * versioned id with its own rule (#330 T3). Naming those ids here before their rules
- * exist would make a verdict say it was measured against a bar that was not yet
- * being applied, which is the one thing a versioned id must never do.
+ * Every workflow but query optimization names `agent-investigation.1`, and that is a
+ * claim rather than a placeholder: composing claims that rest on something the run
+ * actually read is the BASELINE every workflow has to meet, whatever else it is
+ * asked for. A template ADDS to it. Naming an id before its rule exists would make a
+ * verdict say it was measured against a bar that was not yet being applied, which is
+ * the one thing a versioned id must never do.
  */
-export const AGENT_WORKFLOW_VERIFIERS: Readonly<Record<AgentRunWorkflowType, AgentGoalVerifierId>> = Object.freeze({
-  investigation: "agent-investigation.1",
-  "query-optimization": "agent-investigation.1",
-  "database-assessment": "agent-investigation.1",
-} satisfies Record<AgentRunWorkflowType, AgentGoalVerifierId>);
+export interface AgentWorkflowGoal {
+  readonly verifier: AgentGoalVerifierId;
+  readonly verify: (run: VerifiableAgentRun) => readonly AgentGoalShortfall[];
+}
 
 /** Everything the verdict is a function of, and nothing else. */
 export type VerifiableAgentRun = Pick<AgentRunRecord, "mode" | "workflowType" | "status" | "events">;
@@ -167,24 +169,46 @@ type GoalRule = (run: VerifiableAgentRun) => readonly AgentGoalShortfall[];
  * two halves of one decision, and the half that drifted would be the one a reader
  * could not interpret.
  */
-const WORKFLOW_GOAL_RULES: Readonly<Record<AgentRunWorkflowType, GoalRule>> = Object.freeze({
-  investigation: verifyInvestigationGoal,
-  "query-optimization": verifyInvestigationGoal,
-  "database-assessment": verifyInvestigationGoal,
-} satisfies Record<AgentRunWorkflowType, GoalRule>);
-
-const GOAL_RULES: Readonly<Record<AgentRunMode, (run: VerifiableAgentRun) => GoalRule>> = Object.freeze({
-  planning: () => verifyPlanningGoal,
-  agent: (run) => WORKFLOW_GOAL_RULES[run.workflowType],
-} satisfies Record<AgentRunMode, (run: VerifiableAgentRun) => GoalRule>);
+/**
+ * The optimization bar: everything an investigation must meet, and then its own
+ * artifact.
+ *
+ * Composed rather than replaced. A run that answered nothing has not become
+ * acceptable by comparing two plans, so the baseline is checked first and its
+ * shortfall dominates — reporting `no-plan-comparison` about a run that never
+ * composed a report at all would name the smaller of two problems.
+ */
+function verifyQueryOptimizationGoal(run: VerifiableAgentRun): readonly AgentGoalShortfall[] {
+  const baseline = verifyInvestigationGoal(run);
+  if (baseline.length > 0) return baseline;
+  return run.events.some((event) => event.kind === "plan-comparison") ? [] : ["no-plan-comparison"];
+}
 
 /**
- * Which rule judged this run. Mode decides first and the workflow cannot override
- * it, for the same reason it cannot in `selectAgentTools`: planning has no tools
- * whatever it is for, so it can never be held to a bar that requires evidence.
+ * Workflow type → the rule an agent run of it is judged by, AND the id that names
+ * that rule — ONE entry, so the two cannot drift.
+ *
+ * These were two records until review pointed out that the lockstep this file
+ * claimed was enforced by nothing: changing a workflow's id without changing its
+ * rule typechecked, and the verdict would then say it had been measured against a
+ * bar nobody applied. A versioned id whose meaning can change silently is worse
+ * than no id at all, so the two halves are one value.
  */
-function verifierFor(run: VerifiableAgentRun): AgentGoalVerifierId {
-  return run.mode === "planning" ? AGENT_PLANNING_VERIFIER : AGENT_WORKFLOW_VERIFIERS[run.workflowType];
+export const AGENT_WORKFLOW_GOALS: Readonly<Record<AgentRunWorkflowType, AgentWorkflowGoal>> = Object.freeze({
+  investigation: { verifier: "agent-investigation.1", verify: verifyInvestigationGoal },
+  "query-optimization": { verifier: "agent-query-optimization.1", verify: verifyQueryOptimizationGoal },
+  "database-assessment": { verifier: "agent-investigation.1", verify: verifyInvestigationGoal },
+} satisfies Record<AgentRunWorkflowType, AgentWorkflowGoal>);
+
+const PLANNING_GOAL: AgentWorkflowGoal = { verifier: AGENT_PLANNING_VERIFIER, verify: verifyPlanningGoal };
+
+/**
+ * The goal this run is judged against. Mode decides first and the workflow cannot
+ * override it, for the same reason it cannot in `selectAgentTools`: planning has no
+ * tools whatever it is for, so it can never be held to a bar requiring evidence.
+ */
+function goalFor(run: VerifiableAgentRun): AgentWorkflowGoal {
+  return run.mode === "planning" ? PLANNING_GOAL : AGENT_WORKFLOW_GOALS[run.workflowType];
 }
 
 /**
@@ -196,6 +220,9 @@ function verifierFor(run: VerifiableAgentRun): AgentGoalVerifierId {
  * own record could not support.
  */
 export function verifyRunGoal(run: VerifiableAgentRun): AgentGoalVerdict {
-  const unmet = GOAL_RULES[run.mode](run)(run);
-  return { outcome: unmet.length === 0 ? "answered" : "unanswered", verifier: verifierFor(run), unmet };
+  // One lookup, so the id in the verdict is by construction the id of the rule that
+  // produced it.
+  const goal = goalFor(run);
+  const unmet = goal.verify(run);
+  return { outcome: unmet.length === 0 ? "answered" : "unanswered", verifier: goal.verifier, unmet };
 }

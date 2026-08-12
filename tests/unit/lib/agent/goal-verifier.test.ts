@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AGENT_PLANNING_VERIFIER, AGENT_WORKFLOW_VERIFIERS, verifyRunGoal } from "@/lib/agent/goal-verifier";
+import { AGENT_PLANNING_VERIFIER, AGENT_WORKFLOW_GOALS, verifyRunGoal } from "@/lib/agent/goal-verifier";
 import type {
   AgentArtifactReference,
   AgentRunEvent,
@@ -220,9 +220,81 @@ describe("a planning run is judged by what planning mode can produce", () => {
   });
 });
 
+describe("a query-optimization run is judged by its own artifact as well as the baseline", () => {
+  const planComparison: AgentRunEvent = {
+    kind: "plan-comparison",
+    atMs: 25,
+    before: { correlationId: CORRELATION.full, sql: "SELECT * FROM orders", summary: { access: "full-scan" } },
+    after: { correlationId: CORRELATION.empty, sql: "SELECT id FROM orders", summary: { access: "index" } },
+  };
+
+  test("a cited report AND a plan comparison is an answer", () => {
+    const verdict = verifyRunGoal(
+      run(
+        "agent",
+        "succeeded",
+        [contextCaptured, completed(CORRELATION.full, 8), planComparison, reportCiting(ARTIFACT(CORRELATION.full))],
+        "query-optimization",
+      ),
+    );
+
+    expect(verdict).toEqual({ outcome: "answered", verifier: "agent-query-optimization.1", unmet: [] });
+  });
+
+  test("THE GATE: a perfect report with no plan comparison does not answer this workflow's question", () => {
+    // #330 T3's gate, stated as it is written: the goal verifier fails the run when
+    // its own artifact is absent. This ledger would be a clean `answered` for an
+    // investigation — it is the workflow that makes it not one.
+    const events = [contextCaptured, completed(CORRELATION.full, 8), reportCiting(ARTIFACT(CORRELATION.full))];
+
+    expect(verifyRunGoal(run("agent", "succeeded", events, "investigation")).outcome).toBe("answered");
+    expect(verifyRunGoal(run("agent", "succeeded", events, "query-optimization"))).toEqual({
+      outcome: "unanswered",
+      verifier: "agent-query-optimization.1",
+      unmet: ["no-plan-comparison"],
+    });
+  });
+
+  test("the baseline dominates: a run that never reported is told THAT, not that it skipped a comparison", () => {
+    // Naming the smaller of two problems would send a reader after the wrong one.
+    const verdict = verifyRunGoal(
+      run("agent", "succeeded", [contextCaptured, completed(CORRELATION.full, 8)], "query-optimization"),
+    );
+
+    expect(verdict.unmet).toEqual(["no-report"]);
+  });
+
+  test("a comparison does not rescue a report that rests entirely on empty results", () => {
+    const verdict = verifyRunGoal(
+      run(
+        "agent",
+        "succeeded",
+        [contextCaptured, completed(CORRELATION.empty, 0), planComparison, reportCiting(ARTIFACT(CORRELATION.empty))],
+        "query-optimization",
+      ),
+    );
+
+    expect(verdict.unmet).toEqual(["empty-evidence"]);
+  });
+
+  test("the other two workflows are not held to the optimization bar", () => {
+    for (const workflowType of ["investigation", "database-assessment"] as const) {
+      const verdict = verifyRunGoal(
+        run(
+          "agent",
+          "succeeded",
+          [contextCaptured, completed(CORRELATION.full, 8), reportCiting(ARTIFACT(CORRELATION.full))],
+          workflowType,
+        ),
+      );
+      expect(verdict.outcome, workflowType).toBe("answered");
+    }
+  });
+});
+
 describe("the verifier registry", () => {
   test("names one rule per workflow type, so a new workflow cannot inherit another one's bar", () => {
-    expect(Object.keys(AGENT_WORKFLOW_VERIFIERS).sort()).toEqual([
+    expect(Object.keys(AGENT_WORKFLOW_GOALS).sort()).toEqual([
       "database-assessment",
       "investigation",
       "query-optimization",
@@ -230,10 +302,20 @@ describe("the verifier registry", () => {
   });
 
   test("every workflow identifies the rule that judged it, so a reader knows what the verdict measured", () => {
-    for (const [workflowType, verifierId] of Object.entries(AGENT_WORKFLOW_VERIFIERS)) {
+    for (const [workflowType, goal] of Object.entries(AGENT_WORKFLOW_GOALS)) {
       expect(verifyRunGoal(run("agent", "succeeded", [], workflowType as AgentRunWorkflowType)).verifier).toBe(
-        verifierId,
+        goal.verifier,
       );
+    }
+  });
+
+  test("the id and the rule are ONE entry, so a verdict cannot name a bar that was not applied", () => {
+    // Found by review on #343: as two separate records, changing an id without
+    // changing its rule typechecked. A versioned id whose meaning can drift silently
+    // is worse than no id at all.
+    for (const goal of Object.values(AGENT_WORKFLOW_GOALS)) {
+      expect(typeof goal.verifier).toBe("string");
+      expect(typeof goal.verify).toBe("function");
     }
   });
 
@@ -241,7 +323,7 @@ describe("the verifier registry", () => {
     // Mode decides before the workflow does, for the same reason it does in
     // `selectAgentTools`: a toolless run can never be held to a bar that requires
     // evidence, so a workflow type must not be a way to impose one on it.
-    for (const workflowType of Object.keys(AGENT_WORKFLOW_VERIFIERS) as AgentRunWorkflowType[]) {
+    for (const workflowType of Object.keys(AGENT_WORKFLOW_GOALS) as AgentRunWorkflowType[]) {
       const verdict = verifyRunGoal(run("planning", "succeeded", [closing], workflowType));
       expect(verdict).toEqual({ outcome: "answered", verifier: AGENT_PLANNING_VERIFIER, unmet: [] });
     }
@@ -250,7 +332,7 @@ describe("the verifier registry", () => {
   test("the baseline is the same for all three today, and every workflow must still meet it", () => {
     // Composing claims that rest on something the run read is what EVERY workflow
     // has to do; the templates add to it rather than replacing it (#330 T3).
-    for (const workflowType of Object.keys(AGENT_WORKFLOW_VERIFIERS) as AgentRunWorkflowType[]) {
+    for (const workflowType of Object.keys(AGENT_WORKFLOW_GOALS) as AgentRunWorkflowType[]) {
       expect(verifyRunGoal(run("agent", "succeeded", [contextCaptured, closing], workflowType)).unmet).toEqual([
         "no-report",
       ]);
