@@ -1,0 +1,369 @@
+/**
+ * The SQL the SERVER composes for an agent run (#329, epic #325; planning decision P1).
+ *
+ * Two of the M2 tools do not take a statement from the model at all. A catalog
+ * inspection takes a structured selector and a plan inspection takes the statement
+ * it is about; in both cases the statement that reaches the database is written
+ * here, per dialect. That is what lets a schema read BE the canonical bounded read
+ * (`sql.query.read`) instead of needing a fourth operation descriptor, which the
+ * epic pinned shut.
+ *
+ * Three constraints shape every string below:
+ *
+ * 1. **The composed statement must satisfy the M1 input guard**, or the tool can
+ *    never run. That rules out more than it looks like: `statement-guard.ts`
+ *    refuses any word beginning `PRAGMA_`, so SQLite's `pragma_table_info()`
+ *    table-valued function — the obvious way to read a column list there — is
+ *    unavailable, and the SQLite catalog read goes through `sqlite_master`
+ *    instead. The asymmetry is real and documented on the tool: PostgreSQL yields
+ *    a structured column inventory, SQLite yields each object's own DDL text.
+ * 2. **The profiled providers bind nothing.** `queryReadOnly(sql, budget)` takes no
+ *    parameters (`postgres.ts`, `sqlite.ts`), so a selector cannot be bound and has
+ *    to be quoted with the shared `quoteLiteral`. Selectors are therefore validated
+ *    here as well as quoted — see `assertSelector` for the one character that is
+ *    refused rather than quoted, and why.
+ * 3. **No dialect is served on a guess.** Both maps are looked up with
+ *    `Object.hasOwn`, and an unlisted dialect is refused. A composition that has
+ *    not been checked against that engine's catalog and its EXPLAIN grammar is not
+ *    a fallback, it is a statement nobody verified.
+ *
+ * On the plan side: the composed form is the ESTIMATING one on both engines, never
+ * the executing one. `src/lib/explain`'s PostgreSQL strategy is deliberately not
+ * reused for this — its `buildSql` ignores the `mode` argument and always emits
+ * `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`, which RUNS the statement it explains.
+ * That is correct for the editor's Explain button (a user asked for real timings)
+ * and exactly wrong here, where the approval-gated `sql.explain.analyze` descriptor
+ * is the only thing allowed to execute a plan. Teaching the strategy registry to
+ * honour its own mode argument is a separate, editor-visible change (#194).
+ */
+
+import { quoteLiteral } from "@/lib/sql/values";
+import type { DatabaseType } from "@/lib/types";
+
+export type AgentComposedSqlDenyCode =
+  /** This milestone has verified a composition for PostgreSQL and SQLite only. */
+  | "UNSUPPORTED_DIALECT"
+  /** Blank, over-long, or carrying a character that cannot be safely quoted. */
+  | "INVALID_SELECTOR"
+  /** A well-formed selector that has no meaning for this engine. */
+  | "SELECTOR_UNSUPPORTED_BY_DIALECT"
+  /** Nothing to explain. */
+  | "INVALID_STATEMENT";
+
+/**
+ * Raised when no statement can honestly be composed. The tool layer maps it to a
+ * typed tool outcome; it is never surfaced as a database failure, because no
+ * database was reached.
+ */
+export class AgentComposedSqlError extends Error {
+  constructor(
+    message: string,
+    public readonly reasonCode: AgentComposedSqlDenyCode,
+  ) {
+    super(message);
+    this.name = "AgentComposedSqlError";
+    Object.setPrototypeOf(this, AgentComposedSqlError.prototype);
+  }
+}
+
+/**
+ * The widest identifier limit among the engines this repository serves (Oracle's
+ * 128; PostgreSQL's is 63 and MySQL's 64). A selector longer than any engine could
+ * name is not a narrowing request, and bounding it keeps a multi-megabyte string
+ * out of a composed statement.
+ */
+export const MAX_CATALOG_SELECTOR_LENGTH = 128;
+
+/**
+ * Which inventory a catalog read asks for.
+ *
+ * Three kinds rather than one wide statement, because the engines do not agree on
+ * how many reads the inventory takes and a single composed monster would have to be
+ * verified per dialect anyway. Each kind is one bounded read (`sql.query.read`)
+ * under the same descriptor, so the split costs statements out of the run's budget
+ * and buys nothing in privilege — which is exactly the trade the row cap forces:
+ * one flat projection per kind stays diagnosable when it overflows, where a nested
+ * aggregate would come back as one unreadable row-per-table blob.
+ */
+export type AgentCatalogKind = "columns" | "relations" | "indexes";
+
+export interface AgentCatalogSelector {
+  /** Defaults to the column inventory, which is what a bare `inspect_schema` means. */
+  readonly kind?: AgentCatalogKind;
+  readonly schema?: string;
+  readonly table?: string;
+}
+
+/**
+ * SQLite's only schema for a profiled provider. The read-only profile opens one
+ * file and attaching another is refused at the input stage, so `main` is not merely
+ * the default — it is the whole set.
+ */
+const SQLITE_ONLY_SCHEMA = "main";
+
+/**
+ * Validates one selector value and returns it.
+ *
+ * The backslash refusal is not decoration. `spans.ts` reads a single-quoted literal
+ * with backslash escapes under the dialect-less grammar the guard uses, so a value
+ * ending in a backslash makes the closing quote look escaped and the whole
+ * composed statement reads as `UNDETERMINABLE_TEXT`. The statement would then be
+ * refused anyway — this path fails closed either way — but it would be refused with
+ * a reason that describes the composition rather than the input. Refusing here
+ * names the actual cause, which is the difference between a model that can fix its
+ * request and one that cannot.
+ *
+ * ANY backslash is refused, not only a trailing one, and that is deliberately wider
+ * than the reasoning above requires: an interior backslash IS settleable (`'a\b'`
+ * reads as a terminated literal and the guard admits the composed statement), so an
+ * object genuinely named `a\b` cannot be selected. Separating the two cases would buy
+ * that one name back at the cost of a rule whose boundary depends on where in the
+ * string the character sits — and a selector is a name a caller can also reach by
+ * narrowing to its schema instead. The wide rule is the one that stays true if the
+ * grammar's escape handling is ever revisited (`docs/BACKLOG.md` S2).
+ */
+function assertSelector(value: string, field: string): string {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (trimmed.length === 0) {
+    throw new AgentComposedSqlError(`catalog selector "${field}" must be a non-empty name`, "INVALID_SELECTOR");
+  }
+  if (trimmed.length > MAX_CATALOG_SELECTOR_LENGTH) {
+    throw new AgentComposedSqlError(
+      `catalog selector "${field}" is longer than ${MAX_CATALOG_SELECTOR_LENGTH} characters`,
+      "INVALID_SELECTOR",
+    );
+  }
+  if (trimmed.includes("\\")) {
+    throw new AgentComposedSqlError(
+      `catalog selector "${field}" carries a backslash, which no dialect-less reading of a quoted literal settles`,
+      "INVALID_SELECTOR",
+    );
+  }
+  return trimmed;
+}
+
+/** `AND <column> = '<value>'`, or nothing when the selector is absent. */
+function equalsClause(column: string, value: string | undefined, field: string, dialect: DatabaseType): string {
+  if (value === undefined) return "";
+  return ` AND ${column} = ${quoteLiteral(assertSelector(value, field), dialect)}`;
+}
+
+function composePostgresCatalog(selector: AgentCatalogSelector): string {
+  return (
+    "SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position " +
+    "FROM information_schema.columns " +
+    "WHERE table_schema NOT IN ('pg_catalog', 'information_schema')" +
+    equalsClause("table_schema", selector.schema, "schema", "postgres") +
+    equalsClause("table_name", selector.table, "table", "postgres") +
+    " ORDER BY table_schema, table_name, ordinal_position"
+  );
+}
+
+/**
+ * The foreign-key inventory.
+ *
+ * The joins follow `providers/sql/postgres.ts` (`CTE_FK_INFO`), which runs against
+ * live servers, rather than being re-derived: the pairing of `table_schema` for the
+ * key-column side and `constraint_schema` for the referenced side is subtle enough
+ * that a second, plausible-looking version of it would be a statement nobody has
+ * verified. The projection is flat — one row per referencing column — because the
+ * row cap refuses rather than truncates, and a flat overflow is diagnosable where a
+ * nested aggregate's is not.
+ *
+ * ONE deliberate departure from that source, found by review: `tc.table_name =
+ * kcu.table_name` is added to the first join. A PostgreSQL constraint name is unique
+ * per TABLE, not per schema, so two tables in one schema may both carry
+ * `fk_customer` — and without the extra predicate each one's referencing column is
+ * attributed to the other as well. Narrowing a join cannot lose a row that belonged
+ * there, and the alternative (a wrong edge in the inventory) is a false fact in a
+ * prompt.
+ *
+ * Be precise about what that predicate does and does not close: it fixes the
+ * REFERENCING side only. `constraint_column_usage` exposes no referencing-table
+ * column, so two same-named constraints in one schema still cross-match on the
+ * referenced side, and one table can gain an edge pointing at the other's parent.
+ * Both that collision and the composite-key pairing this projection cannot express
+ * are `docs/BACKLOG.md` B8, and both need the same `pg_constraint` rewrite.
+ */
+function composePostgresRelations(selector: AgentCatalogSelector): string {
+  return (
+    "SELECT tc.table_schema, tc.table_name, kcu.column_name, " +
+    "ccu.table_schema AS referenced_schema, ccu.table_name AS referenced_table, ccu.column_name AS referenced_column " +
+    "FROM information_schema.table_constraints tc " +
+    "JOIN information_schema.key_column_usage kcu " +
+    "ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema " +
+    "AND tc.table_name = kcu.table_name " +
+    "JOIN information_schema.constraint_column_usage ccu " +
+    "ON ccu.constraint_name = tc.constraint_name AND ccu.constraint_schema = tc.constraint_schema " +
+    "WHERE tc.constraint_type = 'FOREIGN KEY' " +
+    "AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')" +
+    equalsClause("tc.table_schema", selector.schema, "schema", "postgres") +
+    equalsClause("tc.table_name", selector.table, "table", "postgres") +
+    " ORDER BY tc.table_schema, tc.table_name, kcu.column_name"
+  );
+}
+
+/**
+ * The index inventory, one row per indexed column.
+ *
+ * `indisprimary` rides along because it is the only place on this path that says
+ * which columns are the primary key: `information_schema.columns` does not carry
+ * it, and asking for it separately would be a fourth read out of a twenty-statement
+ * budget. The column order is the INDEX's own (`array_position` over `indkey`), not
+ * the table's, which is what makes a composite index readable — the same expression
+ * the provider's live-verified `CTE_INDEX_INFO` orders by.
+ *
+ * TWO KNOWN LIMITATIONS, both recorded in `docs/BACKLOG.md` B7 and both about what
+ * the inventory SAYS rather than about what may run:
+ *
+ *  - an expression index (`CREATE INDEX … ON t (lower(name))`) has no `pg_attribute`
+ *    row for its expression, so the join drops it and the index is absent from the
+ *    inventory rather than present without its columns;
+ *  - `indkey` carries a covering index's `INCLUDE` columns after its key columns
+ *    (PostgreSQL 11+, where `indnkeyatts` is what separates them), so those appear
+ *    here as if they were key columns. Left as it is rather than sliced by
+ *    `indnkeyatts`: that column does not exist on older servers, and this milestone
+ *    verifies no PostgreSQL composition against a live engine.
+ */
+function composePostgresIndexes(selector: AgentCatalogSelector): string {
+  return (
+    "SELECT n.nspname AS table_schema, t.relname AS table_name, i.relname AS index_name, " +
+    "ix.indisunique AS is_unique, ix.indisprimary AS is_primary, a.attname AS column_name " +
+    "FROM pg_index ix " +
+    "JOIN pg_class t ON t.oid = ix.indrelid " +
+    "JOIN pg_class i ON i.oid = ix.indexrelid " +
+    "JOIN pg_namespace n ON n.oid = t.relnamespace " +
+    "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) " +
+    "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')" +
+    equalsClause("n.nspname", selector.schema, "schema", "postgres") +
+    equalsClause("t.relname", selector.table, "table", "postgres") +
+    " ORDER BY n.nspname, t.relname, i.relname, array_position(ix.indkey, a.attnum)"
+  );
+}
+
+/**
+ * SQLite serves one schema, and a selector naming another is refused rather than
+ * quietly read as `main`.
+ */
+function assertSqliteSchema(selector: AgentCatalogSelector): void {
+  if (selector.schema === undefined) return;
+  const schema = assertSelector(selector.schema, "schema");
+  if (schema.toLowerCase() !== SQLITE_ONLY_SCHEMA) {
+    throw new AgentComposedSqlError(
+      `SQLite serves one schema on the agent path ("${SQLITE_ONLY_SCHEMA}"), so "${schema}" cannot be selected`,
+      "SELECTOR_UNSUPPORTED_BY_DIALECT",
+    );
+  }
+  // `main` needs no clause: sqlite_master IS main's catalog, so filtering on it
+  // would be a no-op dressed up as a narrowing.
+}
+
+function composeSqliteCatalog(selector: AgentCatalogSelector): string {
+  assertSqliteSchema(selector);
+  return (
+    "SELECT name, type, sql FROM sqlite_master " +
+    // The escape character is `@` rather than a backslash on purpose: `'\'` is the
+    // literal the dialect-less span reader cannot settle (see `assertSelector`).
+    "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite@_%' ESCAPE '@'" +
+    equalsClause("name", selector.table, "table", "sqlite") +
+    " ORDER BY type, name"
+  );
+}
+
+/**
+ * SQLite's index inventory.
+ *
+ * `sql IS NOT NULL` is what excludes the indexes SQLite creates for a `UNIQUE` or
+ * `PRIMARY KEY` constraint: they carry no DDL text at all, so an inventory that
+ * kept them would list an index nothing can describe. Their columns are not lost —
+ * the constraint that created them is in the table's own DDL, which the object read
+ * returns. The `sqlite_` name filter stays as a second line for the same objects.
+ *
+ * The selector narrows on `tbl_name` (the indexed TABLE), not on `name`: a caller
+ * asking about a table wants that table's indexes, and nobody knows an index's name
+ * before reading the inventory.
+ */
+function composeSqliteIndexes(selector: AgentCatalogSelector): string {
+  assertSqliteSchema(selector);
+  return (
+    "SELECT name, tbl_name, sql FROM sqlite_master " +
+    "WHERE type = 'index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite@_%' ESCAPE '@'" +
+    equalsClause("tbl_name", selector.table, "table", "sqlite") +
+    " ORDER BY tbl_name, name"
+  );
+}
+
+/**
+ * Per dialect, per kind. SQLite's relation read IS its object read: foreign keys
+ * are declared inside `CREATE TABLE` and the only structured alternative
+ * (`pragma_foreign_key_list`) is refused by the guard, so the same statement serves
+ * both and the DDL text is parsed for the edges.
+ */
+const CATALOG_COMPOSERS: Partial<
+  Record<DatabaseType, Readonly<Record<AgentCatalogKind, (selector: AgentCatalogSelector) => string>>>
+> = {
+  postgres: { columns: composePostgresCatalog, relations: composePostgresRelations, indexes: composePostgresIndexes },
+  sqlite: { columns: composeSqliteCatalog, relations: composeSqliteCatalog, indexes: composeSqliteIndexes },
+};
+
+/**
+ * The dialect's estimating EXPLAIN prefix. Both forms DESCRIBE without running:
+ * PostgreSQL's `EXPLAIN` executes only with `ANALYZE`, and SQLite's
+ * `EXPLAIN QUERY PLAN` reports the plan the compiler produced.
+ */
+const ESTIMATING_EXPLAIN_PREFIX: Partial<Record<DatabaseType, string>> = {
+  postgres: "EXPLAIN (FORMAT JSON)",
+  sqlite: "EXPLAIN QUERY PLAN",
+};
+
+/**
+ * The catalog statement for this dialect and selector.
+ *
+ * The result is a bounded read like any other: it carries no LIMIT, so a schema
+ * wider than the policy's row budget is REFUSED rather than silently truncated.
+ * That is the same choice the rest of this layer makes — a partial inventory that
+ * claims to be whole is worse than a refusal a caller can narrow — and the selector
+ * is how a caller narrows it.
+ *
+ * KNOWN LIMITATION, with its number: the PostgreSQL projection is one row per COLUMN,
+ * so against `maxResultRows: 200` an unnarrowed call overflows at roughly 25 tables of
+ * eight columns and comes back as a repairable database error. The engine's message
+ * names the budget, so it is diagnosable, but it does cost one repair attempt. The
+ * SQLite side is one row per OBJECT and is nowhere near the cap. Making the two
+ * symmetric means aggregating columns per table, which changes what a caller parses
+ * out of the result — that decision belongs with the context snapshot that consumes
+ * it, not here.
+ */
+export function composeCatalogRead(dialect: DatabaseType, selector: AgentCatalogSelector): string {
+  if (!Object.hasOwn(CATALOG_COMPOSERS, dialect)) {
+    throw new AgentComposedSqlError(
+      `no verified catalog composition for provider type "${dialect}"`,
+      "UNSUPPORTED_DIALECT",
+    );
+  }
+  // Non-null: the key was just proven to be an own property of the map.
+  return CATALOG_COMPOSERS[dialect]![selector.kind ?? "columns"](selector);
+}
+
+/**
+ * The estimating plan statement for `sql` on this dialect.
+ *
+ * Nothing here inspects `sql`: whether it is a bounded read is the descriptor's
+ * input contract to answer, and it answers for the COMPOSED text, so a write the
+ * model smuggled in is refused with the prefix already attached. Composing it first
+ * and letting the guard refuse it is deliberate — one place decides what a
+ * statement may be.
+ */
+export function composeEstimatingExplain(dialect: DatabaseType, sql: string): string {
+  const statement = typeof sql === "string" ? sql.trim() : "";
+  if (statement.length === 0) {
+    throw new AgentComposedSqlError("there is no statement to explain", "INVALID_STATEMENT");
+  }
+  if (!Object.hasOwn(ESTIMATING_EXPLAIN_PREFIX, dialect)) {
+    throw new AgentComposedSqlError(
+      `no verified estimating EXPLAIN for provider type "${dialect}"`,
+      "UNSUPPORTED_DIALECT",
+    );
+  }
+  return `${ESTIMATING_EXPLAIN_PREFIX[dialect]} ${statement}`;
+}

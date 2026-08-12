@@ -635,6 +635,61 @@ Per-table `SELECT` grants are also what bound which rows an agent can READ: the 
 catalog/schema allowlist screens the *declared* target, and only the grants bound what a hostile
 statement could reach instead.
 
+### 12.4 What drives this profile (#329)
+
+#328 built the profile and nothing called it. The agent tool layer
+([`src/lib/agent/tools.ts`](../../src/lib/agent/tools.ts)) is the code written to drive it, and it is
+the only thing in the repository that will: every reach passes `executeAuditedOperation`, and the
+provider comes from an execution-profile acquirer the layer is HANDED rather than one it imports,
+always asked for `agent-read-only`.
+
+Be precise about what is true at this commit, because the injection is easy to misread as wiring:
+nothing in `src/` calls `acquireExecutionProfileProvider` yet. The acquirer is a parameter so that a
+denial can be *proven* not to acquire anything (a test passes a spy and asserts it is never reached),
+and the run loop ([`investigation.ts`](../../src/lib/agent/investigation.ts)) passes whatever its
+caller handed it. There is a run service and a workflow but still no HTTP route (#329 T9), so the
+path is reachable from server code and not from a request.
+
+Four things about the PostgreSQL side of that layer are worth knowing here:
+
+- **The catalog read is a composed bounded read**, not a new operation. `inspect_schema` takes a
+  schema/table selector and the server writes
+  `SELECT … FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog', …)`, executed as
+  `sql.query.read` like any other statement. The model never supplies that SQL. Selectors are quoted
+  with `quoteLiteral` because `queryReadOnly` binds no parameters, and a selector carrying a
+  backslash is refused outright rather than quoted — the dialect-less span reader treats it as an
+  escape, so `'a\'` would read as an unterminated literal.
+- **A run reads three catalog inventories at its start (#329 T8), not one.** `inspect_schema` takes
+  a `kind` — `columns` (the default), `relations` (foreign keys, from
+  `information_schema.table_constraints` joined to `key_column_usage` and `constraint_column_usage`)
+  and `indexes` (from `pg_index` joined to `pg_class`, `pg_namespace` and `pg_attribute`, carrying
+  `indisunique` and `indisprimary`). The index read is also the only place on this path that says
+  which columns are the primary key, since `information_schema.columns` does not carry it. Two
+  consequences of the projections, both deliberate: an **expression index** has no `pg_attribute` row
+  for its expression, so it is absent from the inventory rather than listed without columns; and the
+  `information_schema` views are privilege-filtered, so a least-privilege `libredb_agent` role sees
+  exactly the tables it was granted — a smaller inventory on the agent path than the editor's is
+  correct, not a defect. All three are subject to the same row cap and are **refused, not truncated**,
+  when a schema is wider than `maxResultRows`; the run then continues with no snapshot and is told to
+  narrow `inspect_schema` itself.
+- **Plan inspection uses `EXPLAIN (FORMAT JSON)`, never `EXPLAIN (ANALYZE, …)`.** The editor's
+  Explain button emits the ANALYZE form deliberately (a user asked for real timings) and that form
+  EXECUTES the statement, which on this engine performs a data-modifying CTE. The agent path is
+  served by [`composed-sql.ts`](../../src/lib/agent/composed-sql.ts) instead, and the executing
+  variant stays behind the approval-gated `sql.explain.analyze` descriptor that no tool reaches.
+- **The statement timeout is clamped to the run's remaining wall clock** before it reaches
+  `SET LOCAL statement_timeout`, so a statement cannot outlive the run that asked for it. Here that
+  clamp really preempts; on SQLite it does not — see
+  [sqlite.md §12](./sqlite.md#12-agent-read-only-execution-profile-328).
+
+  Worth knowing what the preemption looks like coming back, because it is not what the name suggests:
+  PostgreSQL reports it as `canceling statement due to statement timeout`, and `mapDatabaseError`
+  matches `canceling statement` before its timeout branch, so it arrives as a `QueryCancelledError` and
+  never as a `TimeoutError` on this engine. The agent tool layer treats it as a repairable statement
+  failure — narrowing the read is the repair that helps — and the mapper discards the wording that
+  would separate it from an operator cancel ([BACKLOG](../BACKLOG.md) B4), which is why a run
+  cancellation is enforced by the run loop's own state rather than by that exception.
+
 ---
 
 ## 13. Testing

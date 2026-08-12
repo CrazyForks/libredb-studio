@@ -22,8 +22,12 @@ import {
   QueryToolbar,
   BottomPanel,
 } from "@/components/studio/index";
+import { AgentRail } from "@/components/agent/AgentRail";
 import { DatabaseConnection, SavedQuery } from "@/lib/types";
 import { quoteLiteral } from "@/lib/sql/values";
+import { buildConnectionPayload } from "@/hooks/use-connection-payload";
+import { useAgentCapability } from "@/hooks/use-agent-capability";
+import { useAgentArtifact } from "@/components/agent/use-agent-artifact";
 import { useToast } from "@/hooks/use-toast";
 import { useProviderMetadata } from "@/hooks/use-provider-metadata";
 import { useAuth } from "@/hooks/use-auth";
@@ -162,6 +166,51 @@ export default function Studio() {
   const [codeGenTable, setCodeGenTable] = useState<string | null>(null);
   const [testDataTable, setTestDataTable] = useState<string | null>(null);
 
+  // === Agent rail (#329 T10a) ===
+  // Server-side flag, discovered at runtime the way the storage mode is: the pages
+  // are statically prerendered, so a build-time read would answer for the build
+  // rather than for the operator's container. Off (and absent) until it answers.
+  const agentEnabled = useAgentCapability();
+  const [isAgentSheetOpen, setIsAgentSheetOpen] = useState(false);
+
+  // Artifact hydration (#329 T11). The rail cites what a run stored; showing it puts
+  // the rows into the bottom panel that already renders rows, and applying a drafted
+  // statement puts it into the editor that already holds statements. There is no
+  // second grid and no second editor, and neither happens without a user action.
+  const agentArtifact = useAgentArtifact({
+    explainFormat: metadata?.capabilities.explainFormat,
+    onShown: (surface) => queryExec.setBottomPanelMode(surface),
+    onError: (message) => toast({ title: "The agent result could not be shown", description: message }),
+  });
+
+  /*
+    A hydrated artifact is a view of what a RUN produced, so the user's own work takes
+    the panel back: a new result on this tab, a new plan on it, or a different tab
+    altogether ends the view.
+
+    Keyed on the identity of what a run PRODUCES rather than on the calls that produce
+    it, because the paths that execute a statement — the toolbar, the command palette,
+    an import, a generated statement — are many and wrapping them one at a time would
+    miss one. Both outputs are watched because they are written separately: an explain
+    run stores a plan and deliberately leaves `result` untouched
+    (`use-query-execution.ts`), so a tab whose result is still null would otherwise
+    keep showing the run's plan after the user asked for their own.
+  */
+  const agentArtifactDismiss = agentArtifact.dismiss;
+  useEffect(() => {
+    agentArtifactDismiss();
+  }, [tabMgr.activeTabId, tabMgr.currentTab.result, tabMgr.currentTab.explainPlan, agentArtifactDismiss]);
+
+  // A run persists a connection ID and no credential, so the process that resumes it
+  // re-resolves the connection server-side. Only a managed connection has an id that
+  // survives that, which is why a browser-only one reaches the rail as null: the rail
+  // says why instead of posting a request the route can only refuse.
+  const agentConnectionPayload = conn.activeConnection === null ? null : buildConnectionPayload(conn.activeConnection);
+  const agentConnectionId =
+    agentConnectionPayload !== null && "connectionId" in agentConnectionPayload
+      ? agentConnectionPayload.connectionId
+      : null;
+
   // Data Masking
   const [maskingConfig, setMaskingConfig] = useState<MaskingConfig>(() => loadMaskingConfig());
   const effectiveMasking = shouldMask(user?.role, maskingConfig);
@@ -295,7 +344,8 @@ export default function Studio() {
   return (
     <div className="flex h-screen w-full bg-[#050505] text-zinc-100 overflow-hidden font-sans select-none">
       <ResizablePanelGroup id="studio-main" direction="horizontal" className="h-full">
-        <ResizablePanel defaultSize={22} minSize={15} maxSize={35} className="hidden md:block">
+        {/* `order` is required once a sibling panel is conditional (the agent rail). */}
+        <ResizablePanel order={1} defaultSize={22} minSize={15} maxSize={35} className="hidden md:block">
           <Sidebar
             connections={conn.connections}
             activeConnection={conn.activeConnection}
@@ -322,7 +372,7 @@ export default function Studio() {
           />
         </ResizablePanel>
         <ResizableHandle className="hidden md:flex w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
-        <ResizablePanel defaultSize={78}>
+        <ResizablePanel order={2} defaultSize={agentEnabled ? 54 : 78}>
           <div className="flex-1 flex flex-col min-w-0 h-full bg-[#0a0a0a] pb-16 md:pb-0">
             <StudioMobileHeader
               connections={conn.connections}
@@ -532,6 +582,8 @@ export default function Studio() {
                         }
                         isLoadingMore={tabMgr.currentTab.isLoadingMore}
                         onExportResults={exportResults}
+                        agentArtifact={agentArtifact.artifact}
+                        onDismissAgentArtifact={agentArtifact.dismiss}
                       />
                     </ResizablePanel>
                   </ResizablePanelGroup>
@@ -540,6 +592,42 @@ export default function Studio() {
             </main>
           </div>
         </ResizablePanel>
+
+        {/*
+          The agent rail. Absent — not hidden, not disabled — while the server says
+          the runtime is off, which is the default. One instance serves both
+          presentations: this panel above `md`, and a sheet below it, where the panel
+          is display:none and the mobile nav is what opens the rail.
+
+          The imports above are static, so with the flag off the rail's modules and the
+          two hydration modules beside them are still in the standalone bundle — as is
+          `execution-policy.ts`,
+          which the rail and the timeline import as VALUES for the budget meter's
+          ceilings. What does NOT reach a browser is any agent RUNTIME module (the
+          ledger, the run service, the tool layer, the model adapter — those are
+          server-only and the rail imports nothing from them but types), and no agent
+          request is made beyond the discovery probe. `docs/AGENT.md` states the same
+          boundary for a reader who never opens this file.
+          This repository lazy-imports libraries but no COMPONENT
+          (neither `next/dynamic` nor `React.lazy` appears under `src/`), and the
+          package boundary — the one that matters for what ships to platform — is
+          pinned separately in T12.
+        */}
+        {agentEnabled && (
+          <>
+            <ResizableHandle className="hidden md:flex w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
+            <ResizablePanel order={3} defaultSize={24} minSize={18} maxSize={45} className="hidden md:block">
+              <AgentRail
+                connectionId={agentConnectionId}
+                connectionName={conn.activeConnection?.name ?? null}
+                sheetOpen={isAgentSheetOpen}
+                onSheetOpenChange={setIsAgentSheetOpen}
+                onApplyStatement={(sql) => tabMgr.updateCurrentTab({ query: sql })}
+                onShowArtifact={agentArtifact.show}
+              />
+            </ResizablePanel>
+          </>
+        )}
       </ResizablePanelGroup>
 
       {/* Modals */}
@@ -672,7 +760,14 @@ export default function Studio() {
         onLogout={handleLogout}
       />
 
-      <MobileNav activeTab={activeMobileTab} onTabChange={setActiveMobileTab} hasResult={!!tabMgr.currentTab.result} />
+      <MobileNav
+        activeTab={activeMobileTab}
+        onTabChange={setActiveMobileTab}
+        hasResult={!!tabMgr.currentTab.result}
+        // Absent while the runtime is off, so the nav carries no control that
+        // would open a rail that does not exist.
+        onOpenAgent={agentEnabled ? () => setIsAgentSheetOpen(true) : undefined}
+      />
     </div>
   );
 }

@@ -26,7 +26,7 @@ FAIL=0
 # Count the `run_group` CALLS below when adding one (not the definition) - this is the
 # number the final summary reports, and it had already drifted by one before Group 0e
 # was added.
-TOTAL_GROUPS=23
+TOTAL_GROUPS=26
 EXTRA_BUN_ARGS=("$@")
 GROUP_INDEX=0
 COVERAGE_MODE=0
@@ -110,6 +110,32 @@ run_group "Group 0d: Monaco loader wiring" --nocov \
 run_group "Group 0e: Query safety gate (standalone path)" \
   tests/isolated/query-safety-gate-standalone.test.ts
 
+# Group 0f: The agent's model layer against the REAL LLM error classes
+# (isolated — every tests/api/ai/*.test.ts replaces @/lib/llm/types with stub
+# error classes whose constructors take a message only, and mock.module is
+# process-wide, so a test sharing that process sees the mapper's provider tag
+# dropped even though the class identity still matches). The four files share one
+# process: none of them mocks a module, so they only need isolating from those.
+run_group "Group 0f: Agent model layer" \
+  tests/isolated/agent-model-adapter.test.ts \
+  tests/isolated/agent-provider-registry.test.ts \
+  tests/isolated/agent-capability-probe.test.ts \
+  tests/isolated/agent-investigation.test.ts
+
+# Group 0g: The agent's composition root. Its own group, NOT part of 0f: it mocks
+# @/lib/db, @/lib/agent/investigation and @/lib/seed/resolve-connection, and
+# mock.module is process-wide, so sharing 0f's process would hand the loop suite
+# above a stubbed investigation module.
+run_group "Group 0g: Agent runtime composition" \
+  tests/isolated/agent-runtime.test.ts
+
+# Group 0h: The agent's end-to-end investigation against real engines. Its own
+# group, NOT part of 0f: it mocks `pg` (the PostgreSQL suite's engine-fixture
+# technique) and mock.module is process-wide, so sharing a process would hand every
+# other file in it a pg module that answers only this fixture's statements.
+run_group "Group 0h: Agent end-to-end investigation" \
+  tests/isolated/agent-investigation-e2e.test.ts
+
 # Group 1: Studio (isolated — mocks almost every child component)
 run_group "Group 1/6: Studio" \
   tests/components/Studio.test.tsx
@@ -163,6 +189,7 @@ run_group "Group 10/12: PoolTab" \
 
 # Group 11: Smoke tests (isolated - mock globalThis.fetch + MonitoringEmbed)
 run_group "Group 11/12: Smoke tests" \
+  tests/components/agent/AgentRail.test.tsx \
   tests/components/admin/MonitoringEmbed.test.tsx \
   tests/components/VisualExplain.test.tsx \
   tests/components/AIAutopilotPanel.test.tsx \

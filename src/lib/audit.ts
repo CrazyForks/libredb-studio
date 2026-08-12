@@ -61,7 +61,20 @@ export type AuditReason =
   | "agent_statement_budget_exceeded"
   | "agent_total_run_budget_exceeded"
   | "agent_approval_required"
-  | "agent_execution_failed";
+  | "agent_execution_failed"
+  // The run loop's own wall-clock refusals (#329). They are NOT policy denials and
+  // deliberately do not share that vocabulary: they fire before
+  // `executeAuditedOperation` is reached, so without these two a run that stopped on
+  // its own deadline would leave no trace at all. The mirror is kept honest the same
+  // way — `DEADLINE_REASONS` in src/lib/agent/tools.ts is typed
+  // `Record<AgentDeadlineDenyCode, AuditReason>`.
+  | "agent_run_deadline_exceeded"
+  | "agent_insufficient_time_remaining"
+  // The agent drive callback (#329 T9) refusing a caller that presented no valid
+  // single-purpose credential. Distinct from `no_session` on purpose: this path
+  // never wanted a session, so recording one vocabulary for both would make a
+  // forged drive token indistinguishable in the trail from an expired login.
+  | "no_agent_drive_token";
 
 export interface AuditEvent {
   id: string;

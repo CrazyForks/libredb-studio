@@ -14,7 +14,9 @@
     "scripts/*.mjs"
   ],
   "ignoreDependencies": [
-    "tailwindcss"
+    "tailwindcss",
+    "@workflow/world-postgres",
+    "@ai-sdk/anthropic"
   ],
   "ignoreBinaries": [
     "genhtml",

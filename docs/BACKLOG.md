@@ -326,6 +326,21 @@ dismissed with this reasoning recorded on it. Re-check on each Tauri upgrade —
 every provider doc, so the fix is a convention change (anchor on symbol names, not line numbers) as
 much as a correction.
 
+### X2. Two chart README `--set` recipes render a YAML boolean where Kubernetes needs a string
+
+`charts/libredb-studio/README.md`'s Content-Security-Policy escape hatch sets `CSP_REPORT_ONLY` with
+`--set extraEnv[0].value="true"` (twice: the single-variable example and the two-variable one). The
+shell strips the quotes and Helm type-coerces the bare word, so the manifest renders
+`value: true` — an unquoted YAML boolean, while `core/v1.EnvVar.value` is a string, and the API server
+rejects it (`invalid type for io.k8s.api.core.v1.EnvVar.value: got "bool", expected "string"`).
+Reproduced with `helm template` on 2026-08-12. `--set-string` is the fix, one word per line.
+
+Found while documenting the agent runtime in #329 T13, whose own new recipe uses `--set-string` for
+exactly this reason. Left for a separate change rather than folded in, because it is a different
+feature's documentation and the same PR's chart version bump is already spoken for. Done when both
+lines use `--set-string` — and ideally when the README's `--set` bracket arguments are single-quoted,
+since unquoted `extraEnv[0]` is a glob pattern in zsh.
+
 ---
 
 ## Security Phase 1 deferrals
@@ -724,25 +739,6 @@ Done when out-of-scope reads are refused by something that does not read SQL - a
 set generated for the agent role, an allowlisted directory for SQLite targets, or an authorizer both
 adapters expose.
 
-### A4. No wall-clock deadline bounds an agent run
-
-`maxTotalRunMs` bounds the DATABASE time a run consumes: the execution layer reports each completed
-call's elapsed time and the tracker sums them. Nothing bounds the run's wall clock. Time between
-calls is not counted, so a run that spends minutes in model latency or waiting on a caller stays
-inside its budget indefinitely; parallel calls each contribute their own duration, so the sum can
-exceed real elapsed time; and a call admitted just under the limit can still overrun it by up to one
-statement timeout.
-
-This is deliberate at this layer. `ExecutionBudgetTracker` has no clock so that budget accounting
-stays deterministic under test, and database time is the bound that actually protects the database.
-The missing control is a run-level one: a runaway agent is bounded by how long it may run, not by
-how much database time it used.
-
-Done when the run loop owns a monotonic deadline per run, refuses to admit a call that cannot finish
-inside the remaining time, and clamps each effective statement timeout to what is left. That belongs
-with the WorkflowAgent run loop in M2 (#329), which is the first component that owns a run's
-lifetime.
-
 ### A5. The PostgreSQL profile's regression tests model the server rather than run one
 
 `tests/integration/db/postgres-provider.test.ts` proves the read-only profile against a stateful
@@ -813,3 +809,522 @@ about what type-checks; today that divergence is zero, since 7.0.2 already repor
 Done when TypeScript exposes an API 7.x tooling can build on and typescript-eslint's peer range
 follows, at which point this is a one-line dependency bump plus a re-run of the gates: the compiler
 side is already proven green.
+
+## Agent M2 deferrals (#329)
+
+### B1. A module-private credential map would be invisible to the agent state guard
+
+`src/lib/agent/state-guard.ts` derives its credential key names from `SECRET_FIELD_MAPS` in
+`src/lib/storage/connection-secrets.ts`, so a field promoted to `secret` in one of the three
+classification maps is covered without an edit. The aggregate itself is a hand-maintained array with
+no type-level guarantee - each individual map fails `bun run typecheck` when a field goes
+unclassified, but nothing makes a fourth MAP appear in the array.
+
+The direction that loses coverage silently is adding a map, not removing one: the storage layer
+would seal the new field while the guard happily persisted it. `tests/unit/lib/agent/state-guard.test.ts`
+closes that by reflection - it walks the storage module's exports, recognises a classification map
+structurally, and fails when one is not registered. Verified to fire by temporarily exporting a
+fourth map.
+
+What remains is narrower: the check sees **exported** maps only. A map kept module-private and wired
+straight into `walkConnection` is invisible to it. All three existing maps are exported for
+consumers, so this is a convention rather than an enforced rule.
+
+Done when a new classification map cannot be added without the guard learning about it - most
+directly by having `walkConnection` iterate a registry instead of three separately derived key
+lists. That registry has to carry each map's nesting location (root, `ssl`, `sshTunnel`), so it is a
+change to a security-critical encrypt/decrypt path with its own test obligations, which is why it
+was not folded into the agent milestone that surfaced it.
+
+### B2. The Anthropic provider kind is ratified and installed, but not offered
+
+`@ai-sdk/anthropic@4.0.37` is an owner-ratified dependency and is installed, and the agent's provider
+registry (`src/lib/agent/provider-registry.ts`) could serve it in a few lines. What blocks it is not
+the agent at all: the registry is keyed on `LLMProviderType`, the settings surface's own union
+(`src/lib/llm/types.ts`), and that union is what `LLM_PROVIDER` resolves against
+(`src/lib/llm/utils/config.ts`). Adding `anthropic` there makes `LLM_PROVIDER=anthropic` a
+selectable setting for the whole application, and `src/lib/llm/factory.ts` would then have to build a
+chat provider for it or throw - so the AI Assistant and the Natural Language Query panel would be
+broken for exactly the users who configured it.
+
+Serving it properly therefore means a `src/lib/llm/providers/anthropic.ts` that speaks Anthropic's
+Messages streaming protocol: `createSSEParser`'s `extractContent` in
+`src/lib/llm/utils/streaming.ts` understands the OpenAI delta shape only, and Anthropic requires
+`max_tokens` on every request while `LLMStreamOptions.maxTokens` is optional, which needs a default
+nobody has chosen. That is a chat-surface feature with its own conventions, tests and release note,
+not a line in the agent registry - and the ratified package cannot be used for it either, since
+`src/lib/llm` is reachable from the published package while the AI SDK is deliberately not
+(`tests/unit/agent-dependency-boundary.test.ts`).
+
+Until then `@ai-sdk/anthropic` stays in `knip.json`'s `ignoreDependencies` as an installed-but-unwired
+ratified package, which that test's allowed-ignore set names explicitly.
+
+Done when the chat surface gains an Anthropic provider under its own conventions and the registry
+gains the matching adapter in the same change - the `Record<LLMProviderType, AgentProviderAdapter>`
+will not compile until it does.
+
+### B3. A scope allowlist on a target dimension denies every tool that cannot declare it
+
+`withinAllowlist` (`src/lib/db/operations/policy.ts`) refuses a call that does not DECLARE a dimension
+the scope constrains, which is the right direction - an undeclared target cannot be screened, so it
+fails closed. The consequence for the agent tool layer is that a scope carrying an allowlist silently
+narrows the tool set to the tools that happen to declare that dimension:
+
+- A `schema` allowlist admits only a NARROWED `inspect_schema` call — one that was given a selector,
+  which is what the tool declares. The selector-less full inventory declares nothing and is denied
+  (verified: `createTargetScope("c", { schemas: ["public"] })` plus `inspectSchemaTool(ctx, {})`
+  answers `TARGET_OUT_OF_SCOPE`), and that is the natural first call — the one T8's run-start snapshot
+  DOES make: `captureContextSnapshot` (`src/lib/agent/context-snapshot.ts`) asks for each catalog kind
+  with no selector, so under a schema allowlist every run's context capture is refused and the run
+  proceeds with no snapshot at all. It fails closed and the model is told to inspect the schema
+  itself, but a run scoped to one schema never gets an inventory. Narrowing the capture to the scope's
+  own single-entry allowlist is the obvious repair once a caller builds such a scope. Every
+  `run_read_query` and `inspect_plan` call is denied outright, because a raw statement cannot declare
+  which schema it will touch without parsing it.
+- A `catalog` allowlist denies EVERY call in the layer: no tool declares that dimension at all.
+
+Nothing is wired to build such a scope yet (`createTargetScope` has no production caller at this
+commit), so this is a property of the layer rather than a live defect, and the tool layer records it
+at the `inspect_schema` target declaration. It matters because the failure looks like a policy bug
+rather than a scoping choice: the model gets `TARGET_OUT_OF_SCOPE` with advice to ask for an in-scope
+target, and for a raw read there is no way to comply.
+
+Two honest resolutions when a caller first needs scoping, and the choice is a product one: give
+`run_read_query` an optional declared-schema argument and require it when the scope constrains that
+dimension, or let the run service refuse to start a run whose scope constrains a dimension its tool
+set cannot declare - which is louder and needs no per-tool argument.
+
+Done when a scope with a schema or catalog allowlist produces a coherent outcome for every tool the
+mode offers, with a test per dimension.
+
+### B4. `mapDatabaseError` discards the text that distinguishes a timeout cancel from an operator cancel
+
+`mapDatabaseError` matches `canceling statement` before its timeout branch and returns
+`new QueryCancelledError("Query was cancelled", provider, query)` (`src/lib/db/errors.ts`), replacing
+the engine's own wording. PostgreSQL says `canceling statement due to statement timeout` for a
+`statement_timeout` and `canceling statement due to user request` for `pg_cancel_backend`, so after
+this mapping **no** consumer can tell the two apart — the discriminator is gone, not merely
+unexamined.
+
+That is why the agent tool layer classifies a cancel as a repairable statement failure
+(`src/lib/agent/tools.ts`): the reachable case on the agent path is the timeout this layer itself
+installs via `SET LOCAL statement_timeout`, and narrowing the read is the repair that helps. The cost
+is stated there — an operator cancel arriving mid-statement is also offered a repair, so a run
+cancellation has to be enforced by the run loop's own persisted state between tool calls rather than by
+expecting the driver's cancel to propagate.
+
+The fix is in shared code and has editor-visible consequences, which is why it is not in #329:
+reordering the timeout check ahead of the cancellation check, or preserving the original message on
+`QueryCancelledError`, changes what the query panel shows when a statement is cancelled versus times
+out. The reordering is the substantive one and needs the editor's cancel/timeout UX re-checked
+(`src/lib/db/providers/sql/postgres.ts` sets `queryTimeout` on the pool as well, so both paths exist
+today).
+
+The same mapper has a wider imprecision worth fixing in the same pass, because the agent layer's
+repairable-versus-environment split inherits it: the classification is **substring** matching on the
+engine's message, so an identifier can decide the class. Verified against the live mapper:
+
+- `no such table: pooled_items` matches `pool` and returns `PoolExhaustedError`, so a plainly
+  repairable missing relation is treated as an environment fault and ends an agent run.
+- `Connection terminated unexpectedly` matches nothing and falls through to the base `DatabaseError`,
+  so a dead socket is offered to a model as a statement it could rewrite (bounded at three attempts).
+- `relation "user_passwords" does not exist` matches `password` and returns `AuthenticationError` —
+  harmless on the agent path today only because a query-phase `AuthenticationError` is repairable
+  there, which is a coincidence rather than a design.
+
+Neither direction is a boundary failure: nothing runs that policy did not allow, and the agent's
+statement and repair budgets still bound the waste. What is wrong is the diagnosis, and it is wrong
+before any consumer sees the error, so no consumer can correct it.
+
+Done when a statement timeout and a user cancellation are distinguishable by type or by preserved
+message, with the editor's own consumers updated and the agent layer's cancel classification
+revisited against the new signal; and when classification no longer depends on a substring that a
+table or column name can satisfy (driver error codes — PostgreSQL `SQLSTATE`, SQLite `errcode` — are
+the signal that does not collide, and each provider already has access to its own).
+
+### B5. The agent run ledger assumes one writer per run, and cannot enforce it
+
+`src/lib/agent/run-store.ts` and `src/lib/agent/run-service.ts` are append-only over the durable
+world's stream primitives, which offer no compare-and-append: a writer cannot say "append this only
+if the stream is still at index N". Every operation is therefore read-then-append, and two
+consequences follow that a single-writer run never meets and a second writer would:
+
+- **Two concurrent opens on one caller-supplied run id write two headers.** The fold refuses a ledger
+  with a second header (`MALFORMED_LEDGER`), permanently, for every later read — so the race does not
+  resolve in one side's favour, it bricks the run. Nothing minted internally can collide (the id is a
+  UUIDv4, so 122 random bits), so reaching this needs a caller that supplies its own id, which is
+  exactly what the workflow-run-id path does.
+- **Two loops driving one running run would both perform the same step.** `runStep` reads the ledger,
+  sees the step neither settled nor invoked, and appends its invocation; two readers of the same state
+  both pass that check. The write-ahead ordering makes a step at-most-once *per loop*, not
+  *per run* — the milestone's "no tool execution performed twice" criterion is about a restart, where
+  the dead process is gone by construction, and that case is genuinely covered.
+
+Not defended in code because every available defence is worse than the constraint: a lock file is
+single-instance only (which the Postgres backend exists to escape), and a lease in the ledger is a
+distributed-lock design with its own expiry semantics. The honest boundary is that single ownership of
+a running workflow belongs to the layer above rather than being re-implemented below it — and how
+strong that guarantee is depends on which backend is configured, which is the part worth stating
+plainly. On the zero-config local world it holds by construction: the queue awaits each delivery
+before attempting the next, so retries are sequential. On the opt-in Postgres backend a
+visibility-timeout redelivery can overlap a handler that is still alive, and that is precisely where
+the second bullet above would bite.
+
+Done when either the run ledger can append conditionally on the stream's tail index (which is what
+would make both races impossible at the storage layer), or the single-ownership guarantee the runtime
+provides is asserted by a test rather than assumed by prose — whichever the durable backend can
+actually support.
+
+### B6. Every agent cost ceiling is per-drive, so N resumes cost up to N times one drive's budget
+
+The three things that bound what a run may spend — `ExecutionBudgetTracker` (`maxStatementsPerRun`,
+`maxTotalRunMs`), `AgentRepairLedger` and `AgentRunDeadline` — are all constructed by the process that
+drives a run and live only in its memory. `runInvestigation` (`src/lib/agent/investigation.ts`) takes
+them as injected resources, so a run resumed after a process death is handed a fresh set and starts
+each ceiling again. A run that dies and resumes ten times may therefore perform ten times
+`maxStatementsPerRun` statements and spend ten times `AGENT_RUN_DEADLINE_MS` of wall clock, even though
+each individual drive stayed honestly inside its bounds.
+
+Nothing currently claims otherwise — `AGENT_MAX_MODEL_TURNS`'s docblock in
+`src/lib/agent/execution-policy.ts` states the per-drive scope explicitly rather than implying a
+per-run one, which is why this is a recorded limitation and not a defect. It matters for two later
+tasks: T10b's budget meter must not present a per-drive figure as a run total, and any retry policy
+that resumes automatically would multiply the ceiling without a user ever asking for it.
+
+The data needed to fix it is already persisted: `AgentRunRecord` carries `createdAtMs`, and the ledger
+holds every settled step, so a drive could fold the run's own history into the ceilings it starts with
+(a deadline measured from `createdAtMs`, a statement count folded from `tool-completed` entries)
+instead of starting from zero. Done when the ceilings a drive enforces are derived from the run's
+ledger rather than from the drive's own construction, with a test that resumes a run twice and shows
+the second drive inheriting the first's spend.
+
+### B7. A PostgreSQL expression index is absent from the agent's schema inventory
+
+The composed index read (`composePostgresIndexes`, `src/lib/agent/composed-sql.ts`) joins `pg_index`
+to `pg_attribute` on `a.attnum = ANY(ix.indkey)` to name each indexed column. An expression index
+(`CREATE INDEX … ON t (lower(name))`) stores a zero in `indkey` for its expression and keeps the
+expression in `pg_index.indexprs`, so the join matches nothing and the index does not appear in the
+run's context snapshot at all. A partly-expression index (`(status, lower(name))`) is worse in one
+respect: it appears, carrying only its plain columns, so a reader could take it for an index on
+`status` alone.
+
+Consequences are bounded and reporting-only: nothing about enforcement depends on the inventory, and
+the model can still ask for a plan (`inspect_plan`), which is what actually says whether an index is
+used. The cost is a model reasoning about "there is no index on that column" when there is one. The
+SQLite side does not have this gap — `parseSqliteIndexDdl` keeps an expression's written form, because
+the DDL text carries it (`src/lib/agent/sqlite-ddl.ts`).
+
+Fixing it means projecting `pg_get_indexdef(ix.indexrelid)` (or `pg_get_expr(ix.indexprs, ix.indrelid)`)
+alongside the column join and parsing the emitted definition, which is a second per-dialect parser
+against text whose stability this repository has not verified — deliberately not done inside the task
+that found it. Done when an expression index appears in the inventory with its expression, asserted
+against a live PostgreSQL rather than a fixture, since the projection is the part that cannot be
+checked without an engine (see A5).
+
+### B8. The composed foreign-key read cannot pair a composite key's columns, and its referenced side still collides on constraint names
+
+`composePostgresRelations` (`src/lib/agent/composed-sql.ts`) joins
+`information_schema.key_column_usage` (one row per REFERENCING column) to
+`information_schema.constraint_column_usage` (one row per REFERENCED column) on the constraint alone.
+Neither view exposes an ordinal that pairs the two sides, so a foreign key over two or more columns
+comes back as the cross-product of its sides: `FOREIGN KEY (x, y) REFERENCES parents (a, b)` yields
+four rows, and `buildPostgresTables` turns them into four edges, of which two are wrong
+(`x -> parents.b`, `y -> parents.a`). Single-column keys — the overwhelming majority — are exact.
+
+The consequence is confined to what a run is TOLD: the packed context can show a relation that does
+not exist, so a model could join on the wrong column and get a statement that is refused or returns
+nothing. Nothing about enforcement depends on it. The SQLite side does not have this gap: the DDL
+text pairs the two lists positionally and `sqlite-ddl.ts` reads them that way, which is the
+declaration's own meaning.
+
+A second, independent defect lives in the same joins and needs the same fix. A PostgreSQL constraint
+name is unique per TABLE, so two tables in one schema may both carry `fk_customer`. The referencing
+side is narrowed by `tc.table_name = kcu.table_name`, but `constraint_column_usage` exposes no
+referencing-table column at all, so the referenced side cannot be narrowed the same way: table `a`
+still gains an edge pointing at table `b`'s parent. Same consequence as above — a relation in the
+prompt that does not exist — and the same blast radius, since nothing about enforcement reads the
+inventory.
+
+A correct projection means leaving `information_schema` for `pg_constraint`, unnesting `conkey` and
+`confkey` `WITH ORDINALITY` and joining on the ordinal — which closes both defects at once, because
+`pg_constraint` rows carry `conrelid` and are identified by oid rather than by name. It is a statement
+that has to be verified against a live server before it can be trusted, which this milestone cannot do
+(see A5). Done when a composite foreign key appears in the inventory with each column paired to the one
+it actually references, and two same-named constraints in one schema produce only their own edges,
+both asserted against a live PostgreSQL.
+
+### B9. Nothing enqueues an agent drive, so an interrupted run is resumable but never resumed
+
+Opened by #329 T9. `POST /api/agent/drive` exists, authenticates a server-minted single-purpose
+credential and resumes the run it names, and `src/lib/agent/runtime.ts` re-derives everything that
+run needs from its own ledger — so a resume WORKS. What does not exist is anything that asks for
+one. A run is driven exactly once, in the process that opened it (`src/app/api/agent/runs/route.ts`),
+and if that process dies mid-run the run stays `running` in the ledger with nobody to pick it up:
+`mintAgentDriveToken` has no production caller, and the workflow runtime is used only as the
+ledger's durable substrate — there is no `"use workflow"` function and no queue producer, so the
+backend's own re-enqueue-on-start never sees an agent run.
+
+Distinct from a drive that *fails*, which is now recorded: a throw anywhere in `driveAgentRun` ends
+the run as `failed` with a classified reason (`docs/AGENT.md`, "A drive that dies before the loop"),
+so an unconfigured model no longer leaves a run at `queued` forever. This entry is the case where the
+process is GONE — nothing threw, nothing can record, and the run stays `running` until something asks
+for it. Recording a failure cannot close that; only a producer can.
+
+Adopting the SDK's Next.js integration is what would supply the producer, and it was refused
+deliberately rather than overlooked. Its documented setup asks for `/.well-known/workflow/*` to be
+excluded from the proxy matcher (`node_modules/workflow/docs/getting-started/next.mdx`), and it warns
+that a proxy running on that path detaches the request body — so the callback could not merely
+authenticate its way through the middleware either. Worse than the requested edit: **this matcher
+already excludes it**, because the dot rule (`.*\..*`) skips every path containing a dot and
+`.well-known` contains one (A2 above records the same consequence). So that route would sit outside
+`src/proxy.ts` entirely, unauthenticated, the moment it existed — with no matcher edit to review. The
+pinned decision for exactly this case (P4) says driving in-process without a loopback hop is strictly
+better, which is what the start route does; the drive path this task added is one the matcher DOES
+route, guarded by a credential rather than by a path rule, and `tests/api/proxy.test.ts` pins both
+halves of that.
+
+Two things have to land together whenever a producer arrives, and neither is safe to add alone:
+
+- **A sweep that finds runs left `running`** and drives each one — at boot, or on a timer — with the
+  same credential the callback already verifies.
+- **Single-flight per run.** Today no two drives of one run can overlap, because there is only ever
+  one. A producer removes that accident, and the ledger is explicitly read-then-append with no
+  fencing (B5), so two drives would both read "not invoked" for the same step and both perform it —
+  the duplicate execution the milestone's durability criterion forbids.
+
+Done when a run whose process died is picked up without a person asking, no step is performed twice
+while that happens, and B6's per-drive cost ceilings are accounted for across the resumes it causes.
+
+### B10. No token budget is enforced, so the rail's budget meter reports none
+
+Opened by #329 T10b. The task's bar names tokens among the figures the meter should report, and the
+meter deliberately does not show one: nothing in this repository bounds an agent run's token spend.
+`AGENT_EXECUTION_POLICY`'s budgets are statement-shaped (`src/lib/agent/execution-policy.ts`),
+`AGENT_MAX_MODEL_TURNS` bounds model TURNS rather than their size, and the run loop never reads the
+SDK's `usage` at all (`src/lib/agent/investigation.ts` consumes `fullStream` parts and the assistant
+messages, nothing else). A token figure would therefore be a number the server does not enforce,
+shown next to four that it does — which is the one thing that bar forbids, so the meter states the
+turn ceiling instead and says nothing about tokens.
+
+Closing it is two changes that have to land together: reading `usage` off each turn and recording it
+in the run's ledger (a new field on `run-finished`, or a new event kind — T2's union is closed, so
+this is a deliberate widening rather than an addition anyone can make in passing), and a ceiling in
+`execution-policy.ts` that the loop actually refuses on. Done when a run that exceeds a configured
+token budget ends with a reason a user can read, and the meter shows the same number the loop
+enforced.
+
+### B11. The rail can stop a run but cannot pause or resume one
+
+Opened by #329 T10b. `AgentRunService` has no pause: a run holds a provider and a budget while it is
+running, and nothing in this milestone can put those down and pick them up again. Resuming exists
+(`POST /api/agent/drive`, `driveAgentRun`) but is authenticated by a server-minted single-purpose
+credential a browser never holds — it is the seam a machine producer will use (B9), not a user
+control. The rail therefore offers stop and nothing else, and it does not render a disabled pause or
+resume, because a disabled control reads as a capability that is merely unavailable right now.
+
+Resume becomes offerable the moment B9's producer exists — a user-visible "pick this run up" is then
+just asking for a delivery. Pause is the larger one: it needs a run state between running and
+terminal that releases the run's resources without ending it, and a resumed run would have to
+re-acquire them, which is exactly the path B6 already complicates. Done when either control exists in
+the service with its own ledger record, and the rail renders it because the service can honour it.
+
+### B12. A statement that failed at the database records no duration, so the meter's database time counts completed reads only
+
+Opened by #329 T10b. `ExecutionBudgetTracker` charges `maxTotalRunMs` from every execution's elapsed
+time, on the failure path as well as the success one (`execution.ts` calls `endExecution` with
+`statements: 1` in both). The durable ledger is narrower: `tool-completed` carries the artifact's
+`summary.elapsedMs`, while `tool-refused` carries an `AgentToolRefusal`, whose database-error variant
+records a fingerprint and the engine's message and no duration at all (`src/lib/agent/types.ts`). The
+rail folds its meter from the ledger, so its database-time figure is the sum over completed reads and
+sits BELOW what the tracker enforced whenever a statement failed.
+
+The rail says so beside the meter rather than quietly rounding — under-reporting the time a bound has
+already spent is the direction that misleads. Fixing it means recording the elapsed time of a failed
+execution somewhere durable; the natural place is the refusal itself, which is a T2 contract change
+and therefore deliberate rather than incidental. Done when a run whose statement failed shows the same
+database time the tracker charged it, with a test that fails on the current under-count.
+
+### B13. Three spends the agent run ledger never records, so the budget meter reads low
+
+Opened by #329 T10b, found by the task's own fresh-context review rather than by writing the meter.
+
+The largest is the schema capture. `captureContextSnapshot` (`src/lib/agent/context-snapshot.ts`)
+calls `inspectSchemaTool` directly, once per catalog kind — three reads on PostgreSQL, two on SQLite
+(`CATALOG_PLANS`) — and each one goes through `executeAuditedOperation` and is charged `statements: 1`
+plus its elapsed time against exactly the budget the meter displays. What it does NOT go through is
+the run loop's `runStep`, which is the only writer of `tool-completed`; the capture records one summary
+`context-captured` entry instead. On an agent-mode drive with no reusable snapshot in its ledger — the
+case `establishContext` actually reads a catalog in, since a planning run captures nothing and a
+resumed run reuses what it recorded — a ledger-folded meter therefore reads "0 / 20 statements" at the
+moment two or three are already spent, before the model's first turn, and a capture that FAILS records
+no entry at all while still having paid for its reads.
+
+Two smaller mismatches belong with it. An acquisition failure is accounted as one executed statement
+although nothing ran — `tools.ts` acquires the provider inside the allowed callback deliberately, so
+that a denied call never opens a pool — and it propagates out of the tool, leaving the step with a
+`tool-invoked` entry and no settlement, so the fold cannot see it. And a `tool-completed` entry carries
+the provider's own `summary.elapsedMs`, while `maxTotalRunMs` is charged the span the execution layer
+measured around the whole call (`execution.ts`), which also covers that acquisition. All three gaps run
+in the same direction — the meter under-reports — which is why the rail states its figures as a floor
+rather than as the spend, and why the caveat it shows is a list of what is known rather than a proof
+that the list is complete.
+
+Either half closes the same way: give the capture path a durable per-read record, or read the meter
+from the tracker's own accounting instead of from the ledger. The second is not a drop-in — the
+tracker is process-local and `releaseExecutionRun` drops a run's accounting when it ends, so a
+finished run would report zero — which is why the ledger fold was chosen and its gap recorded rather
+than papered over. Done when a run that has captured its schema shows the catalog reads it paid for,
+with a test that fails on the current under-count.
+
+### B14. An agent artifact hydrates the grid and the explain view, but not the chart or export surfaces
+
+Deferred by #329 T11, which is the task's own recorded narrowing rather than something discovered
+afterwards. A hydrated artifact reaches the two surfaces its operations produce — the results grid for
+`sql.query.read`, the explain view for `sql.explain.estimate` — and the charts, pivot and dashboard
+views keep rendering the tab's own result while one is shown. Charting a run's rows is a real want and
+a bigger change than it looks: `DataCharts` and `PivotTable` are configured against the columns of the
+result they were opened on, so hydrating them means deciding what happens to a chart configuration
+when the underlying result is replaced and then taken away again.
+
+Export is absent for a different reason, and it is a gap rather than a decision that closes anything:
+`exportResults` in `src/components/Studio.tsx` serializes `currentTab.result`, so offering the Export
+menu over a hydrated view would export the tab's rows while the user is looking at the run's. The
+menu is therefore hidden while an artifact is shown. Done when either surface can take an explicitly
+hydrated result — with the provenance badge still naming the run, since an exported file that came
+from an agent run and is indistinguishable from one the user ran is the thing to avoid.
+
+### B15. A run's stored results are gone once the run ends, so a report's citations can outlive its rows
+
+Surfaced by #329 T11 rather than introduced by it: `ExecutionArtifactStore` holds results in process
+memory and `releaseExecutionRun` drops everything a run produced at `finish` or `cancel`
+(`src/lib/agent/run-service.ts`), which is the M1 decision that agent results never rest on disk.
+The consequence the artifact route makes visible is that the report — composed as the run's last step
+— is usually read AFTER the run has ended, so "Show result" on its citations answers `410` with
+`reason: "released"` rather than rows, and the same is true for any run driven by a different replica.
+
+The route says which of the two happened instead of reporting a missing artifact, and the rail offers
+"Show result" only while the run is live — the milestone's own rule that a control the service cannot
+honour is not rendered — with the report section stating the bound in words, so a user who saw the
+control during the run knows why it is gone afterwards. The consequence to know: the show affordance
+on report CITATIONS is mostly dormant, because a report is composed as the run's last step; what is
+reachable in practice is showing a result from a live run's timeline. Closing it properly means deciding
+where agent results may rest — encryption, retention and tenancy are exactly the questions #328
+declined to answer — so it is a product decision, not an implementation gap. Done when a finished
+run's cited rows are readable for a stated retention window, or when the surface states the window it
+has instead of offering a control that usually cannot be honoured.
+
+### B16. The opt-in multi-replica backend cannot load in the container image or the npx payload
+
+Found while landing #329 T1 and carried forward deliberately, because the milestone's own commit that
+found it could not validate a fix (nothing built a world yet).
+
+`@workflow/core/dist/runtime/world.js` resolves any world other than its two built-ins with
+`require(targetWorld)` off a `createRequire` rooted at `process.cwd()`. The specifier is a variable,
+so Next's output-file-tracing cannot see it: `@workflow/world-postgres` is **absent from
+`.next/standalone`**, and therefore from the container image and the standalone tarball the npx
+launcher downloads. `WORKFLOW_TARGET_WORLD=@workflow/world-postgres` passes this repository's own
+allowlist (`src/lib/agent/config.ts`) and then fails inside the runtime at the moment a world is
+built — so the documented path to running agents on more than one replica does not work in the
+artifacts most operators deploy. A `bun dev` checkout and a plain `node_modules` install are
+unaffected, which is exactly why it can go unnoticed.
+
+Scoped by measurement rather than by inference, so the entry is not read as more than it is: a
+`DOCKER_BUILD=true bun run build` on 2026-08-12 leaves `.next/standalone/node_modules/@workflow`
+holding `world-local` and `utils`, and the rest of the runtime (`workflow`, `@workflow/core`, `ai`,
+`@ai-sdk/*`) compiled INTO the server chunks — which is why the default `local` backend does work in
+the image. Only the world reached through a variable specifier is missing.
+
+The repository already has the remedy pattern for this shape of dynamic specifier: the explicit
+copies in `Dockerfile` and `scripts/build-standalone-payload.sh`, both of which already hand-copy
+modules that tracing cannot see. Done when the Postgres world is present in both payloads with a test
+asserting it (`tests/unit/packaging-payload-prune.test.ts` pins what the payload must keep and is the
+nearest existing home for such an assertion), and when `docs/AGENT.md`'s deployment section loses the
+caveat that points here.
+
+### B17. Table profiling and monitoring tools are deferred, so the agent's tool set is four
+
+Recorded as #329's own narrowing (planning decision P1), not as something discovered later. The
+canonical operation set is exactly three descriptors (`src/lib/db/operations/descriptors.ts`), and the
+parent epic pinned that number as a product decision, so a tool has to fit one of them or it does not
+exist. The M2 tool set is therefore schema inspection, a bounded read, an estimating plan inspection
+and report composition.
+
+The two that were left out sit on opposite sides of that line. **Table profiling** (row counts, null
+ratios, cardinality, value distributions) fits: it is a bounded read whose SQL the server composes
+per dialect, exactly like the catalog read. What it multiplies is scope — each statistic is a
+dialect-specific composition with its own cost, and a profile that silently scans a large table is
+its own hazard. **Monitoring** does not fit at all: it reaches `getMetrics`, slow-query listings and
+session listings, which are provider methods no descriptor covers, so wiring it would be a database
+reach outside `src/lib/db/operations/` — a defect by this milestone's constraint rather than a
+shortcut.
+
+Done, for profiling, when the composed statements exist per dialect with their own cost bound and the
+tool is added to the read-class set. Done, for monitoring, only after a decision about whether the
+operation set grows a fourth descriptor for non-SQL metadata reads — which drags the verification
+marker, the provider triad and the security matrix with it, and is a human product call.
+
+### B18. Nothing calls the capability probe, so an incapable model is discovered at its first tool call
+
+`probeAgentModel` (`src/lib/agent/capability-probe.ts`) establishes positively that a configured model
+calls tools, honours the schema its tool arguments are declared against, and streams — and it has no
+caller in `src/`. The consequence is not a security gap (a model that cannot call tools simply does
+nothing) but a diagnosis gap: instead of a typed refusal at start pointing the user at the chat and
+NL2SQL surfaces that do work, the run opens, spends a drive, and ends with a model that answered in
+prose.
+
+It was left unwired for a real reason rather than by omission: a mandatory live probe on every run
+start adds a model round trip and a failure mode to the start path, and whether to pay that (per
+start, per configuration change, or cached with what invalidation) is a product decision T9's bar did
+not carry. There is a second, narrower limit worth stating in the same place: for the `ollama` and
+`custom` kinds the probe can only report what it observed on the wire, because the model is whatever
+the operator is serving — so "not established" there means "not observed", never "not supported".
+
+Done when the start path refuses a model whose capabilities were established as absent, with the
+refusal surfaced in the rail, and with the caching decision recorded rather than implied.
+
+### B19. The agent endpoints are absent from docs/API_DOCS.md
+
+`docs/API_DOCS.md` documents every other route family (auth, database, AI, storage, connections,
+admin) request-by-request, and contains no mention of `/api/agent/*`. The behaviour document
+`docs/AGENT.md` describes the six paths and what each one refuses, which is why this is a
+completeness gap rather than an undocumented surface, but a reader who goes to the API reference for
+the request and response shapes will not find them and has no pointer telling them where to look.
+
+Nothing enforces that file's route list — no test compares it against `src/app/api/` — so the omission
+is invisible to the gates. Done when the agent family is documented there in the same shape as the
+others (or reduced to a pointer at `docs/AGENT.md` in the same place a reader looks), and ideally when
+a test derives the documented families from the route tree so the next family cannot be forgotten.
+
+### B20. A Gemini deployment behind a proxy is not configurable, on either surface
+
+`resolveApiUrl` (`src/lib/llm/utils/config.ts`) returns `LLM_API_URL` for every provider kind, so the
+resolved configuration carries it — and both Gemini consumers ignore it. The chat provider constructs
+`new GoogleGenerativeAI(apiKey)` (`src/lib/llm/providers/gemini.ts`), which has no base-URL option at
+all, and the agent's adapter deliberately passes no `baseURL` (`src/lib/agent/provider-registry.ts`)
+because leaving it undefined is what keeps the SDK's own environment fallback unreachable. So an
+operator who must reach Gemini through an egress proxy or a regional endpoint can set the variable,
+see no error, and be routed to Google directly.
+
+This is pre-existing behaviour that the agent inherited rather than introduced, and it is recorded
+here because #329 T4 is where it was noticed. Fixing it means threading `config.apiUrl` into both
+consumers and deciding what an explicitly-set `LLM_API_URL` means for a provider whose SDK has no
+base-URL seam — a settings-surface change with the chat surface's own conventions and tests, not an
+agent change. Done when a proxied Gemini endpoint is reachable from the configuration the user already
+entered, or when the settings surface says plainly that the variable does not apply to that kind.
+
+### B21. The published package carries the agent-provenance branch as dormant markup
+
+`BottomPanel` is shared by both shells, and #329 T11 added its agent-provenance branch — an optional
+`agentArtifact` prop, the provenance badge and its test ids. `bun run build:lib` therefore emits that
+markup inside `dist/workspace.mjs`.
+
+It is inert, and the package boundary that matters is intact: the prop is optional, the embedded shell
+never passes it, no entry point exports `BottomPanel` (asserted through a transitive `export … from`
+closure in `tests/unit/agent-package-boundary.test.ts`), and the package gains no agent module, no
+agent type and none of the runtime packages — which is what the boundary tests pin. What remains is
+dead bytes in a consumer's bundle and a small honesty cost: a reader grepping the published output
+finds strings suggesting an agent capability that the embedded shell cannot reach.
+
+Done when the provenance branch lives in a standalone-only component and `BottomPanel` takes it as
+children, or when Phase 4's surface unification decides the embedded shell gets an agent surface after
+all — at which point this stops being dormant rather than being removed.
