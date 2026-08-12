@@ -1456,3 +1456,38 @@ second composition path per dialect whose numbers are estimates the planner main
 built from it would have to say which of its figures were measured and which were the engine's own
 estimate. Done when that distinction is carried in `AgentTableProfile` and the fallback is composed
 per dialect.
+
+### B29. An attacker-supplied identifier the model quotes back reaches a transcript unfenced
+
+Found by the injection fixtures in `tests/evals/injection.test.ts` (#330 T4), which is what those
+fixtures are for.
+
+Every block the SERVER writes is fenced and its markers neutralised, and the suite asserts that
+property directly by counting: a transcript holds exactly as many closing markers as the server
+opened. The path this does not cover is the model's own message. An attacker who can name a table can
+put the closing marker in that name; the model reads it correctly fenced, and then copies the
+identifier into its own tool ARGUMENTS — which are the model's words, not the server's. The
+transcript sent back on the next turn therefore carries an unfenced marker.
+
+**This is an open injection path, not a bounded residual**, and the first version of this entry said
+otherwise — the correction is worth recording because the mistake was instructive. It claimed "the
+text following the marker is the model's own JSON, not attacker content". That is false: an attacker
+who can name a table controls the WHOLE identifier, so they control the marker and arbitrary text
+after it, and JSON quoting around the string does not make that suffix the model's.
+
+What is true is a narrower and different claim, and it is what makes this hard to reach today rather
+than harmless: **the server never hands the model the raw marker.** Every server-authored path
+neutralises it first, so a model reading a hostile inventory sees the defanged spelling. For the raw
+marker to appear in an assistant message the model has to reconstruct it. The fixtures assert both
+halves — that the fenced inventory contains no raw marker, and that the transport does not prevent
+one if the model produces it anyway (the scripted model supplies it directly, which is stronger than
+what the fenced paths currently give a real one).
+
+The server's own blocks do stay balanced, which bounds what can be re-attributed to the SERVER — and
+nothing more than that.
+
+Fixing it means rewriting the messages the provider itself returned (`response.messages`), which is
+the transcript that provider will accept back — the same reason `investigation.ts` filters those
+messages to the assistant turn rather than rebuilding them. Done when a tool call's arguments are
+neutralised on the way into the transcript without desynchronising the `tool_call_id` pairing the
+endpoint validates.
