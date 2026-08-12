@@ -4,6 +4,64 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "Documentation only. No default, template or image change, so an upgrade from 0.1.32 alters nothing a cluster runs"
+        - "Documented the optional agent runtime: it is off unless LIBREDB_AGENT_ENABLED is set, it reuses the existing AI configuration, and both of its variables are passed through extraEnv"
+        - "Documented the single-instance constraint the agent runtime adds. Its zero-config durable backend keeps run state on local disk behind file locks, so running agents above replicaCount 1 requires WORKFLOW_TARGET_WORLD set to the opt-in PostgreSQL backend, which is not yet reachable in the published image"
+      artifacthub.io/containsSecurityUpdates: "true"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.11.0
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.11.0
+    created: "2026-08-12T07:38:43.87904252Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: 7ccb57ecd985db4660396bcd18f0ad1fda9fc822d8546c935b93f334e92eb6b6
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.33/libredb-studio-0.1.33.tgz
+    version: 0.1.33
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "Runtime baseline raised to Node 24 LTS. This is a breaking change for the npm package and the standalone tarballs only. The container image this chart deploys already ran Node 24, so a Helm upgrade needs no action and no values change"
         - "Node 26 is now fully supported, server-side SQLite storage included. better-sqlite3 moved to its N-API line, so one prebuilt binary stays valid across Node majors instead of being pinned to the ABI that built it"
         - "Security: lodash advanced to 4.18.1, clearing CVE-2026-4800 (arbitrary code execution via untrusted input in template imports). It enters the bundle only through recharts and no Studio code path reaches the affected template import, but the version an image scanner reports now carries the fix"
@@ -1689,4 +1747,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-08-11T01:54:27.764822572Z"
+generated: "2026-08-12T07:38:43.872195395Z"
