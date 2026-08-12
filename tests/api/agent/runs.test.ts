@@ -14,6 +14,8 @@ import { AgentRunServiceError } from "@/lib/agent/run-service";
 import { clearRateLimitState } from "@/lib/api/rate-limit";
 import * as realAuth from "@/lib/auth";
 import * as realSeed from "@/lib/seed/resolve-connection";
+import * as realGate from "@/lib/agent/capability-gate";
+import { AgentRunStoreError } from "@/lib/agent/run-store";
 
 const { SeedConnectionError } = realSeed;
 
@@ -24,6 +26,8 @@ const mockGetSession = mock(
 );
 
 // ─── The connection the run is opened against ───────────────────────────────
+
+const mockAdmitAgentModel = mock<typeof realGate.admitAgentModel>(async () => ({ kind: "allowed" }));
 
 const mockResolveConnection = mock(async (body: { connectionId?: string }) => ({
   id: body.connectionId ?? "seed:sales",
@@ -99,6 +103,9 @@ function installMocks(): void {
   // replacement stays installed for the rest of the process and breaks the next
   // file that imports an export this one forgot.
   mock.module("@/lib/auth", () => ({ ...realAuth, getSession: mockGetSession }));
+  // The gate would otherwise build a real model and, where a key is configured, put a
+  // live probe call inside this suite.
+  mock.module("@/lib/agent/capability-gate", () => ({ ...realGate, admitAgentModel: mockAdmitAgentModel }));
   mock.module("@/lib/seed/resolve-connection", () => ({ ...realSeed, resolveConnection: mockResolveConnection }));
   mock.module("@/lib/agent/runtime", () => ({
     getAgentRunService: mock(async () => ({
@@ -137,11 +144,43 @@ beforeEach(() => {
   mockGetSession.mockResolvedValue({ role: "user", username: "ada" });
   process.env[AGENT_ENABLED_ENV] = "true";
   mockDriveAgentRun.mockClear();
+  mockAdmitAgentModel.mockClear();
+  mockAdmitAgentModel.mockImplementation(async () => ({ kind: "allowed" }));
   mockStart.mockClear();
   mockResolveConnection.mockClear();
 });
 
 describe("POST /api/agent/runs", () => {
+  /*
+    A model that cannot call tools is refused BEFORE a run exists, which is the whole
+    point of the gate (`docs/BACKLOG.md` B18): otherwise the run opens, spends a drive
+    and ends having answered in prose, and the user is left reading a failed run to
+    learn something the server could have said at the start. 422 because the request is
+    well-formed — it is the configuration that cannot honour it — and no ledger is
+    written for a run that never began.
+  */
+  test("a model established as unable to drive a run is refused before one is opened", async () => {
+    mockAdmitAgentModel.mockImplementation(async () => ({
+      kind: "refused",
+      refusal: {
+        provider: "gemini",
+        modelId: "some-model",
+        capabilities: { toolCalling: false, structuredOutput: false, streaming: true },
+        missing: ["toolCalling"],
+        message: "This model does not call tools. Use the AI Assistant or Natural Language Query instead.",
+      },
+    }));
+
+    const res = await POST(startRequest(VALID_BODY));
+    const body = await parseResponseJSON<{ error: string; missing: string[] }>(res);
+
+    expect(res.status).toBe(422);
+    expect(body.error).toContain("does not call tools");
+    expect(body.missing).toEqual(["toolCalling"]);
+    expect(mockStart).not.toHaveBeenCalled();
+    expect(mockDriveAgentRun).not.toHaveBeenCalled();
+  });
+
   test("opens a run for the session's own actor and reports it queued", async () => {
     const res = await POST(startRequest(VALID_BODY));
     const body = await parseResponseJSON<{ runId: string; status: string; mode: string }>(res);
@@ -289,6 +328,33 @@ describe("GET /api/agent/runs/[runId]", () => {
     const res = await GET(createMockRequest("/api/agent/runs/arun_9"), params("arun_9"));
 
     expect(res.status).toBe(404);
+  });
+
+  /*
+    A run id the LEDGER cannot name is a run that cannot exist, so it answers like one.
+
+    Found by asking the running server for `../../etc/passwd`: the store's id guard
+    refused it before touching the filesystem — which is the guard working — but the
+    error reached no HTTP mapping and fell through as a bodyless 500. A malformed id is
+    the caller's mistake, and this module's own rule is that "no such run", "not yours"
+    and "runtime off" answer identically; teaching a caller the id grammar through a
+    different status would undo that.
+  */
+  test("a run id the ledger cannot name answers exactly like a run that does not exist", async () => {
+    // Once: a persistent replacement would outlive this test, because `mock.module`
+    // installs it for the whole process.
+    mockStatus.mockImplementationOnce(async (runId: string) => {
+      throw new AgentRunStoreError(
+        "INVALID_RUN_ID",
+        `agent run id "${runId}" is not usable as a ledger name: expected 1-64 characters of [A-Za-z0-9_]`,
+      );
+    });
+
+    const res = await GET(createMockRequest("/api/agent/runs/arun-with-hyphens"), params("arun-with-hyphens"));
+    const body = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(404);
+    expect(body.error).toBe("No such agent run");
   });
 
   test("an unauthenticated caller is refused", async () => {
