@@ -358,7 +358,7 @@ describe("AgentRail", () => {
 
   test("a refusal with no message of its own still says something true", async () => {
     globalThis.fetch = mock(async () => jsonResponse({}, 500)) as unknown as typeof fetch;
-    const { getByTestId, findByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
 
     fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
     await act(async () => {
@@ -366,6 +366,324 @@ describe("AgentRail", () => {
     });
 
     expect((await findByTestId("agent-error")).textContent).toContain("500");
+    expect(queryByTestId("agent-model-refusal")).toBeNull();
+  });
+
+  /**
+   * The refused model (#331 T4).
+   *
+   * A `422` is the one start failure that is a verdict about the MODEL: the capability
+   * gate refuses only what the probe positively established, so everything that merely
+   * went wrong — a bad key, a quota, a 5xx — starts a run and is reported by the drive
+   * instead. The body below is the one a real refusal produced on 2026-08-13, from an
+   * Ollama endpoint serving `gemma3:270m`.
+   *
+   * #325 ratified that a model failing the probe falls back to chat/NL2SQL. T2 and T3
+   * deleted both surfaces — but the toolless surface that SURVIVED is in this rail:
+   * `admitAgentModel` returns `allowed` for planning mode without probing at all, so
+   * the mode one click away works with exactly the model that was just refused. The
+   * rail therefore may not claim there is nothing toolless left; what it owes the user
+   * is which capability is missing, that an AGENT run is what this model cannot drive,
+   * that plan mode still works, and that another model is what reads the database.
+   */
+  test("a model established as unable to drive a run is refused, and the shortfall is named", async () => {
+    const fetchMock = mock(async () =>
+      jsonResponse(
+        {
+          error:
+            'The model "gemma3:270m" (ollama) cannot drive an agent run: the capability probe could not establish tool calling, schema-valid tool arguments, streaming. The endpoint refused the tool request with HTTP 400: registry.ollama.ai/library/gemma3:270m does not support tools. Configure a different model and start the run again.',
+          missing: ["toolCalling", "structuredOutput", "streaming"],
+        },
+        422,
+      ),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-model-refusal")).textContent).toContain("cannot drive an agent run");
+
+    const missing = getByTestId("agent-model-refusal-missing").textContent ?? "";
+    expect(missing).toContain("tool calling");
+    expect(missing).toContain("schema-valid tool arguments");
+    expect(missing).toContain("streaming");
+    // Our field names are not the user's vocabulary, and the probe's own message rule
+    // says so; a rail rendering `missing` raw would reintroduce exactly that leak.
+    expect(missing).not.toContain("toolCalling");
+    expect(missing).not.toContain("structuredOutput");
+
+    // The endpoint's own words survive the trip: they name the true cause, and nothing
+    // this browser composes could have known them.
+    expect(getByTestId("agent-model-refusal-report").textContent).toContain("does not support tools");
+    expect(getByTestId("agent-model-refusal-action").textContent).toContain("model");
+
+    // Not the generic red line, and nothing was followed.
+    expect(queryByTestId("agent-error")).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The false statement this state used to make. It read "There is nothing toolless to
+   * fall back to", which the capability gate contradicts on its second line: planning
+   * mode is never probed and never refused, so the same model drives a plan today.
+   *
+   * The offer is an invitation rather than a promise, and that is not hedging: the
+   * probe always sends tools, so a refusal that establishes nothing about a TOOLLESS
+   * request cannot establish that one would work either. What it can do is not
+   * contradict it — see the two tests below for the case where it does.
+   */
+  test("the refusal offers plan mode where nothing the probe saw rules it out", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ error: "no", missing: ["toolCalling"], disproved: ["toolCalling"] }, 422),
+    ) as unknown as typeof fetch;
+    const { getByTestId, findByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect(await findByTestId("agent-model-refusal-use-planning")).toBeTruthy();
+    const action = getByTestId("agent-model-refusal-action").textContent ?? "";
+    expect(action).toContain("Plan mode");
+    expect(action).toContain("no tools");
+    // Offered, not guaranteed: the probe never sent a toolless request.
+    expect(action).toMatch(/\btry\b|\bmay\b/i);
+    // The claim that was false. It cannot come back in any of its wordings.
+    expect(action).not.toContain("nothing toolless");
+    expect(action).not.toContain("nothing to fall back to");
+    // And a different model is still what buys a run that reads the database.
+    expect(action).toContain("different model");
+  });
+
+  /**
+   * The distinction this state turns on (#331 T4 review).
+   *
+   * `missing` names what the probe could not ESTABLISH, and "streaming" lands there for
+   * two opposite reasons. Here the endpoint refused the tool request outright — the
+   * live `gemma3:270m` case of 2026-08-13 — so no stream ever existed to observe, and
+   * the same model then drove a planning run to `succeeded`. Nothing was disproved, so
+   * the offer stands even though `missing` names streaming.
+   */
+  test("streaming merely unobserved does not withdraw the offer", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ error: "no", missing: ["toolCalling", "structuredOutput", "streaming"], disproved: [] }, 422),
+    ) as unknown as typeof fetch;
+    const { getByTestId, findByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-model-refusal-missing")).textContent).toContain("streaming");
+    expect(getByTestId("agent-model-refusal-use-planning")).toBeTruthy();
+  });
+
+  /**
+   * The other reason, and the one that made the old copy a false promise. An endpoint
+   * that answered the probe with one buffered body was WATCHED failing to stream, and
+   * plan mode consumes the same `streamText().fullStream` an agent run does
+   * (`investigation.ts`). Driven through the real run loop on 2026-08-13: a planning
+   * run over such an endpoint ends `succeeded` with empty text and writes no closing
+   * statement — the user gets a run that claims to have worked and says nothing.
+   *
+   * So the rail does not offer it. Pinned on the DISPROOF rather than on `missing`,
+   * which is identical in this case and in the one above.
+   */
+  test("an endpoint watched failing to stream is not offered a mode that reads the same stream", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse(
+        { error: "no", missing: ["toolCalling", "structuredOutput", "streaming"], disproved: ["streaming"] },
+        422,
+      ),
+    ) as unknown as typeof fetch;
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect(await findByTestId("agent-model-refusal")).toBeTruthy();
+    expect(queryByTestId("agent-model-refusal-use-planning")).toBeNull();
+
+    const action = getByTestId("agent-model-refusal-action").textContent ?? "";
+    // The promise that cannot be kept here, in any of its wordings.
+    expect(action).not.toContain("still work");
+    expect(action).not.toContain("Try");
+    // What is true instead: the endpoint did not stream, and that is what plan mode
+    // would read too.
+    expect(action).toContain("streaming");
+    expect(action).toContain("different model");
+  });
+
+  /**
+   * Small print is print (#100). `text-zinc-500` on this rail's `#0a0a0a`, under the
+   * alert's own `bg-red-500/5`, computes to 3.98:1 against WCAG AA's 4.5:1 — measured
+   * from the installed Tailwind 4 palette, not estimated — and this text is 10px, so
+   * the large-text allowance does not apply. `text-zinc-400` is 7.33:1.
+   */
+  test("the refusal's small print is not written in a colour that fails AA", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ error: "no", missing: ["toolCalling"], disproved: ["toolCalling"] }, 422),
+    ) as unknown as typeof fetch;
+    const { getByTestId, findByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    const missing = await findByTestId("agent-model-refusal-missing");
+    expect(missing.querySelector("span")?.className).not.toContain("text-zinc-500");
+    expect(getByTestId("agent-model-refusal-action").className).not.toContain("text-zinc-500");
+  });
+
+  /**
+   * Offering is honest, deciding is not — and a shortcut that spent model budget is the
+   * thing #331 T1 already refused to build. So the control SELECTS the mode and does
+   * nothing else: no second request leaves the browser.
+   */
+  test("the refusal's control selects plan mode and starts nothing", async () => {
+    const fetchMock = mock(async () =>
+      jsonResponse({ error: "no", missing: ["toolCalling"] }, 422),
+    ) as unknown as typeof fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    await act(async () => {
+      fireEvent.click(await findByTestId("agent-model-refusal-use-planning"));
+    });
+
+    expect(getByTestId("agent-mode-planning").getAttribute("aria-pressed")).toBe("true");
+    expect(getByTestId("agent-mode-agent").getAttribute("aria-pressed")).toBe("false");
+    // The refused start, and nothing after it.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(queryByTestId("agent-run-id")?.textContent).toBe("");
+    // The objective is the user's and the offer did not touch it.
+    expect((getByTestId("agent-objective") as HTMLTextAreaElement).value).toBe("why is checkout slow");
+  });
+
+  /**
+   * A verdict is about the mode it was raised for. Once the copy points at plan mode,
+   * a refusal still standing above the mode the user just took would name a way
+   * forward and then deny the user took it.
+   */
+  test("a refusal raised for an agent run does not stand over plan mode", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ error: "no", missing: ["toolCalling"] }, 422),
+    ) as unknown as typeof fetch;
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+    expect(await findByTestId("agent-model-refusal")).toBeTruthy();
+
+    fireEvent.click(getByTestId("agent-mode-planning"));
+    expect(queryByTestId("agent-model-refusal")).toBeNull();
+
+    // Still true of the mode it was about, and nothing was re-asked to learn that.
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    expect(getByTestId("agent-model-refusal")).toBeTruthy();
+  });
+
+  /**
+   * The gate admits planning without probing, so only a server that probes it could
+   * refuse one. Should that ever arrive, the state still explains itself — but it does
+   * not offer the mode the user is already in, because an offer that changes nothing
+   * is an offer saying nothing.
+   */
+  test("a verdict raised for plan mode explains itself and offers no switch to plan mode", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ error: "no", missing: ["streaming"] }, 422),
+    ) as unknown as typeof fetch;
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-model-refusal-missing")).textContent).toContain("streaming");
+    expect(queryByTestId("agent-model-refusal-use-planning")).toBeNull();
+  });
+
+  test("a verdict whose body carries nothing else is still a verdict rather than a generic failure", async () => {
+    globalThis.fetch = mock(async () => jsonResponse({}, 422)) as unknown as typeof fetch;
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-model-refusal")).textContent).toContain("422");
+    // Nothing is claimed about which capability is absent, because nothing was said.
+    expect(queryByTestId("agent-model-refusal-missing")).toBeNull();
+    expect(queryByTestId("agent-error")).toBeNull();
+  });
+
+  // A newer server may probe a capability this build has never heard of. Rendering the
+  // identifier raw is the one thing the labels exist to prevent, so it is dropped.
+  test("a capability this build has no words for is not read back at the user", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ error: "no", missing: ["toolCalling", "telepathy"] }, 422),
+    ) as unknown as typeof fetch;
+    const { getByTestId, findByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    const missing = (await findByTestId("agent-model-refusal-missing")).textContent ?? "";
+    expect(missing).toContain("tool calling");
+    expect(missing).not.toContain("telepathy");
+  });
+
+  // An operator fixes the configuration and starts again: the verdict was about the
+  // model that was configured then, so it cannot outlive the next attempt.
+  test("a refusal does not survive the next start", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ error: "no", missing: ["toolCalling"] }, 422),
+    ) as unknown as typeof fetch;
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+    expect(await findByTestId("agent-model-refusal")).toBeTruthy();
+
+    mockAgentFetch([OPENED_LINE, STARTED_LINE]);
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-run-id")).textContent).toBe("arun_1");
+    expect(queryByTestId("agent-model-refusal")).toBeNull();
   });
 
   // An accepted start whose body names no run leaves nothing to follow: the stream
@@ -555,6 +873,31 @@ describe("AgentRail", () => {
     expect((await findByTestId("agent-failure-reason")).textContent).toBe(
       "The model provider is not configured or could not be reached.",
     );
+  });
+
+  /**
+   * The failure this state must NOT swallow (#331 T4). A quota is not a verdict about
+   * what the model can do: the run opened, the drive classified it, and the ledger says
+   * so in the words `describeFailureReason` owns. Reporting it as an incapable model
+   * would send an operator to change a model that is fine.
+   */
+  test("a drive that ran out of quota keeps the quota's own words, not the incapable-model state", async () => {
+    const failedLine = `${JSON.stringify({
+      kind: "event",
+      event: { kind: "run-finished", atMs: 1_002, status: "failed", reason: "model-rate-limited" },
+    })}\n`;
+    mockAgentFetch([OPENED_LINE, failedLine]);
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-failure-reason")).textContent).toBe(
+      "The model provider is limiting this key's requests. Waiting a minute usually clears it.",
+    );
+    expect(queryByTestId("agent-model-refusal")).toBeNull();
   });
 
   test("an ending the server gave no reason for claims none", async () => {

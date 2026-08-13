@@ -52,6 +52,9 @@
 import { APICallError, streamText, tool } from "ai";
 import { z } from "zod";
 import { type LLMProviderType, LLMError, LLMStreamError } from "@/lib/llm/types";
+// The labels moved out so the rail can name a missing capability without importing
+// this module — and with it the AI SDK — into the browser (#331 T4).
+import { describeAgentCapability } from "./capability-labels";
 import { type AgentModel, mapAgentModelError } from "./model-adapter";
 
 /** What one probe established. Every field is an observation, not a vendor claim. */
@@ -86,6 +89,22 @@ export interface AgentCapabilityRefusal {
    * precedes the body, so a refused request has established nothing at all.
    */
   readonly missing: readonly AgentModelCapability[];
+  /**
+   * The subset of `missing` that this probe watched FAIL, as against the ones it
+   * never got to look at. Often empty, and that is not a defect: an endpoint which
+   * refused the request outright answered no question about the model at all.
+   *
+   * The distinction exists because `missing` is honest for exactly one purpose —
+   * refusing an agent run, which needs all three — and misleading for every other.
+   * "Streaming not established" covers both an endpoint that never streamed because
+   * it refused the tool request (verified live on 2026-08-13: `gemma3:270m` on
+   * `ollama` refused with HTTP 400 and then drove a planning run to `succeeded`) and
+   * an endpoint that answered one buffered body, where a toolless run would produce
+   * silence. A surface that offers the user something ELSE to do with the same model
+   * has to be able to tell those apart, so the probe records which it saw rather than
+   * leaving each reader to guess (#331 T4 review).
+   */
+  readonly disproved: readonly AgentModelCapability[];
   readonly detail?: string;
   /** User-facing: what could not be established, and that another model is the way forward. */
   readonly message: string;
@@ -117,18 +136,6 @@ const PROBE_PROMPT = `Call the ${PROBE_TOOL_NAME} tool once with acknowledged se
 /** Order is the order a refusal lists them in, so the message reads the same way twice. */
 const REQUIRED_CAPABILITIES: readonly AgentModelCapability[] = ["toolCalling", "structuredOutput", "streaming"];
 
-/**
- * What each capability is called in front of a user. The field names are this
- * module's own identifiers; reading `structuredOutput` back to someone is leaking
- * our vocabulary into their error message, and "schema-valid tool arguments" is
- * also the more accurate claim — that is precisely what the probe measured.
- */
-const CAPABILITY_LABELS: Readonly<Record<AgentModelCapability, string>> = Object.freeze({
-  toolCalling: "tool calling",
-  structuredOutput: "schema-valid tool arguments",
-  streaming: "streaming",
-});
-
 /** How much untrusted text may reach a user-facing message. */
 const DETAIL_LIMIT = 200;
 
@@ -143,19 +150,26 @@ const DETAIL_LIMIT = 200;
 //
 // The message names the shortfall and ONE action, and no other surface (#331 T2).
 // It used to send the user to the NL2SQL panel and the AI Assistant as toolless
-// alternatives. That is the wrong advice independently of which of those surfaces
+// alternatives, which is the wrong advice independently of which of those surfaces
 // still ships: the user asked for an agent run, and a toolless surface cannot
 // answer that question - it has no way to reach the database at all. A refusal
-// that redirects to a surface which cannot do the refused thing turns one clear
-// failure into a second, slower one. What remains is the true half: the probe
-// could not establish these capabilities, and a different model is the way forward.
+// that answers the refused question with a surface which cannot do the refused
+// thing turns one clear failure into a second, slower one. What remains is the true
+// half: the probe could not establish these capabilities, and a different model is
+// the way forward.
+//
+// This is why the sentence names no surface even though one survives (#331 T4): the
+// rail does offer planning mode, and that is an offer of a DIFFERENT question the
+// user may choose to ask, not this question answered elsewhere. Which surfaces exist
+// is also the client's fact, not this module's - the same message is read by anything
+// that reaches the run route.
 const refusalMessage = (
   provider: LLMProviderType,
   modelId: string,
   missing: readonly AgentModelCapability[],
   detail?: string,
 ): string => {
-  const shortfall = missing.map((capability) => CAPABILITY_LABELS[capability]).join(", ");
+  const shortfall = missing.map(describeAgentCapability).join(", ");
   // Its own statement rather than a template inside the template below: a nested one
   // reads as part of the sentence while being a separate expression, which is why the
   // rule against them exists.
@@ -311,12 +325,46 @@ function classifyProbeFailure(failure: unknown, provider: LLMProviderType): Prob
   return { conclusive: true, detail: endpointRefusalDetail(status, failure.message) };
 }
 
+/**
+ * Which of the unestablished capabilities the endpoint's OWN ANSWER contradicted.
+ *
+ * Three cases, and the order they are written in is the order they exclude each other:
+ *
+ *  - **The request was refused** (`answered: false`). The status precedes the body, so
+ *    nothing was read and nothing is disproved — the model may be able to do all three
+ *    things and never got the chance to show any of them.
+ *  - **The endpoint answered, but not as a stream.** Then the only thing observed is
+ *    the transport: the SDK's SSE parser finds no frames in a buffered body, so a tool
+ *    call inside one is invisible too, and reading the silence as "this model does not
+ *    call tools" would be the probe inventing a diagnosis.
+ *  - **The endpoint streamed.** Then what the model did was readable, and each missing
+ *    capability was genuinely watched failing — except `structuredOutput` when no tool
+ *    was called at all: a model that called nothing showed no arguments to validate,
+ *    which is unexercised rather than absent.
+ */
+function disprovedBy(
+  capabilities: AgentModelCapabilities,
+  missing: readonly AgentModelCapability[],
+  answered: boolean,
+): readonly AgentModelCapability[] {
+  if (!answered) return [];
+  if (!capabilities.streaming) return ["streaming"];
+  return missing.filter((capability) => capability !== "structuredOutput" || capabilities.toolCalling);
+}
+
+interface RefusalContext {
+  /** The endpoint returned an answer, rather than refusing the request with a status. */
+  readonly answered: boolean;
+  readonly detail?: string;
+}
+
 function refuse(
   agentModel: AgentModel,
   capabilities: AgentModelCapabilities,
-  detail?: string,
+  context: RefusalContext,
 ): AgentCapabilityProbeResult {
   const missing = REQUIRED_CAPABILITIES.filter((capability) => !capabilities[capability]);
+  const { answered, detail } = context;
 
   return {
     supported: false,
@@ -325,6 +373,7 @@ function refuse(
       modelId: agentModel.modelId,
       capabilities,
       missing,
+      disproved: disprovedBy(capabilities, missing, answered),
       detail,
       message: refusalMessage(agentModel.provider, agentModel.modelId, missing, detail),
     },
@@ -360,7 +409,9 @@ export async function probeAgentModel(
     // A stream that broke after a complete tool call is still inconclusive: the
     // transport just failed, and starting a run on it would fail next.
     if (!verdict.conclusive) throw verdict.error;
-    return refuse(agentModel, capabilities, verdict.detail);
+    // `answered: false` — the endpoint declined to serve the request, so nothing it
+    // sent is evidence about the model beyond its unwillingness to take this tool.
+    return refuse(agentModel, capabilities, { answered: false, detail: verdict.detail });
   }
 
   if (capabilities.toolCalling && capabilities.structuredOutput && capabilities.streaming) {
@@ -368,5 +419,7 @@ export async function probeAgentModel(
   }
 
   const detail = observation.unknownToolName === undefined ? undefined : unknownToolDetail(observation.unknownToolName);
-  return refuse(agentModel, capabilities, detail);
+  // The endpoint ran the request to completion; whatever it sent is what the model,
+  // or its transport, actually did.
+  return refuse(agentModel, capabilities, { answered: true, ...(detail === undefined ? {} : { detail }) });
 }
