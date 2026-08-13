@@ -431,6 +431,27 @@ export class AgentRunService {
         `agent run "${runId}" still has ${live} execution(s) in flight and cannot be ended`,
       );
     }
+    /*
+      The verdict is decided BEFORE the ending is written, from the run as it will
+      be: everything the run did, under the status it is about to take. That status
+      is passed explicitly rather than read back, because the verifier distinguishes
+      a run a user stopped from one that simply did not answer, and until this append
+      lands the ledger still reads `running`.
+
+      `run-finished` itself contributes nothing to the verdict — it is the ending, not
+      part of the work — so computing it from the events before the append is not a
+      simplification, it is the correct input.
+
+      A run that never entered the loop gets NO verdict. Its status is still `queued`
+      here — no `run-started` was ever appended — which is `runtime.ts`'s
+      `recordDriveFailure` path: the drive died before the run could try. Calling that
+      "did not answer" would read as a judgement on a run that was never given the
+      chance to, so the field is omitted and the failure reason speaks alone. Found by
+      review on #347.
+    */
+    const record = (await this.readOrThrow(runId)).record;
+    const verdict = record.status === "queued" ? null : verifyRunGoal({ ...record, status });
+
     // Spread rather than the fields outright: an ending that has neither writes the
     // entry it always wrote, so a ledger from before these fields and one after them
     // are the same bytes for the same event.
@@ -440,6 +461,16 @@ export class AgentRunService {
       status,
       ...(reason === undefined ? {} : { reason }),
       ...(stopReason === undefined ? {} : { stopReason }),
+      ...(verdict === null
+        ? {}
+        : {
+            goalVerdict: {
+              outcome: verdict.outcome,
+              verifier: verdict.verifier,
+              // Omitted when the run answered, so the two halves cannot disagree.
+              ...(verdict.unmet.length === 0 ? {} : { unmet: verdict.unmet }),
+            },
+          }),
     });
     try {
       releaseExecutionRun({ runId, tracker: this.resources.tracker, artifacts: this.resources.artifacts });
@@ -449,25 +480,25 @@ export class AgentRunService {
     const view = await this.readOrThrow(runId);
 
     /*
-      Whether the run ANSWERED, said where an operator actually looks.
+      Whether the run ANSWERED, said where an operator actually looks — as well as on
+      the ledger above, which is what a user reads.
 
       Here rather than in the run loop because every terminal path goes through this
-      method — the loop's own `conclude`, and the cancellation checkpoint inside
-      `runStep` that ends a run without returning to it. A log line at either of
-      those two sites would have covered one ending and quietly missed the other.
-
-      Reported, not persisted: writing the verdict into the ledger means spending the
-      terminal-status vocabulary, and that is the owner's decision (`docs/BACKLOG.md`
-      B24). The read costs nothing extra — this view was already being folded to
-      return.
+      method: the loop's own `conclude`, and the cancellation checkpoint inside
+      `runStep` that ends a run without returning to it. A log line at either of those
+      two sites would have covered one ending and quietly missed the other.
     */
-    const verdict = verifyRunGoal(view.record);
-    logger.info(
-      verdict.outcome === "answered"
-        ? `agent run ${runId} answered (${verdict.verifier})`
-        : `agent run ${runId} unanswered (${verdict.verifier}: ${verdict.unmet.join(", ")})`,
-      { runId, status, ...(stopReason === undefined ? {} : { stopReason }) },
-    );
+    const verdictSentence =
+      verdict === null
+        ? "ended before it began"
+        : verdict.outcome === "answered"
+          ? `answered (${verdict.verifier})`
+          : `unanswered (${verdict.verifier}: ${verdict.unmet.join(", ")})`;
+    logger.info(`agent run ${runId} ${verdictSentence}`, {
+      runId,
+      status,
+      ...(stopReason === undefined ? {} : { stopReason }),
+    });
     return view;
   }
 

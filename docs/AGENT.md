@@ -155,9 +155,9 @@ behind, which is exactly when it is worth seeing. It is written only when the pr
 `cancelled`, `deadline-exceeded`, `model-timeout` or `turn-limit`. This is what separates *succeeded*
 from *answered* — a run that stopped because the model composed a cited report and one that stopped
 because the model had nothing more to say are both `succeeded`, and only this says which. The rail
-reads it and states the difference. What it still cannot do is put that difference in the STATUS
-itself. [Whether the run answered](#whether-the-run-answered) is the field that now says so;
-the STATUS word is still open (`docs/BACKLOG.md` B24).
+reads it and states the difference. The STATUS word is deliberately not the thing that carries it —
+[Whether the run answered](#whether-the-run-answered) is the field that does, beside the status
+rather than instead of it (B24).
 
 `stopReason` sits beside `reason`, which says why a drive died before or outside the loop. They
 answer different questions and are mutually exclusive in practice; when both are present, `reason`
@@ -397,6 +397,20 @@ error message all come from whoever can write to the database, so everything cro
 is fenced first: a header naming what the content is and where it came from, and a stated boundary
 the content cannot forge. This is the same firewall the maintainer loop applies to public issue text.
 
+**A notation the server writes needs more than a fence** (`er-diagram.ts`). The relations block turns
+the inventory's foreign keys into a graph, and a fence around it says only where the server stopped
+talking — it does nothing about a table literally named `orders -> secrets`, which would produce a
+line reading as a relation nobody has. So every identifier in that notation is **quoted** and its
+delimiter doubled as SQL does it, and every control character is escaped: without that, a name
+carrying a newline became a second line, and "a relation is a line" is what the whole reading rests
+on. It is a relation list rather than Mermaid for the same reason — `||--o{` is far easier to forge
+than a quoted pair, and a diagram drawing a relation the database does not have is worse than none.
+Two further rules follow from the same principle rather than from formatting: a pairing this
+inventory cannot know is **not invented** (several edges between one pair of tables may be separate
+keys or one composite key returned as a cross product, B8, so the group is one line that names the
+columns and says the pairing is unknown), and the block is bounded in **characters**, because a
+count of edges is not a bound on a prompt.
+
 ## What bounds a run
 
 The frozen execution policy (`src/lib/agent/execution-policy.ts`, version `agent-read-only.1`) is
@@ -523,13 +537,17 @@ Two honest limits, both deliberate:
   own words to decide whether the model answered would be grading the answer with the
   answer. What is checked is what the claims **rested on**, which is a fact about the run.
   A citation the ledger cannot resolve is skipped rather than assumed empty.
-- **The verdict is reported, not persisted.** Every run ending logs it —
-  `agent run arun_… unanswered (agent-investigation.1: no-report)` — from
-  `AgentRunService.finalize`, which is where it belongs because every terminal path goes
-  through it, including the cancellation checkpoint that ends a run without returning to
-  the loop. It is deliberately NOT written into the ledger: recording it means spending
-  the terminal-status vocabulary, and that is the owner's call rather than the
-  implementer's (`docs/BACKLOG.md` B24). Where it is recorded is one call site.
+- **The verdict is on the ledger, beside the status rather than instead of it** (B24, ratified
+  2026-08-13). `run-finished` carries an optional `goalVerdict`, written by
+  `AgentRunService.finalize` — the one method every terminal path goes through, including the
+  cancellation checkpoint that ends a run without returning to the loop. The status vocabulary is
+  unchanged, because the two axes are independent: a run can end `succeeded` having answered
+  nothing, `failed` having answered nothing, or `failed` with no verdict meaningful at all because
+  the drive died before the loop. The first two were both observed on live runs. A ledger written
+  before the field folds unchanged, and its absence means what is true of it: no verifier ran.
+  That third shape writes the absence **deliberately**: a run still `queued` at its ending never
+  entered the loop, and calling it "did not answer" would judge a run that was never given the
+  chance to. Its failure reason speaks alone.
 
 ### The eval harness
 
@@ -694,6 +712,7 @@ src/lib/agent/
 ├── model-adapter.ts      # resolved LLM config → an SDK model; SDK errors → our error classes
 ├── provider-registry.ts  # provider kind → adapter (total over the settings surface's union)
 ├── goal-verifier.ts      # did this run ANSWER? a pure fold over the ledger, per workflow
+├── er-diagram.ts         # the schema's relations as text, quoted so a name cannot forge one
 ├── plan-summary.ts       # how an engine reaches its rows, read from an ESTIMATING plan
 ├── table-profile.ts      # composed per-table aggregates, and the findings derived from them
 ├── capability-probe.ts   # tool calling / structured output / streaming, established positively
@@ -752,9 +771,8 @@ declared-target allowlist, the statement guard and the role's own grants are the
   markup.
 - **B23** — seed eligibility is decided against the browser's last descriptor fetch, so a seed
   repointed server-side mid-session is not seen until the next fetch.
-- **B24** — a run that ends without a cited report is still `succeeded`. The verifier that SEES it
-  now exists ([above](#whether-the-run-answered)) and its verdict is reported; what remains is the
-  STATUS word, which is the owner's decision rather than the implementer's.
+- **B29** — an identifier the model quotes back into its own tool arguments reaches the transcript
+  unfenced; an open injection path, bounded only by the server never handing it the raw marker.
 
 ## Related documentation
 
