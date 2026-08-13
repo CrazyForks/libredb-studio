@@ -94,35 +94,6 @@ mock.module("@/components/DataCharts", () => ({
   },
 }));
 
-mock.module("@/components/NL2SQLPanel", () => ({
-  NL2SQLPanel: ({ onClose, onLoadQuery }: Record<string, unknown>) => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const React = require("react");
-    return React.createElement(
-      "div",
-      { "data-testid": "nl2sqlpanel" },
-      "NL2SQLPanel",
-      React.createElement("button", { "data-testid": "nl2sql-close-btn", onClick: onClose as () => void }, "Close"),
-      React.createElement(
-        "button",
-        {
-          "data-testid": "nl2sql-load-btn",
-          onClick: () => (onLoadQuery as (query: string) => void)("SELECT 1"),
-        },
-        "Load",
-      ),
-    );
-  },
-}));
-
-mock.module("@/components/AIAutopilotPanel", () => ({
-  AIAutopilotPanel: () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const React = require("react");
-    return React.createElement("div", { "data-testid": "aiautopilotpanel" }, "AIAutopilotPanel");
-  },
-}));
-
 mock.module("@/components/PivotTable", () => ({
   PivotTable: ({ onLoadQuery }: Record<string, unknown>) => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -213,8 +184,6 @@ function createDefaultProps(overrides: Partial<Record<string, unknown>> = {}) {
     metadata: null,
     historyKey: 0,
     savedKey: 0,
-    isNL2SQLOpen: false,
-    onSetIsNL2SQLOpen: mock(() => {}),
     maskingEnabled: false,
     onToggleMasking: undefined,
     userRole: "admin",
@@ -231,7 +200,6 @@ function createDefaultProps(overrides: Partial<Record<string, unknown>> = {}) {
     onCellChange: mock(() => {}),
     onApplyChanges: mock(() => {}),
     onDiscardChanges: mock(() => {}),
-    onExecuteQuery: mock(() => {}),
     onLoadQuery: mock(() => {}),
     onLoadMore: undefined,
     isLoadingMore: false,
@@ -249,24 +217,23 @@ describe("BottomPanel", () => {
     const props = createDefaultProps({
       metadata: { capabilities: { explainFormat: "postgres-json", supportsExplain: true } },
     });
-    const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+    const { getByText, queryByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
 
-    const expectedLabels = [
-      "Results",
-      "Explain",
-      "History",
-      "Saved",
-      "Charts",
-      "NL2SQL",
-      "Autopilot",
-      "Pivot",
-      "Docs",
-      "Diff",
-      "Dashboard",
-    ];
+    const expectedLabels = ["Results", "Explain", "History", "Saved", "Charts", "Pivot", "Docs", "Diff", "Dashboard"];
     for (const label of expectedLabels) {
       const btn = getByText(label);
       expect(btn).not.toBeNull();
+    }
+
+    /*
+      The ABSENCE is the assertion, and it is why this test names labels that should
+      never appear again (#331 T2). Listing only what survives passes just as well when
+      a removed tab is left behind or added back, which is the one thing this test is
+      here to catch — the milestone's gate asks for the removal to be asserted rather
+      than eyeballed. Found by review on #349.
+    */
+    for (const removed of ["NL2SQL", "Autopilot"]) {
+      expect(queryByText(removed)).toBeNull();
     }
   });
 
@@ -362,18 +329,6 @@ describe("BottomPanel", () => {
     expect(queryByTestId("datacharts")).not.toBeNull();
   });
 
-  test('NL2SQL tab renders NL2SQLPanel when mode="nl2sql"', () => {
-    const props = createDefaultProps({ mode: "nl2sql" });
-    const { queryByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
-    expect(queryByTestId("nl2sqlpanel")).not.toBeNull();
-  });
-
-  test('Autopilot tab renders AIAutopilotPanel when mode="autopilot"', () => {
-    const props = createDefaultProps({ mode: "autopilot" });
-    const { queryByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
-    expect(queryByTestId("aiautopilotpanel")).not.toBeNull();
-  });
-
   test('Pivot tab renders PivotTable when mode="pivot"', () => {
     const props = createDefaultProps({ mode: "pivot" });
     const { queryByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
@@ -407,14 +362,6 @@ describe("BottomPanel", () => {
     });
     const { queryByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
     expect(queryByTestId("visualexplain")).not.toBeNull();
-  });
-
-  test("clicking NL2SQL tab fires onSetIsNL2SQLOpen(true)", () => {
-    const onSetIsNL2SQLOpen = mock(() => {});
-    const props = createDefaultProps({ onSetIsNL2SQLOpen });
-    const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
-    fireEvent.click(getByText("NL2SQL").closest("button")!);
-    expect(onSetIsNL2SQLOpen).toHaveBeenCalledWith(true);
   });
 
   test("Export dropdown shows when results exist and mode is results", () => {
@@ -548,63 +495,27 @@ describe("BottomPanel", () => {
     expect(queryByTestId("datacharts")).toBeNull();
   });
 
-  test("NL2SQL onClose wrapper closes the panel and resets mode to results", () => {
-    const onSetIsNL2SQLOpen = mock(() => {});
-    const onSetMode = mock(() => {});
-    const props = createDefaultProps({ mode: "nl2sql", onSetIsNL2SQLOpen, onSetMode });
-    const { getByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
-
-    fireEvent.click(getByTestId("nl2sql-close-btn"));
-
-    expect(onSetIsNL2SQLOpen).toHaveBeenCalledWith(false);
-    expect(onSetMode).toHaveBeenCalledWith("results");
-  });
-
-  test("NL2SQL onLoadQuery wrapper loads the query and switches to results mode", () => {
+  /*
+    One wrapper, three panels. Each of these modes hands the panel a callback that
+    loads a statement into the editor and then switches the bottom panel back to
+    results, and the three differ only in which panel raises it. Written as one
+    parameterized test so that a fourth panel gaining the same wrapper is a row here
+    rather than a fourth near-identical copy — `explain` below stays separate because
+    it needs a tab carrying a result, which is a different fixture and not a row.
+  */
+  test.each<[string, string, string]>([
+    ["pivot", "pivottable-load-btn", "SELECT 2"],
+    ["history", "queryhistory-select-btn", "SELECT 3"],
+    ["saved", "savedqueries-select-btn", "SELECT 4"],
+  ])("%s load wrapper loads the query and switches to results mode", (mode, testId, expectedQuery) => {
     const onLoadQuery = mock(() => {});
     const onSetMode = mock(() => {});
-    const props = createDefaultProps({ mode: "nl2sql", onLoadQuery, onSetMode });
+    const props = createDefaultProps({ mode, onLoadQuery, onSetMode });
     const { getByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
 
-    fireEvent.click(getByTestId("nl2sql-load-btn"));
+    fireEvent.click(getByTestId(testId));
 
-    expect(onLoadQuery).toHaveBeenCalledWith("SELECT 1");
-    expect(onSetMode).toHaveBeenCalledWith("results");
-  });
-
-  test("Pivot onLoadQuery wrapper loads the query and switches to results mode", () => {
-    const onLoadQuery = mock(() => {});
-    const onSetMode = mock(() => {});
-    const props = createDefaultProps({ mode: "pivot", onLoadQuery, onSetMode });
-    const { getByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
-
-    fireEvent.click(getByTestId("pivottable-load-btn"));
-
-    expect(onLoadQuery).toHaveBeenCalledWith("SELECT 2");
-    expect(onSetMode).toHaveBeenCalledWith("results");
-  });
-
-  test("History onSelectQuery wrapper loads the query and switches to results mode", () => {
-    const onLoadQuery = mock(() => {});
-    const onSetMode = mock(() => {});
-    const props = createDefaultProps({ mode: "history", onLoadQuery, onSetMode });
-    const { getByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
-
-    fireEvent.click(getByTestId("queryhistory-select-btn"));
-
-    expect(onLoadQuery).toHaveBeenCalledWith("SELECT 3");
-    expect(onSetMode).toHaveBeenCalledWith("results");
-  });
-
-  test("Saved onSelectQuery wrapper loads the query and switches to results mode", () => {
-    const onLoadQuery = mock(() => {});
-    const onSetMode = mock(() => {});
-    const props = createDefaultProps({ mode: "saved", onLoadQuery, onSetMode });
-    const { getByTestId } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
-
-    fireEvent.click(getByTestId("savedqueries-select-btn"));
-
-    expect(onLoadQuery).toHaveBeenCalledWith("SELECT 4");
+    expect(onLoadQuery).toHaveBeenCalledWith(expectedQuery);
     expect(onSetMode).toHaveBeenCalledWith("results");
   });
 
