@@ -795,27 +795,47 @@ ER diagram depends on. Done when either the mixed terms are stated openly
 (alongside C8, which is the natural place) or a permissive layout engine proves it
 can match the output.
 
-### C10. Only one audit finding reaches a user, and 43 drown it out
+### C10. The last DOMPurify advisories are held open by Monaco's pin
 
-`bun audit` reports 44 advisories (15 high, 23 moderate, 6 low). All but one chain
-is development-only - `minimatch`, `brace-expansion`, `flatted`, `picomatch`,
-`esbuild`, `@babel/core` and `undici` arrive through `eslint`,
-`typescript-eslint`, `knip`, `tsup`, `workflow` and `@ai-sdk/*`, none of which is
-in `dependencies` and none of which is in the image. The single chain that ships
-is `dompurify` via `monaco-editor`, which carries 18 advisories of its own, all
-XSS-family; the reachable surface is whatever markup Monaco renders in its hover
-and suggestion widgets, which in this app means database metadata.
+`dompurify` via `monaco-editor` is the only advisory chain that reaches a user.
+Everything else `bun audit` reports - `minimatch`, `brace-expansion`, `flatted`,
+`picomatch`, `esbuild`, `@babel/core`, `undici` - arrives through `eslint`,
+`typescript-eslint`, `knip`, `tsup`, `workflow` and `@ai-sdk/*`, and none of it is
+in the image. `undici` was checked specifically, because the agent runtime sits in
+`devDependencies` by design yet reaches the standalone build: building with
+`DOCKER_BUILD=true` shows no `undici` anywhere under `.next/standalone`, since
+`@ai-sdk/provider-utils` reaches it through a `createRequire` call that output
+tracing cannot follow.
 
-Worth recording so nobody re-derives it: `dompurify` is dual-licensed
-(MPL-2.0 OR Apache-2.0), so the copyleft half can simply not be chosen, and the
-LGPL-3.0 `@img/sharp-libvips-*` binaries never reach the runtime image - the
-runner stage copies `node_modules` selectively rather than wholesale, and nothing
-in `src/` uses `next/image`, so sharp is never exercised.
+#374 moved the shipped copy from 3.2.7 to 3.4.8 by upgrading Monaco itself, which
+cleared 14 of the 17. **Three or four remain** (FOSSA counts three, GitHub
+Advanced Security four - one advisory postdates FOSSA's scan) and none can be
+closed here: they need 3.4.9, 3.4.11, 3.4.12 and 3.4.13, Monaco pins dompurify
+exactly, and 0.56.0 is its newest release.
 
-Done when the audit output separates shipped advisories from tooling ones, so one
-production finding is not filed behind 43 that cannot affect a user. C6 is the
-related gap - without fixed-version data neither this nor a scanner's verdict can
-say whether the one that matters is even actionable.
+**Do not "fix" these with a `package.json` override.** Monaco ships DOMPurify
+inlined in its prebuilt `min/vs` bundle and nothing in `src/` imports the package,
+so an override would change a lockfile entry no shipped code reads, leave the
+bundle byte-identical, and turn `bun audit`, FOSSA and Trivy green at once. The
+GHAS findings land on `bun.lock:<line>`, which is the tell: every one of those
+tools reads the manifest, not the artefact.
+
+Two related non-findings, recorded so they are not re-derived: `dompurify` is
+dual-licensed (MPL-2.0 OR Apache-2.0), so the copyleft half can simply not be
+chosen; and the LGPL-3.0 `@img/sharp-libvips-*` binaries never reach the runtime
+image, because the runner stage copies `node_modules` selectively and nothing in
+`src/` uses `next/image`.
+
+Consequence for the README: FOSSA publishes a second badge
+(`?type=shield&issueType=security`) alongside the license one already there, and
+it is red for exactly these advisories. Adding it was declined on 2026-08-15 -
+it would advertise a standing failure caused by an upstream pin rather than by
+anything neglected here. Add it when it goes green.
+
+Done when Monaco ships a dompurify at or past 3.4.13. Re-check on each Monaco
+release; verify by grepping the staged bundle for the version literal
+(`grep -o '"3\.4\.[0-9]*"' public/monaco/vs/editor-*.js`) rather than trusting the
+lockfile.
 
 ### C11. The FOSSA integration reports three permanent failures
 
@@ -838,10 +858,21 @@ That leaves `elkjs` EPL-2.0 - C9, and the only entry that is both real and ours.
 
 The cost of leaving it is that a permanently-red status trains everyone, including
 outside contributors, to read red as normal; #362 is the case where a genuine
-red mattered and was noticed only because nothing else was red. Done when the
-policy is scoped to what is actually distributed - production dependencies only,
-with the sample database's terms allowed rather than denied - so the statuses go
-green and a future failure means something, or when the integration is removed.
+red mattered and was noticed only because nothing else was red.
+
+**Largely resolved on 2026-08-15.** The owner worked the FOSSA dashboard: the
+license findings above were ignored with their reasons, and `License Compliance`
+and `Dependency Quality` now pass. `Security Analysis` still reports three, which
+is the honest number - they are the Monaco-pinned DOMPurify advisories in C10, and
+this is now a status that means something rather than one that is always red.
+
+What remains is the cause rather than the symptom. FOSSA reads `bun.lock` but does
+not apply the manifest's dev/production split, so every devDependency is scanned as
+if it shipped - that is why `highlight.js`, four devDependency-only chains and the
+platform binaries appeared at all. Each new devDependency can therefore raise a
+finding that has to be ignored by hand. Done when that is reported upstream and
+fixed, or when the policy is scoped to production dependencies so the ignore list
+stops growing.
 
 ---
 
