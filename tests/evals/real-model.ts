@@ -38,6 +38,16 @@ interface RealModelCase {
     rowCount: number;
     executionTime: number;
   }>;
+  /**
+   * A bar this case adds to the ledger's own verdict, returning the shortfall's id
+   * or `undefined`.
+   *
+   * Consulted only when `verifyRunGoal` already said `answered`, so the ledger's
+   * reason dominates — the same rule the workflow verifiers compose by, and for the
+   * same reason: reporting a case-specific shortfall about a run that composed no
+   * report at all would name the smaller of two problems.
+   */
+  readonly judge?: (drive: EvalDrive) => string | undefined;
 }
 
 const rows = (data: Record<string, unknown>[], fields: string[]) => ({
@@ -46,12 +56,6 @@ const rows = (data: Record<string, unknown>[], fields: string[]) => ({
   rowCount: data.length,
   executionTime: 4,
 });
-
-const HEADCOUNTS = [
-  { department: "engineering", headcount: 41 },
-  { department: "sales", headcount: 22 },
-  { department: "support", headcount: 17 },
-];
 
 /** A count per department table, so a statement that names some gets those. */
 const COUNTS: Readonly<Record<string, number>> = {
@@ -68,38 +72,249 @@ const COUNTS: Readonly<Record<string, number>> = {
 /**
  * A scripted engine whose answers AGREE with the inventory the run captured.
  *
- * The three cases below hand back the same three rows whatever they are asked,
- * against an inventory of eight department tables of `(id, name)`. A scripted model
- * never notices — it does not read the inventory — but a real one does, and #350's
- * measurement showed what that costs: the model counts the eight tables, is answered
- * about three departments it did not ask about, disbelieves the result, and probes
- * to the turn ceiling. The run never gets as far as composing anything, so those
- * cases cannot measure a REPORT at all, whatever the report contract says. Left as
- * they are on purpose — they are #341's observed corpus, and re-shaping them is its
- * own change with its own evidence to produce — but a case that needs the run to
- * reach the end needs an engine that lets it.
+ * Every case that reaches a database uses this one, and #331 T7 is why. Until then
+ * three of the cases below handed back the same three department rows whatever they
+ * were asked, against an inventory of eight department tables of `(id, name)`. A
+ * scripted model never notices — it does not read the inventory — but a real one
+ * does, and the measurement was unambiguous. The old fixture, driven on 2026-08-14
+ * against the reference model: `one-query-answer` failed on `turn-limit` at 16 turns
+ * and 16 statements, `one-query-answer-sqlite` at 16 turns and 14, `empty-result` at
+ * 16 and 16 — none of them composing a single claim — while `cited-report`, the same
+ * question and the same model over this engine, answered in 2 turns on 1 statement.
+ * Those three could not measure a REPORT at all, whatever the report contract said:
+ * the model was answered about departments it had not asked about, disbelieved the
+ * result, and spent the run establishing what the fixture would not tell it. Two runs
+ * of the repaired fixture on the same day answered 5/5.
+ *
+ * The rule this fixture is built to keep, and the one those cases broke: **a scripted
+ * engine's answers must be consistent with the inventory the same run handed out.**
+ * An eval whose world contradicts itself measures the contradiction and nothing else.
+ *
+ * It answers the three shapes a live model was observed sending, and the split is
+ * from that log rather than from imagination — the first repair covered only counts,
+ * and the drive that followed it showed a model asking `SELECT * FROM public.legal`
+ * and being answered `{department, headcount}`, which is the same contradiction in a
+ * different statement. A catalog question gets the table list; an aggregate gets
+ * counts; anything else gets the table's own rows, in the columns the inventory
+ * declares.
  */
-const countsFor = async (sql: string) => {
-  const named = DEPARTMENTS.filter((table) => new RegExp(`\\b${table}\\b`, "i").test(sql));
-  const tables = named.length > 0 ? named : DEPARTMENTS;
-  const counted = tables
-    .map((table) => ({ department: table, headcount: COUNTS[table] ?? 0 }))
-    .sort((left, right) => right.headcount - left.headcount);
-  return rows(counted, ["department", "headcount"]);
+const peopleIn = (table: string): Record<string, unknown>[] =>
+  Array.from({ length: COUNTS[table] ?? 0 }, (_unused, index) => ({ id: index + 1, name: `${table}-${index + 1}` }));
+
+/** What follows a `FROM` or a `JOIN`, which is where a statement says what it reads. */
+const READ_TARGETS = /\b(?:from|join)\s+([a-z0-9_."]+)/gi;
+
+/**
+ * The tables a statement actually READS.
+ *
+ * Structural on purpose, and the first shape of this was not: it word-matched the
+ * whole statement against the eight table names, one of which is `people`, and this
+ * file's own empty-result objective contains that word. An alias, a CTE name or a
+ * comment carrying it — `SELECT id FROM legal AS people`, `-- the people with no
+ * name` — made a single-table question answer with two tables' rows, which is the
+ * self-contradiction the rest of this fixture exists to avoid. What a statement reads
+ * is a fact about its structure, so it is read off the structure.
+ *
+ * No fallback here, and that is the difference from `tablesNamedIn` below: a
+ * statement naming no table reads no table, which is what the empty-result bar has to
+ * be able to say about `SELECT 1`.
+ */
+const readTargetsIn = (sql: string): ReadonlySet<string> => {
+  const read = new Set<string>();
+  for (const match of sql.matchAll(READ_TARGETS)) {
+    // `public.legal`, `"legal"` and `legal` are the same table to this world.
+    const bare = (match[1] ?? "").replaceAll('"', "").split(".").pop();
+    if (bare !== undefined) read.add(bare.toLowerCase());
+  }
+  return read;
 };
 
-const CASES: readonly RealModelCase[] = [
+/**
+ * Which of this world's tables a statement is asking about, for ANSWERING it.
+ *
+ * The fallback is a property of the engine, not of the statement: a statement naming
+ * no table still has to be answered something, and answering it nothing would teach
+ * the model to disbelieve the fixture. It is deliberately NOT the predicate a bar
+ * judges a citation by — treating "named no table" as "named all eight" would hand
+ * `SELECT 1` the whole database as evidence, which is #331 T7's second review finding.
+ */
+const tablesNamedIn = (sql: string): readonly string[] => {
+  const read = readTargetsIn(sql);
+  const named = DEPARTMENTS.filter((table) => read.has(table));
+  return named.length > 0 ? named : DEPARTMENTS;
+};
+
+const countsFor = async (sql: string) => {
+  // A catalog question the MODEL wrote itself, and only the ones the engine preset
+  // does not already serve (it answers anything naming `information_schema.columns`
+  // or `sqlite_master`). So this is a model checking the inventory a second way, and
+  // it must find the same eight tables rather than a count of people.
+  if (/information_schema|pg_catalog|pg_tables|pg_class/i.test(sql)) {
+    return rows(
+      DEPARTMENTS.map((table) => ({ table_schema: "public", table_name: table })),
+      ["table_schema", "table_name"],
+    );
+  }
+  if (/\bcount\s*\(/i.test(sql)) {
+    const counted = tablesNamedIn(sql)
+      .map((table) => ({ department: table, headcount: COUNTS[table] ?? 0 }))
+      .sort((left, right) => right.headcount - left.headcount);
+    return rows(counted, ["department", "headcount"]);
+  }
+  return rows(tablesNamedIn(sql).flatMap(peopleIn), ["id", "name"]);
+};
+
+/**
+ * The table the empty-result case asks about, named ONCE.
+ *
+ * Its objective, the world's answers and the case's own bar are three statements
+ * about the same table, and the bar is the one that fails silently if they drift: a
+ * question about a table the bar is not watching would score `answered` on any
+ * citation at all. Typed as a member of this world's tables, so it cannot name one
+ * the inventory does not hold.
+ */
+const EMPTY_RESULT_TABLE: (typeof DEPARTMENTS)[number] = "legal";
+
+/**
+ * Does this statement ask for the rows that have NO name?
+ *
+ * The complement is removed BEFORE the question is asked, and that is the whole
+ * point of the helper. Dispatching on a bare `\bnull\b` was the first repair's shape
+ * and it re-created the contradiction it was written to remove: `IS NOT NULL`
+ * contains the word, so `SELECT count(*) FROM legal WHERE name IS NOT NULL` answered
+ * `0` while `SELECT count(*) FROM legal` answered `5` and `SELECT * FROM legal`
+ * returned five rows that all carry names. Checking the complement is what deepening
+ * looks like, so it is exactly the model this case wants to reward that met the
+ * self-contradicting world.
+ *
+ * A statement mentioning both — `count(*) FILTER (WHERE name IS NULL)` beside a
+ * total — still asks for the unnamed rows, and is answered as such: the facts of
+ * this world are that `legal` holds five rows, all named, and none of the three
+ * shapes may disagree with the other two.
+ */
+const asksForUnnamed = (sql: string): boolean => /\bnull\b/i.test(sql.replace(/\bis\s+not\s+null\b/gi, " "));
+
+/**
+ * The same world, asked something whose truthful answer is nothing.
+ *
+ * The empty case's objective used to be "which employees have no department
+ * assigned?" against an inventory holding no employees table and no department
+ * column — a question the world could not answer, so the run had nowhere to go but
+ * round in circles. It now asks about a table that exists, and the engine answers
+ * the two shapes of that question the way a real one would: a listing of the
+ * offending rows comes back empty, and a COUNT of them comes back as one row saying
+ * zero. A count that returned no rows at all would be a shape no engine produces,
+ * and re-teaching the model to disbelieve the fixture is exactly what this repair is
+ * for. Everything else — the total, the complement, the table's own rows — is
+ * answered from the populated world, so the run can establish that the table has
+ * five rows and that all five are named.
+ */
+const noneUnnamed = async (sql: string) => {
+  if (!asksForUnnamed(sql)) return countsFor(sql);
+  return /\bcount\s*\(/i.test(sql) ? rows([{ unnamed: 0 }], ["unnamed"]) : rows([], ["id", "name"]);
+};
+
+/**
+ * Did the run ESTABLISH the table's population before saying nothing was missing?
+ *
+ * The ledger cannot answer this, and the count shape is why. `empty-evidence` fires
+ * when EVERY cited result came back empty; a count of the unnamed rows comes back as
+ * one row saying zero, which is a non-empty result, so a run that reports "0" as its
+ * finding while citing that count is recorded `answered`. That is the #341 defect
+ * this case exists to detect, and after the count shape was added the case could no
+ * longer fail on it — so the case carries its own bar.
+ *
+ * What is checked is what the claims RESTED on, which is a fact about the run: the
+ * statement behind each cited artifact, resolved through the step that drafted it. A
+ * run passes only if some cited statement READ the target table without asking for
+ * the unnamed rows — its total, its complement, or its own rows. That is the run
+ * establishing that `legal` holds five rows and that all five carry a name, which is
+ * the difference the case exists to measure: "established there are none and said so"
+ * against "reported the zero it was looking for".
+ *
+ * Both halves of that predicate were widenings that review had to take back, and the
+ * shortfall ids are separate because each names a different way a report can fail to
+ * establish it:
+ *
+ *  - `snapshot-not-population` — no artifact was cited at all. Zero artifact
+ *    citations does not mean "no report": `judge` runs only over a run the ledger
+ *    ALREADY scored `answered`, so it means every claim rested on the context
+ *    snapshot. The snapshot says the table and the column exist; it never says how
+ *    many rows are in them.
+ *  - `zero-as-finding` — the run cited its null-predicate read and nothing that read
+ *    the table otherwise. The original defect.
+ *  - `probe-not-population` — the cited statements read no target table at all. This
+ *    is `SELECT 1 as x` and `SELECT sqlite_version()`, which are not hypotheticals:
+ *    a live model sent exactly those in earlier runs of this case (#350). A bar that
+ *    only asked "does this statement avoid the word NULL?" counted them as the
+ *    table's population.
+ *
+ * **What this bar still cannot see**, stated because every widening of what counts as
+ * evidence is a step back toward the escape hatch it replaced:
+ *
+ *  - The model's PROSE, for the reason `goal-verifier.ts` gives — grading the answer
+ *    with the answer establishes nothing. It cannot tell a graceful sentence from a
+ *    curt one, a hedge from a claim, or a sentence that contradicts the very result
+ *    it cites.
+ *  - Whether the cited population read was about the right COLUMN, or returned
+ *    anything relevant. `SELECT id FROM legal` passes; so would a read of `legal`
+ *    that never mentions `name`.
+ *  - A read of the target table reached under another name — a view, or a CTE whose
+ *    body this fixture never resolves. Nothing in this world has one, so the limit is
+ *    latent rather than live.
+ *  - Whether the model UNDERSTOOD what it cited. The bar is about what the claims
+ *    rest on, and a run can rest on the right result for the wrong reason.
+ */
+const populationShortfall = (drive: EvalDrive): string | undefined => {
+  const draftedFor = new Map<string, string>();
+  for (const event of drive.events) {
+    if (event.kind === "statement-drafted") draftedFor.set(event.stepId, event.sql);
+  }
+  const statementBehind = new Map<string, string>();
+  for (const event of drive.events) {
+    if (event.kind !== "tool-completed") continue;
+    const sql = draftedFor.get(event.stepId);
+    if (sql !== undefined) statementBehind.set(event.artifact.correlationId, sql);
+  }
+
+  const cited = drive.events
+    .flatMap((event) => (event.kind === "report-composed" ? event.claims : []))
+    .flatMap((claim) => claim.evidence)
+    .flatMap((reference) => (reference.source === "artifact" ? [reference.correlationId] : []));
+  // The ledger has already accepted this run, so this is a report whose every claim
+  // cited the inventory rather than a result — never a run that composed nothing.
+  if (cited.length === 0) return "snapshot-not-population";
+
+  const citedStatements = cited.flatMap((correlationId) => {
+    const sql = statementBehind.get(correlationId);
+    return sql === undefined ? [] : [sql];
+  });
+  const readTheTable = citedStatements.filter((sql) => readTargetsIn(sql).has(EMPTY_RESULT_TABLE));
+  if (readTheTable.some((sql) => !asksForUnnamed(sql))) return undefined;
+  return readTheTable.length > 0 ? "zero-as-finding" : "probe-not-population";
+};
+
+/**
+ * The cases, exported so the shapes that decide a verdict can be driven WITHOUT a
+ * credential.
+ *
+ * `tests/evals/empty-result-detection.test.ts` drives this world with scripted
+ * models to pin what the empty-result case is able to catch. A copy of the world in
+ * that file would prove something about the copy, so it imports these.
+ */
+export const CASES: readonly RealModelCase[] = [
   {
     /*
-      #350's scenario, and the one case here that measures the REPORT.
+      #350's scenario, and the case the citation contract is measured on.
 
-      The other cases end wherever the model chooses to stop; this one is scored on
-      whether the run WROTE DOWN what it found. That is the thing #350 is about: the
-      live runs that motivated it read the answer, held the artifact id, and composed
-      nothing, spending their remaining turns on statements with nothing to learn in
-      them (`SELECT 1 as x;`, `SELECT sqlite_version();`) while working out how to
-      cite what they already had. `claims` in the table below is the column that
-      shows it — a run can be `succeeded` with zero.
+      Every case here is scored on whether the run WROTE DOWN what it found — the
+      verdict requires a report of any agent-mode run — but until #331 T7 repaired
+      their engines, three of them could not get that far. This is the thing #350 is
+      about: the live runs that motivated it read the answer, held the artifact id,
+      and composed nothing, spending their remaining turns on statements with nothing
+      to learn in them (`SELECT 1 as x;`, `SELECT sqlite_version();`) while working
+      out how to cite what they already had. `claims` in the table below is the column
+      that shows it — a run can be `succeeded` with zero.
 
       This case is a MEASUREMENT harness, not evidence by itself: what a given model
       does with it belongs in the run that measured it, not in this comment.
@@ -115,21 +330,49 @@ const CASES: readonly RealModelCase[] = [
     engine: "postgres",
     objective: "Which department has the most employees?",
     expectation: "answers from a single aggregate rather than re-counting each department",
-    answer: async () => rows(HEADCOUNTS, ["department", "headcount"]),
+    answer: countsFor,
   },
   {
     name: "one-query-answer-sqlite",
     engine: "sqlite",
     objective: "Which department has the most employees?",
     expectation: "the same, on the engine whose catalog read returns DDL instead of columns",
-    answer: async () => rows(HEADCOUNTS, ["department", "headcount"]),
+    answer: countsFor,
   },
   {
+    /*
+      #341's third defect: a run that treats an empty result as an answer.
+
+      The objective names a table the inventory holds and a column it declares, so the
+      question is answerable and its truthful answer is "none". Two shapes of that
+      question exist and this world answers both the way an engine would — the listing
+      comes back empty, the count comes back as one row saying zero — because a count
+      returning NO rows is a shape no engine produces, and a fixture that produced it
+      would be teaching the model to disbelieve the world again.
+
+      That count is also what takes the detection out of the ledger's hands, so the
+      case carries its own bar rather than claiming one it lost. `empty-evidence`
+      requires every cited result to be empty; the count is one row, so a run that
+      reports `0` while citing it is recorded `answered` by the verifier. `judge`
+      re-establishes the distinction the case was written for, on the only ground a
+      machine has: what the claims RESTED on. It passes only a report that cites a
+      statement which READ the table without asking for the unnamed rows — the run
+      establishing the five rows and the five names before saying none are missing.
+      A report resting on the captured inventory alone is `snapshot-not-population`,
+      one resting on the null-predicate read is `zero-as-finding`, and one resting on
+      statements that touched no table is `probe-not-population`.
+
+      What neither the verdict nor the judge can see is the prose — whether the
+      sentence is graceful, hedged or curt — and `populationShortfall` lists that and
+      the bar's other blind spots where it is defined, rather than letting this
+      comment imply there are none.
+    */
     name: "empty-result",
     engine: "postgres",
-    objective: "Which employees have no department assigned?",
-    expectation: "deepens or states uncertainty rather than presenting 0 rows as the finding",
-    answer: async () => rows([], ["id", "name"]),
+    objective: `Which people in the ${EMPTY_RESULT_TABLE} table have no name recorded?`,
+    expectation: "cites a read of the table's population, not only the zero it was looking for",
+    answer: noneUnnamed,
+    judge: populationShortfall,
   },
   {
     name: "planning",
@@ -154,10 +397,12 @@ interface CaseOutcome {
   readonly note: string;
 }
 
-function summarise(name: string, drive: EvalDrive, expectation: string): CaseOutcome {
+export function summarise(testCase: RealModelCase, drive: EvalDrive): CaseOutcome {
+  // The ledger's verdict first, and the case's own bar only over a run it passed.
+  const shortfall = drive.verdict.outcome === "answered" ? testCase.judge?.(drive) : drive.verdict.unmet.join(", ");
   return {
-    name,
-    verdict: drive.verdict.outcome === "answered" ? "answered" : `unanswered (${drive.verdict.unmet.join(", ")})`,
+    name: testCase.name,
+    verdict: shortfall === undefined ? "answered" : `unanswered (${shortfall})`,
     status: drive.status,
     stopReason: drive.stopReason,
     turns: drive.turns,
@@ -168,21 +413,32 @@ function summarise(name: string, drive: EvalDrive, expectation: string): CaseOut
       (total, event) => (event.kind === "report-composed" ? total + event.claims.length : total),
       0,
     ),
-    note: expectation,
+    note: testCase.expectation,
   };
+}
+
+/**
+ * The run one case is measured on — the world, the objective and the mode.
+ *
+ * Exported for the same reason `CASES` is: the scripted test that pins what a case
+ * can catch has to open the case's OWN world, or it is measuring a second world that
+ * happens to look like it today.
+ */
+export async function openCaseRun(testCase: RealModelCase): Promise<EvalRun> {
+  return openEvalRun({
+    engine: testCase.engine,
+    objective: testCase.objective,
+    ...(testCase.name === "planning" ? { mode: "planning" as const } : {}),
+    ...(testCase.answer === undefined ? {} : { answer: testCase.answer }),
+  });
 }
 
 async function runCase(testCase: RealModelCase): Promise<CaseOutcome> {
   let run: EvalRun | undefined;
   try {
-    run = await openEvalRun({
-      engine: testCase.engine,
-      objective: testCase.objective,
-      ...(testCase.name === "planning" ? { mode: "planning" as const } : {}),
-      ...(testCase.answer === undefined ? {} : { answer: testCase.answer }),
-    });
+    run = await openCaseRun(testCase);
     const drive = await run.driveModel(await createAgentModel());
-    return summarise(testCase.name, drive, testCase.expectation);
+    return summarise(testCase, drive);
   } catch (error) {
     // A quota is not a defect in this code, and reporting it as one is exactly the
     // mistake #341 recorded: a rail once told a user their configured, answering
@@ -240,4 +496,7 @@ async function main(): Promise<void> {
   if (unanswered > 0) process.exit(1);
 }
 
-await main();
+// Only when this file IS the command. `bun run agent:eval` runs it as the entry, so
+// nothing changes there; a test importing `CASES` gets the world without spending a
+// model call on it.
+if (import.meta.main) await main();
