@@ -66,7 +66,8 @@ Then open **http://localhost:3000** — on first run the admin password is print
 
 | Test | URL | Credentials |
 |------|-----|-------------|
-| **Public Test** | [app.libredb.org](https://app.libredb.org) | SSO |
+| **Public Test With OIDC** | [app.libredb.org](https://app.libredb.org) | SSO |
+| **Public Test With JWT** | [trial.libredb.org](https://trial.libredb.org) | admin@libredb.org / Admin!2026  user@libredb.org / User!2026 |
 
 The test instance comes with a pre-configured PostgreSQL database via [Seed Connections](#seed-connections-pre-configured-databases). No setup required!
 
