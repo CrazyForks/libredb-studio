@@ -4,6 +4,67 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "Agent runs now ground their plan on the connected database's own schema on every supported engine, so a drafted statement names objects that exist rather than ones the model assumed"
+        - "An agent run reads its workflow from the objective instead of asking for it, and an Operate run is given a schema inventory before its first turn"
+        - "A light theme ships alongside the dark one through a shared token layer, and four defects that let a query fail silently are fixed"
+        - "Security: monaco-editor moves to 0.56.0 so the bundled DOMPurify leaves 3.2.7, JWT_SECRET is read per call rather than memoized once, and every field an export writes is escaped"
+        - "Fixes a SQL Server connection addressed by an IP address, which this release would otherwise have broken: the image moves to Node 26, which refuses an IP as the TLS SNI server name, and the pinned tedious sent one on the encrypt path. Addressing a server by hostname was never affected"
+        - "Track app release 0.12.0 (appVersion bump; default image tag follows)"
+      artifacthub.io/containsSecurityUpdates: "true"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.12.0
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.12.0
+    created: "2026-08-18T13:04:12.652504381Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL,
+      SQLite, Oracle, SQL Server, MongoDB, and Redis
+    digest: 7b8501e7df286e85249e6df3d688b2e6fe58e4278c580833b6ce4aa8c2075719
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.37/libredb-studio-0.1.37.tgz
+    version: 0.1.37
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "BREAKING for anyone who enabled a route without attaching it: an enabled route.<name> that sets no parentRefs now REFUSES TO RENDER instead of emitting an HTTPRoute attached to no Gateway. That object was accepted by the API server and routed nothing, so the install succeeded with the app unreachable. parentRefs cannot be defaulted - the Gateway to attach to is specific to each cluster's Gateway API install - so the chart names the route at fault and what to set"
         - "route.labels and route.annotations now reach every enabled route. values.schema.json has documented them as applying to all route resources since the route template landed, but nothing rendered them and they were silently dropped. A per-route labels/annotations entry still wins on a key collision, and chart labels win over both rather than being emitted as a duplicate YAML key"
         - "labels and annotations are consequently reserved key names directly under route: they are shared settings, not route names, and the template no longer mistakes them for routes"
@@ -1927,4 +1988,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-08-16T09:54:25.926021422Z"
+generated: "2026-08-18T13:04:12.646423849Z"
