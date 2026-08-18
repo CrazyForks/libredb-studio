@@ -323,6 +323,34 @@ it also lets the grid label a column without guessing (`ResultsGrid.declaredType
 Guessing from a string's SHAPE is not the fix and should not be attempted: it types a text column
 holding `2026-01-01` as a timestamp.
 
+### U3. Provider metadata is requested with the client's own connection object, so a managed connection defined only by a connection string is refused
+
+`useProviderMetadata` (`src/hooks/use-provider-metadata.ts`) posts `JSON.stringify(connection)` — the
+connection as the CLIENT holds it. For a managed seed connection that object is the sanitized one
+`GET /api/connections/managed` returns, and the sanitizer keeps only the fields that are not secrets.
+A seed defined by `host` / `port` / `database` / `user` survives that trip with enough left to
+construct a provider, so PostgreSQL, MySQL, SQL Server, ClickHouse, Oracle, Druid, Couchbase, Redis,
+SQLite and LibreDB all answer — measured, all eleven managed seeds replayed as the client sends them. A seed defined by `connectionString` does not: the string IS the credential,
+so nothing addressable is left, and `createDatabaseProvider` throws. Measured on 0.11.0 against a
+managed MongoDB seed — `POST /api/db/provider-meta` returns **400**, with
+`Provider metadata request failed` in the console and no capabilities for that connection.
+
+The route already accepts the fix. It resolves `body.connectionId` through `resolveConnection`
+(`src/app/api/db/provider-meta/route.ts`), the same seam `/api/db/query` and `/api/db/schema` use —
+which is why a query and a schema read on that same MongoDB connection both succeed while the
+metadata call beside them fails. Only this one caller sends the object instead of the id.
+
+The damage is bounded because absent metadata reads as unsupported everywhere, which for MongoDB is
+close to the truth: no explain, no create-table, no inline edit. What is lost is the labels — the
+explorer says what a Postgres connection would say rather than naming collections — and the loss is
+silent, a console warning on a path no user reads. It is not a regression: the hook has posted the
+object since it was introduced (`a4b5cfa`, 2026-02-12), and no engine reached this code with a
+connection-string-only managed seed until seed connections carried one.
+
+Done when the hook sends `{ connectionId }` for a connection the server owns and the object only for
+one the client does, with a test that fails on a managed seed whose only address is a connection
+string — the case the current tests cannot see, because they build connections with hosts.
+
 ### X4. Four modals stay mounted while closed, so their code cannot be split
 
 `DataProfiler`, `CodeGenerator`, `TestDataGenerator` and `DataImportModal` render `null` when closed
