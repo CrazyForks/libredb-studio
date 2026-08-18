@@ -277,6 +277,47 @@ function planningEngine(context: AgentToolContext): PlanningEngine {
 }
 
 /**
+ * What a run is told once when it has taken readings and then written its findings
+ * as prose instead of calling `compose_report`.
+ *
+ * A prose turn normally ends the run, and for a model that has established nothing
+ * that is the right ending: there is no report to ask for. But a run that HAS read
+ * something and then narrates its findings has done the whole job except the one
+ * call that records it, and ending there throws the readings away — the ledger keeps
+ * the artifacts and the goal verifier still scores the run `no-report`.
+ *
+ * Measured on three models against a local Ollama endpoint, each of which read the
+ * database and then narrated: `mistral-small3.2:24b` (4 readings), `lfm2:24b` (11 on
+ * a data-analysis run), `qwen3.5:2b` (42). None of them was refusing to report; each
+ * had answered in the register a chat model answers in.
+ *
+ * Once, and only after a call: a model that would not call the tool the first time it
+ * was asked is stopping, not hesitating, and a second telling would spend a turn to
+ * learn that. Three runs never hear it, and each bound is load-bearing rather than
+ * cautious — see `remindToReport`, which is where all three are applied:
+ *
+ *  - a run that established nothing, which is a model that is stopping rather than
+ *    one that is a call short
+ *  - a run that holds no `compose_report`, which is every PLANNING run: naming a tool
+ *    a run's set cannot satisfy is the #350/#356 failure, and the refusal a run gets
+ *    for reaching outside its set is not evidence that it used one
+ *  - a run with no turn left to act on it, because a reminder the loop then refuses
+ *    to grant rescues nothing — it rewrites a model that stopped as a run that ran
+ *    out of turns
+ *
+ * The sentence says CALLED rather than read, because that is what this branch can
+ * know: an offered tool that refused the call is still a tool this run used, and
+ * claiming a reading it has not got would be a false self-description of exactly the
+ * kind agent mode keeps being caught in. See `AGENT_REPORT_RESERVE_NOTICE` for the
+ * other sentence this run may hear about ending.
+ */
+const AGENT_REPORT_REMINDER_NOTICE = [
+  "You have called this run's tools and then written your findings as prose, which records nothing: a run reports by CALLING compose_report, and text outside that call is not a report.",
+  "Call compose_report now with what you established.",
+  AGENT_CITATION_RULE,
+].join(" ");
+
+/**
  * What an operations run is told about the inventory it was given (#411).
  *
  * Both of these sentences used to say "no schema inventory was captured for this run,
@@ -1941,6 +1982,10 @@ export async function runInvestigation(
   let text = "";
   /** The reserve notice is a one-shot: a run is told once that it is out of room. */
   let reserveAnnounced = false;
+  /** Whether a tool this run HOLDS has been called; see `remindToReport`. */
+  let anyToolCalled = false;
+  /** The report reminder is a one-shot too; see `AGENT_REPORT_REMINDER_NOTICE`. */
+  let reportReminded = false;
 
   /**
    * Tells the run, once, that it has come within the reserve of a ceiling.
@@ -1956,6 +2001,27 @@ export async function runInvestigation(
     if (maxTurns - turns > AGENT_REPORT_RESERVE_TURNS && remainingMs > AGENT_REPORT_RESERVE_MS) return;
     reserveAnnounced = true;
     messages.push({ role: "user", content: AGENT_REPORT_RESERVE_NOTICE });
+  };
+
+  /**
+   * Tells the run, once, that it narrated where it should have reported, and says
+   * whether it did — which is the caller's "take the turn again".
+   *
+   * The three bounds `AGENT_REPORT_REMINDER_NOTICE` documents are applied here and
+   * nowhere else. `anyToolCalled` carries the first two together: it is set only for a
+   * tool THIS RUN HOLDS, so a name the model invented reached nothing and a planning
+   * run — handed no tool set at all — can never set it. The ceilings are read rather
+   * than left to be hit, because this is the region the reserve notice has already
+   * pushed the model into: two turns from the end, told to wrap up, wrapping up in
+   * prose.
+   */
+  const remindToReport = (assistant: readonly ModelMessage[]): boolean => {
+    if (reportReminded || !anyToolCalled) return false;
+    if (turns >= maxTurns || resources.deadline.remainingMs() <= 0) return false;
+    reportReminded = true;
+    messages.push(...assistant);
+    messages.push({ role: "user", content: AGENT_REPORT_REMINDER_NOTICE });
+    return true;
   };
 
   /*
@@ -2065,10 +2131,20 @@ export async function runInvestigation(
     );
     text = turn.text;
     if (turn.aborted) return conclude("failed", turnBudgetMs < remainingMs ? "model-timeout" : "deadline-exceeded");
-    if (turn.toolCalls.length === 0) return conclude("succeeded", "model-stopped");
+    if (turn.toolCalls.length === 0) {
+      // A run that used its tools and then narrated is one call short of a report;
+      // one that established nothing has nothing to be reminded about.
+      if (remindToReport(turn.assistantMessages)) return null;
+      return conclude("succeeded", "model-stopped");
+    }
 
     messages.push(...turn.assistantMessages);
     for (const call of turn.toolCalls) {
+      // A tool this run HOLDS, read from the set the SDK was actually given. A name
+      // the model invented reached nothing, and planning mode is handed no set at all
+      // — so a run reminded on either would be told to call `compose_report`, which is
+      // a tool it has not got (#350).
+      if (tools?.[call.toolName] !== undefined) anyToolCalled = true;
       const outcome = await handleCall({ service, context, record, call, known, notAttempted });
       if (outcome.kind === "cancelled") {
         // `runStep` already ended the run at its checkpoint; finishing again would

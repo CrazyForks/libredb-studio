@@ -476,6 +476,9 @@ describe("what the removed panels did that these runs do not", () => {
         );
       },
       answersProse("I cannot support that number."),
+      // The reminder is sent once after a reading; a model that narrates again is
+      // stopping rather than hesitating, which is what these scenarios assert.
+      answersProse("I cannot support that number."),
     ]);
 
     expect(drive.transcripts[2] ?? "").toContain("does not match anything this run produced");

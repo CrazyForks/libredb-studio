@@ -343,6 +343,9 @@ describe("the verdict is on the ledger, where a user reads it (B24)", () => {
     const drive = await run.drive([
       callsTool("run_read_query", { sql: COUNT_BY_DEPARTMENT, rationale: "one query" }),
       answersProse("Engineering has the most employees."),
+      // The reminder is sent once after a reading; a model that narrates again is
+      // stopping rather than hesitating, which is what these scenarios assert.
+      answersProse("Engineering has the most employees."),
     ]);
 
     const finished = drive.events.at(-1);
