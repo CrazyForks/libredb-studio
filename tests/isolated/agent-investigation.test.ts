@@ -3712,6 +3712,137 @@ describe("a run opened with auto-execute is told what the gate needs", () => {
   });
 });
 
+describe("a run that would report an answer it never presented", () => {
+  /*
+    The `no-answer` shortfall, measured on three models: each read the data, got a
+    result, and went straight to `compose_report`. The report lands with nothing
+    beside it and the verifier scores the run as having answered nothing.
+
+    The notice is delivered INSTEAD of that call — `compose_report` ends the run, so
+    a message after it arrives too late — and the run then has the turn it needs.
+  */
+  const presentsRead =
+    (callId = "call_answer") =>
+    (turn: Turn): Response =>
+      chatToolCallStream(
+        "present_answer",
+        JSON.stringify({ artifact: correlationIdIn(turn.transcript), presentation: { kind: "table" } }),
+        callId,
+      );
+
+  test("its compose_report is not run, and the answer it then presents is on the ledger", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "data-analysis", true);
+    const script = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "the question, in SQL" }),
+      // Reports without presenting: this call is the one that gets intercepted.
+      reportOn("Orders were read."),
+      presentsRead(),
+      reportOn("Orders were read."),
+    );
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(result.status).toBe("succeeded");
+    const kinds = (await eventsOf(b.store, run.runId)).map((event) => event.kind);
+    expect(kinds).toContain("answer-composed");
+    // One report on the ledger, not two: the intercepted call never reached the tool.
+    expect(kinds.filter((kind) => kind === "report-composed")).toHaveLength(1);
+    // And the answer was recorded BEFORE the report, which is the ordering the
+    // shortfall is about.
+    expect(kinds.indexOf("answer-composed")).toBeLessThan(kinds.indexOf("report-composed"));
+  });
+
+  test("the notice is sent once, so a model that ignores it still reports", async () => {
+    // The one-shot matters: without it a model that never presents would have every
+    // report intercepted and the run would spend its turns rather than ending.
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "data-analysis", true);
+    const script = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "the question, in SQL" }),
+      reportOn("Orders were read."),
+      reportOn("Orders were read."),
+    );
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(result.stopReason).toBe("report-composed");
+    const kinds = (await eventsOf(b.store, run.runId)).map((event) => event.kind);
+    expect(kinds).not.toContain("answer-composed");
+    expect(kinds.filter((kind) => kind === "report-composed")).toHaveLength(1);
+  });
+
+  test("a run with no reading to present is never told to present one", async () => {
+    // The guard the earlier attempt at this fix lacked: told to present when nothing
+    // has been read, a run can neither present nor report, and loops to `no-report`
+    // instead — which the repository's own data-analysis eval caught. So a run whose
+    // ledger holds no completed read must never see the notice at all.
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "data-analysis", true);
+    // Cites the schema snapshot rather than a result, which is what a run with no
+    // reading has: `reportOn` looks for an artifact reference and there is none.
+    const reportsWithoutReading = (): Response =>
+      chatToolCallStream(
+        "compose_report",
+        JSON.stringify({ claims: [{ claim: "Nothing was read.", evidence: [{ source: "schema" }] }] }),
+        "call_report",
+      );
+    const script = scriptedModel(reportsWithoutReading, answersProse("done"), answersProse("done"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const sent = script.turns.flatMap((turn) => JSON.stringify(turn.body.messages ?? []));
+    expect(sent.some((messages) => messages.includes("This run answers by PRESENTING"))).toBe(false);
+  });
+
+  test("a catalog read is not a result this run can present, so it is never told to", async () => {
+    /*
+      The same guard, on the reading that looks like one and is not. `inspect_schema`
+      reads the catalog under the SAME operation id a drafted read uses, so a run that
+      inspected the schema and nothing else has `sql.query.read` on its ledger — and
+      `present_answer` will refuse every artifact it holds, because the statement behind
+      a catalog read is the SERVER's and there is nothing of the model's to hand over.
+      Told to present one, such a run neither presents nor reports.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "data-analysis", true);
+    const script = scriptedModel(
+      callsTool("inspect_schema", { schema: "public" }),
+      reportOn("The schema was inspected."),
+      answersProse("done"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    // The reading is on the ledger under the answer's own operation id, which is what
+    // makes this case the trap rather than a run with an empty ledger.
+    expect(
+      events.some((event) => event.kind === "tool-completed" && event.artifact.operationId === "sql.query.read"),
+    ).toBe(true);
+    const sent = script.turns.flatMap((turn) => JSON.stringify(turn.body.messages ?? []));
+    expect(sent.some((messages) => messages.includes("This run answers by PRESENTING"))).toBe(false);
+    // And the report it did compose was composed, not intercepted.
+    expect(events.map((event) => event.kind)).toContain("report-composed");
+  });
+});
+
 describe("the handover an answer records comes from the run's own setting", () => {
   /** Presents whatever result this run has already read, as a table. */
   const presentsTheRead =
