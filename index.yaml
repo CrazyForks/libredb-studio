@@ -4,6 +4,71 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "Chart metadata only, and no application change: the appVersion stays 0.12.0 and the deployed image is the same one 0.1.37 installs"
+        - "The chart description named seven engines and twelve ship - Couchbase, ClickHouse, Apache Druid, Elasticsearch and OpenSearch were missing from the text Rancher and ArtifactHub render beside this chart"
+        - "Those five engines are searchable now: they are keywords on the chart rather than only prose"
+        - "Track app release 0.12.0 (appVersion bump; default image tag follows)"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.12.0
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.12.0
+    created: "2026-08-19T20:51:07.233544376Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting twelve engines
+      - PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Redis, Couchbase,
+      ClickHouse, Apache Druid, Elasticsearch and OpenSearch
+    digest: 8adb0027ff0bd58220c19196b7f0eca2094e480a87afaa638bc780b83d76196a
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - couchbase
+    - clickhouse
+    - druid
+    - elasticsearch
+    - opensearch
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.38/libredb-studio-0.1.38.tgz
+    version: 0.1.38
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "Agent runs now ground their plan on the connected database's own schema on every supported engine, so a drafted statement names objects that exist rather than ones the model assumed"
         - "An agent run reads its workflow from the objective instead of asking for it, and an Operate run is given a schema inventory before its first turn"
         - "A light theme ships alongside the dark one through a shared token layer, and four defects that let a query fail silently are fixed"
@@ -1988,4 +2053,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-08-18T13:04:12.646423849Z"
+generated: "2026-08-19T20:51:07.227899842Z"
