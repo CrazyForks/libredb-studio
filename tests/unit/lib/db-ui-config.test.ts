@@ -15,6 +15,8 @@ const ALL_TYPES: DatabaseType[] = [
   "couchbase",
   "clickhouse",
   "druid",
+  "elasticsearch",
+  "opensearch",
 ];
 
 describe("db-ui-config", () => {
@@ -170,6 +172,8 @@ describe("db-showcase", () => {
         "redis",
         "oracle",
         "mssql",
+        "elasticsearch",
+        "opensearch",
         "couchbase",
         "clickhouse",
         "druid",

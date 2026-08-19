@@ -3,7 +3,7 @@ import type { DatabaseType } from "@/lib/types";
 
 /**
  * Display rank for the marketing surfaces (the login hero's "Supported Databases"
- * block, issue #425). Typed `Record<DatabaseType, number>`, so a twelfth member of the
+ * block, issue #425). Typed `Record<DatabaseType, number>`, so a further member of the
  * union fails `bun run typecheck` on the missing key instead of quietly never being
  * shown - the same compile-time-exhaustive trick the connection picker's coverage map
  * uses in tests/hooks/use-connection-form.test.ts.
@@ -22,14 +22,20 @@ export const SHOWCASE_RANK: Record<DatabaseType, number> = {
   redis: 4,
   oracle: 5,
   mssql: 6,
-  couchbase: 7,
-  clickhouse: 8,
-  druid: 9,
+  // The two search engines sit here, ahead of the analytical stores: Elasticsearch is
+  // one of the best-known names on this page, and OpenSearch reads as its sibling to
+  // anyone who knows it - which is also what the code says, since the two type-ids
+  // share one HTTP SQL transport (#424).
+  elasticsearch: 7,
+  opensearch: 8,
+  couchbase: 9,
+  clickhouse: 10,
+  druid: 11,
   // Last on purpose: the embedded store is the least recognisable name here. It is
   // still shown - it is a shipped provider with a doc (docs/providers/libredb.md), an
   // icon and a slot in the connection picker, so omitting it would make the login page
   // contradict the app (issue #425, step 2).
-  libredb: 10,
+  libredb: 12,
 };
 
 /**

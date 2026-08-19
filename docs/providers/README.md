@@ -16,6 +16,8 @@ in lockstep with the code (see the tri-sync rule in [`../../CLAUDE.md`](../../CL
 | Couchbase | `couchbase` | Document | none (HTTP: Query + management REST) | SQL (SQL++) | [couchbase.md](./couchbase.md) |
 | ClickHouse | `clickhouse` | SQL | none (HTTP interface) | SQL | [clickhouse.md](./clickhouse.md) |
 | Apache Druid | `druid` | SQL (analytics) | none (HTTP: SQL endpoint) | SQL (Calcite) | [druid.md](./druid.md) |
+| Elasticsearch | `elasticsearch` | SQL (search) | none (HTTP: `_sql` + REST) | SQL (Elasticsearch SQL) | [elasticsearch.md](./elasticsearch.md) |
+| OpenSearch | `opensearch` | SQL (search) | none (HTTP: `_plugins/_sql` + REST) | SQL (OpenSearch SQL plugin) | [opensearch.md](./opensearch.md) |
 | LibreDB | `libredb` | Embedded (Key-Value) | `@libredb/libredb` | JSON (command grammar) | [libredb.md](./libredb.md) |
 
 ## Conventions
@@ -23,7 +25,10 @@ in lockstep with the code (see the tri-sync rule in [`../../CLAUDE.md`](../../CL
 - **Filename = canonical type-id** (`postgres.md`, `mssql.md`, …), mirroring the source file
   (`src/lib/db/providers/<family>/<type-id>.ts`, or a `<type-id>/` directory when a provider is
   split across modules, as Couchbase, ClickHouse and Druid are). The official product name (e.g.
-  "SQL Server") is used only in each doc's title and prose.
+  "SQL Server") is used only in each doc's title and prose. **One directory may serve two type-ids**
+  — `providers/sql/search/` is `elasticsearch` and `opensearch` — and each type-id still gets its own
+  document, because the tri-sync invariant is per type-id and each doc is the prime reference for its
+  own product's measured behaviour.
 - **Each doc mirrors the code.** Every `file:line` citation is verified, and the per-provider triad
   — code, this doc, and `tests/integration/db/<type-id>-provider.test.ts` — must stay in sync in the
   same PR (the *provider tri-sync invariant*).
@@ -87,17 +92,146 @@ Upstash, PlanetScale, Azure Cosmos DB and Amazon DocumentDB. Their status is tra
   [`../API_DOCS.md`](../API_DOCS.md).
 
 
-## database compose connection tests
-  ┌──────────┬───────────────┬─────────────┬──────────────┐
-  │          │   Couchbase   │ ClickHouse  │ Apache Druid │
-  ├──────────┼───────────────┼─────────────┼──────────────┤
-  │ Host     │ localhost     │ localhost   │ localhost    │
-  ├──────────┼───────────────┼─────────────┼──────────────┤
-  │ Port     │ 8091          │ 8123        │ 8888         │
-  ├──────────┼───────────────┼─────────────┼──────────────┤
-  │ User     │ Administrator │ libredb     │ null         │
-  ├──────────┼───────────────┼─────────────┼──────────────┤
-  │ Password │ password123   │ password123 │ null         │
-  ├──────────┼───────────────┼─────────────┼──────────────┤
-  │ Database │ travel        │ demo        │ null         │
-  └──────────┴───────────────┴─────────────┴──────────────┘
+## Connecting to the container fixture
+
+What to type into the connection dialog for **every shipped provider**, against
+[`database-compose.yml`](../../database-compose.yml). One row per type-id, so the table covers the
+same set as the table at the top of this file and a new provider is a new row rather than a re-drawn
+grid. Each row was verified against the running container on 2026-08-19 — the credentials are the
+ones the fixture actually accepts, not the ones its environment block asks for (twice those differ;
+see the notes).
+
+Start the eight always-on services with a plain `docker compose -f database-compose.yml up -d`; the
+`Profile` column names the ones that need asking for.
+
+| Provider | Compose service | Host | Port | User | Password | Database / service | Profile |
+|---|---|---|---|---|---|---|---|
+| PostgreSQL | `postgres` | localhost | 5432 | `postgres` | `postgres` | `postgres` | — |
+| MySQL | `mysql` | localhost | 3306 | `root` | `root` | `mysql` | — |
+| Oracle | `oracle` | localhost | 1521 | `system` | `Password123!` | `XEPDB1` (service name) | — |
+| SQL Server | `mssql` | localhost | 1433 | `sa` | `Password123!` | `master` | — |
+| MongoDB | `mongodb` | localhost | 27017 | `admin` | `admin` | any; auth source `admin` | — |
+| Redis | `redis` | localhost | 6379 | *none* | *none* | *none* (db index 0) | — |
+| Couchbase | `couchbase` | localhost | 8091 | `Administrator` | `password123` | `travel` (bucket) | — |
+| ClickHouse | `clickhouse` | localhost | 8123 | `libredb` | `password123` | `demo` | — |
+| Apache Druid | `druid-router` | localhost | 8888 | *none* | *none* | *none* | `druid` |
+| Elasticsearch | `elasticsearch` | localhost | 9200 | *none* | *none* | *none* | — |
+| OpenSearch | `opensearch` | localhost | **9201** | *none* | *none* | *none* | — |
+| SQLite | *no service* | — | — | — | — | a file path on the Studio host | — |
+| LibreDB | *no service* | — | — | — | — | a directory on the Studio host | — |
+
+*none* means leave the field empty. It is never a default that happens to be blank: Druid loads no
+security extension in a default install, both search services run with their security plugin off, and
+the `redis` service sets no `requirepass` (verified: `CONFIG GET requirepass` answers empty).
+
+**The two embedded providers have no container, and that is the whole point of them.** SQLite takes a
+path resolved *in the Studio process* and LibreDB a directory; neither reaches a network. Both also
+ship a ready-made sample connection — "Sample (Employees)" and "Sample (LibreDB)" appear in the
+sidebar with no configuration at all — so the fastest way to exercise them is to click one rather than
+to fill this dialog in. See [sqlite.md](./sqlite.md) and [libredb.md](./libredb.md).
+
+**Two rows differ from what the compose file's environment asks for**, which is why they are stated
+from the running container instead:
+
+- **Oracle** sets `ORACLE_PDB: ORCLPDB1`, and `gvenzl/oracle-xe` does not read that variable — it
+  takes `ORACLE_DATABASE` for an application PDB. So the only PDB on the node is the image default,
+  `XEPDB1` (verified: `SELECT name FROM v$pdbs`). Connect to `XEPDB1`, or the listener refuses the
+  service name.
+- **SQL Server** sets `MSSQL_DATABASE: mssql`, which the official image ignores; it creates no
+  database. `master` is what the fixture guarantees (verified: `SELECT name FROM sys.databases`), and
+  a `shop` database appears only once an E2E seed has run.
+
+**The two search services share a port inside the container.** OpenSearch publishes **9201** on the
+host because both products ship on 9200 and the `elasticsearch` service claims it; the provider's own
+default port stays 9200, so this is a collision on this machine and not a fact about the product.
+Security is off on both, which is what makes their fixtures reproducible *and* the limit of what they
+can prove: a bogus `Basic` header is ignored there (HTTP 200 on both, measured), so no 401/403 body
+can ever be captured from these containers. Neither offers a `Database` field at all — an index has no
+namespace above it. Details in [elasticsearch.md](./elasticsearch.md) and
+[opensearch.md](./opensearch.md).
+
+**Druid is seven containers, not one.** It has no single-container mode, so the whole block carries
+`profiles: ["druid"]` and a plain `up -d` leaves it out. The dialog only ever needs the Router:
+
+```bash
+docker compose -f database-compose.yml --profile druid up -d
+```
+
+For the engines that have no provider of their own, use the `compat` profile and connect as the driver
+named in the [Wire-compatible engines](#wire-compatible-engines) table above.
+
+### If Studio itself runs in a container, `localhost` is the wrong host
+
+Every `Host` in the table above is written for a Studio that runs **on the host** — `bun dev`,
+`bun run start`, or the npm package. Inside a container, `localhost` is that container's own loopback
+and nothing is listening on it: a plain `docker run -p 3000:3000 libredb/libredb-studio` reaches
+none of these services (measured — `curl localhost:9200` from an unrelated container answers no HTTP
+status at all, not a refusal you could mistake for a credential problem).
+
+Pick one of three, in this order of preference.
+
+**1. Join the fixture's network and address services by name.** The best answer, and the only one that
+needs no host ports at all: compose puts every service on `libredb-studio_default` with its service
+name as a DNS name.
+
+```bash
+docker run -p 3000:3000 --network libredb-studio_default libredb/libredb-studio
+```
+
+Then use the **service name** as the host and the **in-container** port — which is not always the port
+in the table above:
+
+| Provider | Host inside the network | Port inside the network |
+|---|---|---|
+| PostgreSQL | `postgres` | 5432 |
+| MySQL | `mysql` | 3306 |
+| Oracle | `oracle` | 1521 |
+| SQL Server | `mssql` | 1433 |
+| MongoDB | `mongodb` | 27017 |
+| Redis | `redis` | 6379 |
+| Couchbase | `couchbase` | 8091 |
+| ClickHouse | `clickhouse` | 8123 |
+| Apache Druid | `druid-router` | 8888 |
+| Elasticsearch | `elasticsearch` | 9200 |
+| OpenSearch | `opensearch` | **9200** |
+
+> **OpenSearch is 9200 here, not 9201.** The 9201 in the table above is a *host* port published to
+> dodge a collision with the `elasticsearch` service. Inside the network there is no collision, so the
+> port is the product's own. Verified: `http://opensearch:9200/` reports distribution `opensearch`,
+> number `3.8.0`.
+>
+> Credentials and database names do not change — only host and port do. And the network exists only
+> once compose has created it, so start the fixture before Studio; the name is
+> `<project>_default`, which is `libredb-studio_default` when compose is run from this repository and
+> `<your-directory>_default` otherwise (`docker network ls` says which).
+
+**2. Reach the published host ports through the host gateway.** Use this when Studio must stay off the
+fixture's network — a container you did not start, or services split across several compose projects.
+On Docker Desktop `host.docker.internal` already resolves; on Linux it does not, and the flag below is
+what creates it:
+
+```bash
+docker run -p 3000:3000 --add-host=host.docker.internal:host-gateway libredb/libredb-studio
+```
+
+Now the table at the top of this section is correct as written, with `host.docker.internal` in place of
+`localhost` — including OpenSearch on **9201**, because these are the published host ports. Verified on
+Linux: 9200 and 9201 both answer HTTP 200 through that name.
+
+**3. `--network host`.** Makes `localhost` mean the host's loopback, so the table applies unchanged:
+
+```bash
+docker run --network host ghcr.io/libredb/libredb-studio
+```
+
+Last because of what it costs: **Linux only** (on Docker Desktop the "host" is the VM, not your
+machine), no `-p` mapping (the app binds the host's port 3000 directly), and the container shares the
+host's whole network namespace, which is a far wider grant than reaching one database.
+
+Whichever you pick, [`docker-compose.yml`](../../docker-compose.yml) in the repository root is the
+shape to copy for a real deployment: Studio and its Postgres sit on one compose network and address
+each other by service name, so nothing depends on a published host port existing.
+
+One collision to know about if you run both files: that root compose file and the fixture both name a
+container `libredb-postgres`, so the second one to start fails with *"container name is already in
+use"*. Rename one, or run only the fixture and point Studio's `STORAGE_*` variables at it.

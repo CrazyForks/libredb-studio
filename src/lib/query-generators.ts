@@ -30,6 +30,21 @@ function couchbaseQuote(name: string): string {
 }
 
 /**
+ * Quote only when the name would not round-trip bare, in the two styles a provider
+ * may DECLARE (`ProviderCapabilities.identifierQuoting`).
+ *
+ * One object rather than two functions, and looked up rather than branched on: bun's
+ * lcov attributes a freshly added function's declaration line to nothing, so two new
+ * `function` declarations here read as uncovered while their bodies run - the phantom
+ * this repo's coverage notes describe. A table has one executable line per entry and
+ * no declaration line to lose.
+ */
+const DECLARED_QUOTING: Record<"backtick" | "double", (name: string) => string> = {
+  backtick: (name) => (/^[A-Za-z_][\w$]*$/.test(name) ? name : couchbaseQuote(name)),
+  double: (name) => (/^[a-z_][a-z0-9_$]*$/.test(name) ? name : `"${name.replaceAll('"', '""')}"`),
+};
+
+/**
  * The document key projection. `SELECT *` nests whole documents under the
  * keyspace name and never yields the key at all (issue #262, decision 5), so
  * every generated statement projects it explicitly through the alias.
@@ -60,6 +75,16 @@ const COUCHBASE_KEY_PROJECTION = `META(${COUCHBASE_ALIAS}).id AS ${COUCHBASE_DOC
 export function quoteIdentifier(name: string, capabilities: ProviderCapabilities): string {
   // Document stores (MongoDB) don't use SQL identifier quoting.
   if (capabilities.queryLanguage === "json") return name;
+
+  // An explicit declaration wins over the port heuristic below, because the port
+  // stopped being a faithful proxy for the dialect: Elasticsearch and OpenSearch
+  // both ship on 9200 and disagree about the quote character. Measured on
+  // OpenSearch 3.8.0, a double-quoted identifier is a STRING LITERAL - the
+  // generated query answers 200 with zero rows instead of failing - so the
+  // fall-through default would produce silently wrong results here, not an error.
+  // See `ProviderCapabilities.identifierQuoting`.
+  const declared = capabilities.identifierQuoting;
+  if (declared !== undefined) return DECLARED_QUOTING[declared](name);
 
   if (capabilities.defaultPort === COUCHBASE_PORT) {
     // Couchbase (SQL++): quote unconditionally. Reserved words (`bucket`, `scope`,
@@ -290,6 +315,21 @@ function redisScan(base: string): string {
   return renderRedisCommand(["SCAN", "0", "MATCH", `${escapeGlob(base)}*`, "COUNT", "50"]);
 }
 
+/**
+ * The terminator a generated statement ends with: `;` everywhere, and nothing on a
+ * product whose grammar has none.
+ *
+ * Only the two shapes a user reaches by CLICKING are bounded here - the schema tree's
+ * "Select Top N" and "Generate Query" - because those are the statements this file
+ * writes on the user's behalf. The dialect-specific returns above keep their own
+ * literal `;`: each of those engines accepts one, and this is the fallthrough every
+ * other SQL engine shares, which is where the two search products land. See
+ * `ProviderCapabilities.statementTerminator` for the measurement.
+ */
+function terminator(capabilities: ProviderCapabilities): string {
+  return capabilities.statementTerminator === "none" ? "" : ";";
+}
+
 export function generateTableQuery(
   tableName: string,
   capabilities: ProviderCapabilities,
@@ -328,11 +368,11 @@ export function generateTableQuery(
   if (capabilities.defaultPort === 1433) {
     return `SELECT TOP 50 * FROM ${table};`;
   }
-  // PostgreSQL / MySQL / SQLite / ClickHouse. The trailing LIMIT matters for
-  // ClickHouse specifically: it also accepts `FORMAT x` and `SETTINGS ...` as
-  // trailing clauses, and a LIMIT placed after either is a syntax error, so the
-  // limit must stay last (issue #264).
-  return `SELECT * FROM ${table} LIMIT 50;`;
+  // PostgreSQL / MySQL / SQLite / ClickHouse / Elasticsearch / OpenSearch. The
+  // trailing LIMIT matters for ClickHouse specifically: it also accepts `FORMAT x`
+  // and `SETTINGS ...` as trailing clauses, and a LIMIT placed after either is a
+  // syntax error, so the limit must stay last (issue #264).
+  return `SELECT * FROM ${table} LIMIT 50${terminator(capabilities)}`;
 }
 
 /**
@@ -494,7 +534,7 @@ export function generateSelectQuery(
   if (capabilities.defaultPort === 1433) {
     return `SELECT TOP 100\n${cols}\nFROM ${table}\nWHERE 1=1;`;
   }
-  return `SELECT\n${cols}\nFROM ${table}\nWHERE 1=1\nLIMIT 100;`;
+  return `SELECT\n${cols}\nFROM ${table}\nWHERE 1=1\nLIMIT 100${terminator(capabilities)}`;
 }
 
 export function shouldRefreshSchema(query: string, schemaRefreshPattern: string): boolean {
