@@ -1720,316 +1720,322 @@ export async function runInvestigation(
   // behind. A queued run is one nothing has driven yet; a running one is a resume.
   const resumed = await service.resume(runId);
 
-  // WHERE a run acts is as much the record's to decide as WHO it acts as. Driving a
-  // run with another connection's resources would execute against that connection
-  // while the ledger header went on naming the one the run was opened for, so the
-  // whole audit trail would be about a database the statements never touched.
-  //
-  // BOTH fields are bound, because they do different jobs and either one alone
-  // leaves the door open: `scope` is what the policy layer checks a target against,
-  // while `connection` is what `tools.ts` acquires the provider from and reads the
-  // dialect off. A caller could otherwise satisfy the scope and still send the
-  // statements somewhere else entirely.
-  const declared = [resources.scope.connectionId, resources.connection.id];
-  const mismatch = declared.find((id) => id !== resumed.record.connectionId);
-  if (mismatch !== undefined) {
-    throw new AgentRunServiceError(
-      "RUN_CONNECTION_MISMATCH",
-      `agent run "${runId}" belongs to connection "${resumed.record.connectionId}", not "${mismatch}"`,
-    );
-  }
+  // One drive per run in this process: two would both pass `runStep`'s
+  // read-then-append check and execute the same step twice (`docs/BACKLOG.md` B5).
+  // Released in the `finally` at the foot of this function, so a drive that throws
+  // still leaves the run claimable by the next one.
+  service.claimDrive(runId);
+  try {
+    // WHERE a run acts is as much the record's to decide as WHO it acts as. Driving a
+    // run with another connection's resources would execute against that connection
+    // while the ledger header went on naming the one the run was opened for, so the
+    // whole audit trail would be about a database the statements never touched.
+    //
+    // BOTH fields are bound, because they do different jobs and either one alone
+    // leaves the door open: `scope` is what the policy layer checks a target against,
+    // while `connection` is what `tools.ts` acquires the provider from and reads the
+    // dialect off. A caller could otherwise satisfy the scope and still send the
+    // statements somewhere else entirely.
+    const declared = [resources.scope.connectionId, resources.connection.id];
+    const mismatch = declared.find((id) => id !== resumed.record.connectionId);
+    if (mismatch !== undefined) {
+      throw new AgentRunServiceError(
+        "RUN_CONNECTION_MISMATCH",
+        `agent run "${runId}" belongs to connection "${resumed.record.connectionId}", not "${mismatch}"`,
+      );
+    }
 
-  const record = resumed.record.status === "queued" ? await service.markRunning(runId) : resumed.record;
+    const record = resumed.record.status === "queued" ? await service.markRunning(runId) : resumed.record;
 
-  // Read from the record and not from a module constant: the turn ceiling is one of
-  // the four figures the decision table varies per workflow, and a drive that used
-  // another workflow's ceiling would end runs for a reason nothing enforced.
-  const maxTurns = options.maxTurns ?? AGENT_WORKFLOW_BUDGETS[record.workflowType].maxModelTurns;
+    // Read from the record and not from a module constant: the turn ceiling is one of
+    // the four figures the decision table varies per workflow, and a drive that used
+    // another workflow's ceiling would end runs for a reason nothing enforced.
+    const maxTurns = options.maxTurns ?? AGENT_WORKFLOW_BUDGETS[record.workflowType].maxModelTurns;
 
-  const context: AgentToolContext = {
-    ...resources,
-    runId: record.runId,
-    mode: record.mode,
-    workflowType: record.workflowType,
-    actor: record.actor,
-  };
-  // Read once, from the provider's own declarations, and spent by every sentence that
-  // has to name what this engine holds. See `PlanningEngine`.
-  const engine = planningEngine(context);
-  const tools = declaredTools(record);
-  const messages: ModelMessage[] = [{ role: "user", content: record.objective }];
-  const priorProgress = describePriorProgress(record);
-  if (priorProgress !== null) messages.push({ role: "user", content: priorProgress });
+    const context: AgentToolContext = {
+      ...resources,
+      runId: record.runId,
+      mode: record.mode,
+      workflowType: record.workflowType,
+      actor: record.actor,
+    };
+    // Read once, from the provider's own declarations, and spent by every sentence that
+    // has to name what this engine holds. See `PlanningEngine`.
+    const engine = planningEngine(context);
+    const tools = declaredTools(record);
+    const messages: ModelMessage[] = [{ role: "user", content: record.objective }];
+    const priorProgress = describePriorProgress(record);
+    if (priorProgress !== null) messages.push({ role: "user", content: priorProgress });
 
-  // Step ids the ledger already knows, so a draft is recorded once per step and a
-  // resumed run does not narrate work the dead process already narrated.
-  const known = new Set<string>([...resumed.settledStepIds, ...resumed.indeterminateStepIds]);
-  // Steps this drive refused before reaching a database. Deliberately NOT seeded from
-  // the ledger: a step inherited as unsettled is genuinely indeterminate, because the
-  // dead process never recorded which of the two it was.
-  const notAttempted = new Set<string>();
+    // Step ids the ledger already knows, so a draft is recorded once per step and a
+    // resumed run does not narrate work the dead process already narrated.
+    const known = new Set<string>([...resumed.settledStepIds, ...resumed.indeterminateStepIds]);
+    // Steps this drive refused before reaching a database. Deliberately NOT seeded from
+    // the ledger: a step inherited as unsettled is genuinely indeterminate, because the
+    // dead process never recorded which of the two it was.
+    const notAttempted = new Set<string>();
 
-  let contextEstablished = false;
-  /**
-   * The one workflow whose inventory is PACKED differently (#411).
-   *
-   * It takes the same context path as every other workflow — its own ledger, the
-   * process-held reading, or a capture — because `holdSnapshotForConnection` shares a
-   * snapshot BETWEEN runs, and an operations-shaped partial capture would later be
-   * handed to an investigation run as if it were whole. The capture stays whole; only
-   * the presentation varies.
-   */
-  const operations = record.workflowType === "operations";
-  /**
-   * What this drive was able to put in front of the model, as the planning rules
-   * have to describe it. Rebuilt rather than mutated in place so the rules can only
-   * ever state a combination this code actually produced.
-   */
-  let grounding: PlanningGrounding = {
-    schemaKnown: false,
-    readBy: "this-run",
-    readVia: "composed-catalog",
-    statisticsShown: false,
-  };
-  /**
-   * The inventory a plan run's drafted statement is checked against, or `null` when
-   * this drive has none.
-   *
-   * `null` is a load-bearing value rather than an empty default: a run on an engine
-   * this server cannot ground checked nothing, and an empty inventory would report
-   * every table the model named as one this database does not have. It is the
-   * SNAPSHOT's tables and not the grounding flag, because the check needs the names.
-   */
-  let planningInventory: readonly TableSchema[] | null = null;
+    let contextEstablished = false;
+    /**
+     * The one workflow whose inventory is PACKED differently (#411).
+     *
+     * It takes the same context path as every other workflow — its own ledger, the
+     * process-held reading, or a capture — because `holdSnapshotForConnection` shares a
+     * snapshot BETWEEN runs, and an operations-shaped partial capture would later be
+     * handed to an investigation run as if it were whole. The capture stays whole; only
+     * the presentation varies.
+     */
+    const operations = record.workflowType === "operations";
+    /**
+     * What this drive was able to put in front of the model, as the planning rules
+     * have to describe it. Rebuilt rather than mutated in place so the rules can only
+     * ever state a combination this code actually produced.
+     */
+    let grounding: PlanningGrounding = {
+      schemaKnown: false,
+      readBy: "this-run",
+      readVia: "composed-catalog",
+      statisticsShown: false,
+    };
+    /**
+     * The inventory a plan run's drafted statement is checked against, or `null` when
+     * this drive has none.
+     *
+     * `null` is a load-bearing value rather than an empty default: a run on an engine
+     * this server cannot ground checked nothing, and an empty inventory would report
+     * every table the model named as one this database does not have. It is the
+     * SNAPSHOT's tables and not the grounding flag, because the check needs the names.
+     */
+    let planningInventory: readonly TableSchema[] | null = null;
 
-  /**
-   * A planning run's grounding: the inventory, its relations, and what the engine
-   * estimates about its own tables. An operations plan gets the inventory and the
-   * estimates and no relations at all (#411) — it can read nothing, ever, so the
-   * estimates are the only sizes it will have, while how its tables join is the one
-   * thing an operational reading never asks.
-   *
-   * Three sources, cheapest first, and the order is the whole design:
-   *
-   *  1. **This run's own ledger.** A resumed plan run re-derives the inventory it
-   *     already recorded and sends nothing at all.
-   *  2. **What this process already read**, for any run on this connection. Free,
-   *     and the case #384 built; it is now the fast path rather than the only one.
-   *  3. **A capture**, which reads the catalog through the audited path and records
-   *     it, so the next drive of this run takes path 1.
-   *
-   * The statistics are read on every grounded path, including the two free ones, and
-   * that is deliberate: what the model may conclude has to depend on what it was
-   * shown, not on which process happened to have read a catalog earlier. They are
-   * NOT folded into the snapshot — estimates are not schema, they change under a
-   * running database, and the snapshot's fingerprint is what makes it reusable (see
-   * `schema-stats.ts`).
-   *
-   * A run that cannot be grounded is TOLD so, in the server's own voice and without
-   * naming a tool it does not have. The rules phase depends on that flag being
-   * honest: `grounding.schemaKnown` is what decides whether the model is told to
-   * write against an inventory or told it has not seen this database at all.
-   */
-  const establishPlanningContext = async (): Promise<void> => {
-    const recorded = reusableSnapshot(record.events, record.connectionId);
-    const held = recorded === null ? heldSnapshotForConnection(connectionIdentity(context.connection)) : null;
-    let snapshot = recorded ?? held;
-    // Only the process-held reading is somebody else's. A recorded one is this run's
-    // own earlier drive, and telling the model otherwise would be a false
-    // self-description of exactly the kind this mode keeps being caught in.
-    const readBy: PlanningGrounding["readBy"] = held === null ? "this-run" : "earlier-run";
+    /**
+     * A planning run's grounding: the inventory, its relations, and what the engine
+     * estimates about its own tables. An operations plan gets the inventory and the
+     * estimates and no relations at all (#411) — it can read nothing, ever, so the
+     * estimates are the only sizes it will have, while how its tables join is the one
+     * thing an operational reading never asks.
+     *
+     * Three sources, cheapest first, and the order is the whole design:
+     *
+     *  1. **This run's own ledger.** A resumed plan run re-derives the inventory it
+     *     already recorded and sends nothing at all.
+     *  2. **What this process already read**, for any run on this connection. Free,
+     *     and the case #384 built; it is now the fast path rather than the only one.
+     *  3. **A capture**, which reads the catalog through the audited path and records
+     *     it, so the next drive of this run takes path 1.
+     *
+     * The statistics are read on every grounded path, including the two free ones, and
+     * that is deliberate: what the model may conclude has to depend on what it was
+     * shown, not on which process happened to have read a catalog earlier. They are
+     * NOT folded into the snapshot — estimates are not schema, they change under a
+     * running database, and the snapshot's fingerprint is what makes it reusable (see
+     * `schema-stats.ts`).
+     *
+     * A run that cannot be grounded is TOLD so, in the server's own voice and without
+     * naming a tool it does not have. The rules phase depends on that flag being
+     * honest: `grounding.schemaKnown` is what decides whether the model is told to
+     * write against an inventory or told it has not seen this database at all.
+     */
+    const establishPlanningContext = async (): Promise<void> => {
+      const recorded = reusableSnapshot(record.events, record.connectionId);
+      const held = recorded === null ? heldSnapshotForConnection(connectionIdentity(context.connection)) : null;
+      let snapshot = recorded ?? held;
+      // Only the process-held reading is somebody else's. A recorded one is this run's
+      // own earlier drive, and telling the model otherwise would be a false
+      // self-description of exactly the kind this mode keeps being caught in.
+      const readBy: PlanningGrounding["readBy"] = held === null ? "this-run" : "earlier-run";
 
-    if (snapshot === null) {
-      const capture = await captureContextSnapshot(context);
-      if (capture.kind === "unavailable") {
+      if (snapshot === null) {
+        const capture = await captureContextSnapshot(context);
+        if (capture.kind === "unavailable") {
+          messages.push({
+            role: "user",
+            content: operations
+              ? planningOperationsUngroundedNote(capture.detail, engine.noun)
+              : planningUngroundedNote(capture.detail, engine.noun),
+          });
+          return;
+        }
+        snapshot = capture.snapshot;
+        await service.recordEvent(runId, {
+          kind: "context-captured",
+          fingerprint: snapshot.fingerprint,
+          tableCount: snapshot.tables.length,
+          snapshot,
+          // The same noun this run's own prompt blocks are written with, recorded
+          // where the timeline can read it: the rail has no provider to ask.
+          noun: engine.noun,
+        });
+      }
+      // After the ledger on the capture path, for the reason the agent path records:
+      // what another run may later be handed is an inventory durably part of some run's
+      // own history. Re-holding a reading that came from the hold is not a no-op either
+      // — it moves the connection back to the newest end of the eviction order.
+      holdSnapshotForConnection(snapshot, connectionIdentity(context.connection));
+      if (operations) {
+        // Names and indexes, and NO relations block: the graph is the most expensive
+        // part of the packing and the least useful part of it here (#411). The note
+        // comes first, because it is what says what the fenced block below it is for.
+        messages.push({ role: "user", content: planningOperationsContextNote(engine.noun) });
         messages.push({
           role: "user",
-          content: operations
-            ? planningOperationsUngroundedNote(capture.detail, engine.noun)
-            : planningUngroundedNote(capture.detail, engine.noun),
+          content: packOperationsInventory(snapshot, {
+            preface: planningSnapshotPreface(snapshot, readBy, engine.noun),
+            noun: engine.noun,
+          }),
+        });
+      } else {
+        messages.push({
+          role: "user",
+          content: packPlanningSnapshotMessage(snapshot, record.objective, readBy, engine.noun),
+        });
+        messages.push({
+          role: "user",
+          content: packRelations(snapshot, record.workflowType, record.mode, context.capabilities, engine.noun),
+        });
+      }
+
+      const statistics = await readSchemaStatistics(context);
+      // Row estimates only for an operations plan, and this is the same decision as the
+      // packing above rather than a second one. Its whole context is identifiers of two
+      // kinds and it is TOLD so twice over; the default rendering names a column beside
+      // every table it has an estimate for, which would make that sentence false in the
+      // message under it and would leak a column name out of a run whose documented
+      // egress is table and index names. What the estimates are here FOR is which table
+      // is worth a reading, and a row count is all that answers it. Found by review on
+      // #411.
+      messages.push({
+        role: "user",
+        content: packSchemaStatistics(snapshot.tables, statistics, operations ? { detail: "rows" } : {}),
+      });
+      grounding = {
+        schemaKnown: true,
+        readBy,
+        // The same defaulting the preface does, and from the same field: a snapshot with
+        // no `readVia` came from the composed path, because that was the only path there
+        // was when it was written.
+        readVia: snapshot.readVia ?? "composed-catalog",
+        statisticsShown: statistics.kind === "read",
+      };
+      // What the closing statement will be checked against, taken from the same reading
+      // the model was shown: a statement validated against an inventory the model never
+      // saw would be checked against a database and blamed on a model.
+      planningInventory = snapshot.tables;
+    };
+
+    /**
+     * Gives this drive the run's schema context, once, before the first turn.
+     *
+     * A run that has captured its inventory once never reads a catalog again: the
+     * inventory is in its ledger, so `reusableSnapshot` answers from the record this
+     * drive has already read and performs no database operation at all. That is what
+     * the fingerprint is for — it is checked against the inventory it summarises, so
+     * reuse is a verification rather than a hope — and it matters most on the path
+     * that pays for a re-read twice: a run resumed after a process death starts every
+     * cost ceiling again (`docs/BACKLOG.md` B6), so three catalog statements out of
+     * twenty would be spent per resume on rows the run already had.
+     *
+     * A run whose catalog cannot be read is told so and continues: the tools are
+     * still there, and a narrowed `inspect_schema` is exactly what an overflowing
+     * catalog needs.
+     *
+     * EVERY workflow reaches here, and that is what #411 changed. `operations` used to
+     * return before any of this on a decision the issue re-opened: an operations
+     * objective is about what the engine reports about ITSELF, so an inventory looked
+     * like dead weight — until workflow inference (#407) began routing objectives here
+     * that a user would expect to be answered against the schema, and until it was
+     * noticed that the engine's own reports are full of schema identifiers. The
+     * exclusion was one early return, and deleting it is the whole change: what remains
+     * workflow-specific is which packing runs, not which path does.
+     *
+     * PLANNING now establishes its context the same way, and that is the one line of
+     * the contract the plan-mode grounding design of 2026-08-15 deliberately changed.
+     * It used to consult `heldSnapshotForConnection` and nothing else (#384), so a plan
+     * run was about a real database only when an AGENT run had read one on the same
+     * connection, in this same process — which is to say: never, after a restart, on a
+     * second replica, or for a user who had not already used the mode this one exists
+     * to be safer than. What did NOT change is the property the mode sells: a plan run
+     * still runs NO statement of the user's, still writes nothing, and the model is
+     * still handed no tools. It reads the catalog, which is what the sidebar does on
+     * every connect.
+     */
+    const establishContext = async (): Promise<void> => {
+      contextEstablished = true;
+
+      if (record.mode !== "agent") {
+        await establishPlanningContext();
+        return;
+      }
+
+      /**
+       * The inventory, as THIS workflow is shown it.
+       *
+       * The operations branch is a packing decision and nothing more: the same whole
+       * snapshot, rendered as names and indexes, with no relations block beside it
+       * (#411). It is also why the operations note is pushed here rather than beside the
+       * capture — the note says what the fenced block under it is for, so the two belong
+       * in one place and cannot come apart.
+       */
+      const show = (snapshot: AgentContextSnapshot): void => {
+        if (operations) {
+          messages.push({ role: "user", content: operationsContextNote(engine.noun) });
+          messages.push({
+            role: "user",
+            content: packOperationsInventory(snapshot, {
+              preface: snapshotHandoverText(snapshot.fingerprint),
+              noun: engine.noun,
+            }),
+          });
+          return;
+        }
+        messages.push({ role: "user", content: packSnapshotMessage(snapshot, record.objective, engine.noun) });
+        messages.push({
+          role: "user",
+          content: packRelations(snapshot, record.workflowType, record.mode, context.capabilities, engine.noun),
+        });
+      };
+
+      const recorded = reusableSnapshot(record.events, record.connectionId);
+      if (recorded !== null) {
+        // Held on the reuse path too, not only on the capture: a resumed drive in a
+        // fresh process is exactly where the hold is empty, and this is the reading
+        // that refills it from what the ledger already proved.
+        holdSnapshotForConnection(recorded, connectionIdentity(context.connection));
+        show(recorded);
+        return;
+      }
+
+      const capture = await captureContextSnapshot(context);
+      if (capture.kind === "unavailable") {
+        // The capture's own words send a model to `inspect_schema`, which an operations
+        // run does not hold: naming a tool the run has not got is the #350 failure, and
+        // this workflow is the one that reaches engines where the capture always fails.
+        messages.push({
+          role: "user",
+          content: operations ? operationsUngroundedNote(capture.detail, engine.noun) : capture.modelText,
         });
         return;
       }
-      snapshot = capture.snapshot;
+      const { snapshot } = capture;
       await service.recordEvent(runId, {
         kind: "context-captured",
         fingerprint: snapshot.fingerprint,
         tableCount: snapshot.tables.length,
         snapshot,
-        // The same noun this run's own prompt blocks are written with, recorded
-        // where the timeline can read it: the rail has no provider to ask.
+        // As on the planning path: what the engine calls these rows is part of what was
+        // read, so it is written down with the reading rather than guessed at later.
         noun: engine.noun,
       });
-    }
-    // After the ledger on the capture path, for the reason the agent path records:
-    // what another run may later be handed is an inventory durably part of some run's
-    // own history. Re-holding a reading that came from the hold is not a no-op either
-    // — it moves the connection back to the newest end of the eviction order.
-    holdSnapshotForConnection(snapshot, connectionIdentity(context.connection));
-    if (operations) {
-      // Names and indexes, and NO relations block: the graph is the most expensive
-      // part of the packing and the least useful part of it here (#411). The note
-      // comes first, because it is what says what the fenced block below it is for.
-      messages.push({ role: "user", content: planningOperationsContextNote(engine.noun) });
-      messages.push({
-        role: "user",
-        content: packOperationsInventory(snapshot, {
-          preface: planningSnapshotPreface(snapshot, readBy, engine.noun),
-          noun: engine.noun,
-        }),
-      });
-    } else {
-      messages.push({
-        role: "user",
-        content: packPlanningSnapshotMessage(snapshot, record.objective, readBy, engine.noun),
-      });
-      messages.push({
-        role: "user",
-        content: packRelations(snapshot, record.workflowType, record.mode, context.capabilities, engine.noun),
-      });
-    }
-
-    const statistics = await readSchemaStatistics(context);
-    // Row estimates only for an operations plan, and this is the same decision as the
-    // packing above rather than a second one. Its whole context is identifiers of two
-    // kinds and it is TOLD so twice over; the default rendering names a column beside
-    // every table it has an estimate for, which would make that sentence false in the
-    // message under it and would leak a column name out of a run whose documented
-    // egress is table and index names. What the estimates are here FOR is which table
-    // is worth a reading, and a row count is all that answers it. Found by review on
-    // #411.
-    messages.push({
-      role: "user",
-      content: packSchemaStatistics(snapshot.tables, statistics, operations ? { detail: "rows" } : {}),
-    });
-    grounding = {
-      schemaKnown: true,
-      readBy,
-      // The same defaulting the preface does, and from the same field: a snapshot with
-      // no `readVia` came from the composed path, because that was the only path there
-      // was when it was written.
-      readVia: snapshot.readVia ?? "composed-catalog",
-      statisticsShown: statistics.kind === "read",
-    };
-    // What the closing statement will be checked against, taken from the same reading
-    // the model was shown: a statement validated against an inventory the model never
-    // saw would be checked against a database and blamed on a model.
-    planningInventory = snapshot.tables;
-  };
-
-  /**
-   * Gives this drive the run's schema context, once, before the first turn.
-   *
-   * A run that has captured its inventory once never reads a catalog again: the
-   * inventory is in its ledger, so `reusableSnapshot` answers from the record this
-   * drive has already read and performs no database operation at all. That is what
-   * the fingerprint is for — it is checked against the inventory it summarises, so
-   * reuse is a verification rather than a hope — and it matters most on the path
-   * that pays for a re-read twice: a run resumed after a process death starts every
-   * cost ceiling again (`docs/BACKLOG.md` B6), so three catalog statements out of
-   * twenty would be spent per resume on rows the run already had.
-   *
-   * A run whose catalog cannot be read is told so and continues: the tools are
-   * still there, and a narrowed `inspect_schema` is exactly what an overflowing
-   * catalog needs.
-   *
-   * EVERY workflow reaches here, and that is what #411 changed. `operations` used to
-   * return before any of this on a decision the issue re-opened: an operations
-   * objective is about what the engine reports about ITSELF, so an inventory looked
-   * like dead weight — until workflow inference (#407) began routing objectives here
-   * that a user would expect to be answered against the schema, and until it was
-   * noticed that the engine's own reports are full of schema identifiers. The
-   * exclusion was one early return, and deleting it is the whole change: what remains
-   * workflow-specific is which packing runs, not which path does.
-   *
-   * PLANNING now establishes its context the same way, and that is the one line of
-   * the contract the plan-mode grounding design of 2026-08-15 deliberately changed.
-   * It used to consult `heldSnapshotForConnection` and nothing else (#384), so a plan
-   * run was about a real database only when an AGENT run had read one on the same
-   * connection, in this same process — which is to say: never, after a restart, on a
-   * second replica, or for a user who had not already used the mode this one exists
-   * to be safer than. What did NOT change is the property the mode sells: a plan run
-   * still runs NO statement of the user's, still writes nothing, and the model is
-   * still handed no tools. It reads the catalog, which is what the sidebar does on
-   * every connect.
-   */
-  const establishContext = async (): Promise<void> => {
-    contextEstablished = true;
-
-    if (record.mode !== "agent") {
-      await establishPlanningContext();
-      return;
-    }
-
-    /**
-     * The inventory, as THIS workflow is shown it.
-     *
-     * The operations branch is a packing decision and nothing more: the same whole
-     * snapshot, rendered as names and indexes, with no relations block beside it
-     * (#411). It is also why the operations note is pushed here rather than beside the
-     * capture — the note says what the fenced block under it is for, so the two belong
-     * in one place and cannot come apart.
-     */
-    const show = (snapshot: AgentContextSnapshot): void => {
-      if (operations) {
-        messages.push({ role: "user", content: operationsContextNote(engine.noun) });
-        messages.push({
-          role: "user",
-          content: packOperationsInventory(snapshot, {
-            preface: snapshotHandoverText(snapshot.fingerprint),
-            noun: engine.noun,
-          }),
-        });
-        return;
-      }
-      messages.push({ role: "user", content: packSnapshotMessage(snapshot, record.objective, engine.noun) });
-      messages.push({
-        role: "user",
-        content: packRelations(snapshot, record.workflowType, record.mode, context.capabilities, engine.noun),
-      });
+      // After the ledger, never before it: what a plan run may later be handed is an
+      // inventory that is durably part of some run's own history, not one this process
+      // read and failed to write down.
+      holdSnapshotForConnection(snapshot, connectionIdentity(context.connection));
+      show(snapshot);
     };
 
-    const recorded = reusableSnapshot(record.events, record.connectionId);
-    if (recorded !== null) {
-      // Held on the reuse path too, not only on the capture: a resumed drive in a
-      // fresh process is exactly where the hold is empty, and this is the reading
-      // that refills it from what the ledger already proved.
-      holdSnapshotForConnection(recorded, connectionIdentity(context.connection));
-      show(recorded);
-      return;
-    }
-
-    const capture = await captureContextSnapshot(context);
-    if (capture.kind === "unavailable") {
-      // The capture's own words send a model to `inspect_schema`, which an operations
-      // run does not hold: naming a tool the run has not got is the #350 failure, and
-      // this workflow is the one that reaches engines where the capture always fails.
-      messages.push({
-        role: "user",
-        content: operations ? operationsUngroundedNote(capture.detail, engine.noun) : capture.modelText,
-      });
-      return;
-    }
-    const { snapshot } = capture;
-    await service.recordEvent(runId, {
-      kind: "context-captured",
-      fingerprint: snapshot.fingerprint,
-      tableCount: snapshot.tables.length,
-      snapshot,
-      // As on the planning path: what the engine calls these rows is part of what was
-      // read, so it is written down with the reading rather than guessed at later.
-      noun: engine.noun,
-    });
-    // After the ledger, never before it: what a plan run may later be handed is an
-    // inventory that is durably part of some run's own history, not one this process
-    // read and failed to write down.
-    holdSnapshotForConnection(snapshot, connectionIdentity(context.connection));
-    show(snapshot);
-  };
-
-  let turns = 0;
-  let text = "";
-  /*
+    let turns = 0;
+    let text = "";
+    /*
     The three notice flags below are one-shots per DRIVE, not per run, and the
     distinction is worth stating where they are declared: this function is also what
     RESUMES a run a dead process left running (`service.resume`, at its head), so a
@@ -2037,60 +2043,60 @@ export async function runInvestigation(
     already said. Nothing durable bounds them, because a delivery writes no ledger entry
     — `docs/BACKLOG.md` B51 records both halves as one item, since recording delivery is
     what would make "once" mean once.
-  */
-  /** The reserve notice is a one-shot: a drive tells the run once that it is out of room. */
-  let reserveAnnounced = false;
-  /** Whether a tool this run HOLDS has been called; see `remindToReport`. */
-  let anyToolCalled = false;
-  /** The report reminder is a one-shot per drive too; see `AGENT_REPORT_REMINDER_NOTICE`. */
-  let reportReminded = false;
-  /** The present-before-report notice, once per drive; see `AGENT_PRESENT_BEFORE_REPORT_NOTICE`. */
-  let presentReminded = false;
-  /**
-   * Whether `present_answer` has been CALLED, which is not the same as answered: a
-   * refused call writes no event, so the ledger cannot tell the two apart and this is
-   * the only place that can.
-   */
-  let answerAttempted = false;
+    */
+    /** The reserve notice is a one-shot: a drive tells the run once that it is out of room. */
+    let reserveAnnounced = false;
+    /** Whether a tool this run HOLDS has been called; see `remindToReport`. */
+    let anyToolCalled = false;
+    /** The report reminder is a one-shot per drive too; see `AGENT_REPORT_REMINDER_NOTICE`. */
+    let reportReminded = false;
+    /** The present-before-report notice, once per drive; see `AGENT_PRESENT_BEFORE_REPORT_NOTICE`. */
+    let presentReminded = false;
+    /**
+     * Whether `present_answer` has been CALLED, which is not the same as answered: a
+     * refused call writes no event, so the ledger cannot tell the two apart and this is
+     * the only place that can.
+     */
+    let answerAttempted = false;
 
-  /**
-   * Tells the run, once, that it has come within the reserve of a ceiling.
-   *
-   * A message and not a rule change, which is what makes it safe: it spends no
-   * statement, consults no deadline admission and takes no turn of its own — it rides
-   * on the turn that was about to be taken anyway — and it does not touch the policy
-   * version or the verifier. A planning run is never told: it has no `compose_report`
-   * to call, so this would be an instruction the mode cannot follow (#350).
-   */
-  const announceReserve = (remainingMs: number): void => {
-    if (reserveAnnounced || record.mode !== "agent") return;
-    if (maxTurns - turns > AGENT_REPORT_RESERVE_TURNS && remainingMs > AGENT_REPORT_RESERVE_MS) return;
-    reserveAnnounced = true;
-    messages.push({ role: "user", content: AGENT_REPORT_RESERVE_NOTICE });
-  };
+    /**
+     * Tells the run, once, that it has come within the reserve of a ceiling.
+     *
+     * A message and not a rule change, which is what makes it safe: it spends no
+     * statement, consults no deadline admission and takes no turn of its own — it rides
+     * on the turn that was about to be taken anyway — and it does not touch the policy
+     * version or the verifier. A planning run is never told: it has no `compose_report`
+     * to call, so this would be an instruction the mode cannot follow (#350).
+     */
+    const announceReserve = (remainingMs: number): void => {
+      if (reserveAnnounced || record.mode !== "agent") return;
+      if (maxTurns - turns > AGENT_REPORT_RESERVE_TURNS && remainingMs > AGENT_REPORT_RESERVE_MS) return;
+      reserveAnnounced = true;
+      messages.push({ role: "user", content: AGENT_REPORT_RESERVE_NOTICE });
+    };
 
-  /**
-   * Tells the run, once, that it narrated where it should have reported, and says
-   * whether it did — which is the caller's "take the turn again".
-   *
-   * The three bounds `AGENT_REPORT_REMINDER_NOTICE` documents are applied here and
-   * nowhere else. `anyToolCalled` carries the first two together: it is set only for a
-   * tool THIS RUN HOLDS, so a name the model invented reached nothing and a planning
-   * run — handed no tool set at all — can never set it. The ceilings are read rather
-   * than left to be hit, because this is the region the reserve notice has already
-   * pushed the model into: two turns from the end, told to wrap up, wrapping up in
-   * prose.
-   */
-  const remindToReport = (assistant: readonly ModelMessage[]): boolean => {
-    if (reportReminded || !anyToolCalled) return false;
-    if (turns >= maxTurns || resources.deadline.remainingMs() <= 0) return false;
-    reportReminded = true;
-    messages.push(...assistant);
-    messages.push({ role: "user", content: AGENT_REPORT_REMINDER_NOTICE });
-    return true;
-  };
+    /**
+     * Tells the run, once, that it narrated where it should have reported, and says
+     * whether it did — which is the caller's "take the turn again".
+     *
+     * The three bounds `AGENT_REPORT_REMINDER_NOTICE` documents are applied here and
+     * nowhere else. `anyToolCalled` carries the first two together: it is set only for a
+     * tool THIS RUN HOLDS, so a name the model invented reached nothing and a planning
+     * run — handed no tool set at all — can never set it. The ceilings are read rather
+     * than left to be hit, because this is the region the reserve notice has already
+     * pushed the model into: two turns from the end, told to wrap up, wrapping up in
+     * prose.
+     */
+    const remindToReport = (assistant: readonly ModelMessage[]): boolean => {
+      if (reportReminded || !anyToolCalled) return false;
+      if (turns >= maxTurns || resources.deadline.remainingMs() <= 0) return false;
+      reportReminded = true;
+      messages.push(...assistant);
+      messages.push({ role: "user", content: AGENT_REPORT_REMINDER_NOTICE });
+      return true;
+    };
 
-  /*
+    /*
     Every terminal path goes through here, which is why the ledger writes belong here
     and not at each exit: an exit added later cannot forget them.
 
@@ -2098,183 +2104,186 @@ export async function runInvestigation(
     them — a run whose last entry is `run-finished` is finished, and nothing arrives
     after it. It is skipped when empty rather than written blank, because an empty
     entry would record that the model spoke.
-  */
-  /**
-   * Records the statement a PLAN run drafted, when it drafted one (item 5 of the
-   * plan-mode SQL-generator design of 2026-08-15; `docs/BACKLOG.md` B44).
-   *
-   * Here rather than in the rail, because the ledger is the only thing that outlives
-   * the drive: #389's control reads SQL out of a markdown fence in the BROWSER, which
-   * works when the model fences its SQL, offers nothing when it does not, and leaves
-   * the run's own record with no statement in it to check, cite or verify.
-   *
-   * Three runs deliberately record nothing:
-   *
-   *  - an AGENT run, whose statements are drafted through a tool and already carry a
-   *    `stepId` tying each one to the call that ran it. Reading its closing prose
-   *    again would record a statement it never asked to run.
-   *  - an OPERATIONS plan, the one workflow whose deliverable is prose by decision. Its
-   *    rules WELCOME a fenced block where the engine expresses the reading as a statement
-   *    (`planningProseStatementRule`), and that changes nothing here: what is welcome is
-   *    not what was asked for, so recording it as this run's drafted statement would file
-   *    a deliverable the contract never named and put it in front of the plan verdict,
-   *    which is prose-judged on purpose. The user still gets the block — #389's fence
-   *    reading in the browser is what offers "Apply to editor", and it is withheld only
-   *    on a closing entry this layer read a statement out of.
-   *  - a run that refused, or that fenced nothing. A refusal is an outcome the verdict
-   *    reads for itself; it is not a statement, and recording one would be this layer
-   *    inventing a deliverable the model declined to write.
-   *
-   * The validation attached here is narrow on purpose and the event's own docblock
-   * says how narrow: a statement checked against the inventory is not a statement that
-   * will run, because the inventory records what exists and not what the user's role
-   * may select from.
-   */
-  const recordPlanStatement = async (closing: string): Promise<void> => {
-    if (record.mode === "agent" || record.workflowType === "operations") return;
-    // The dialect goes IN as well as onto the event (#396 review): the reader needs it
-    // to reject a block the model tagged for another engine, because stamping this
-    // connection's type onto a fence the model labelled `mysql` would file the run as
-    // having drafted for a database it explicitly did not write for.
-    const draft = readPlanStatement(closing, context.connection.type);
-    if (draft.kind !== "statement") return;
-    await service.recordEvent(runId, {
-      kind: "plan-statement-drafted",
-      sql: draft.sql,
-      // The engine this drive was given, not one read off the record: a statement is
-      // written for the connection it would actually be run against.
-      dialect: context.connection.type,
-      // The engine's own query language goes in beside the inventory (#414): both
-      // halves of this validation are SQL readers, and on an engine that speaks no SQL
-      // both were wrong at once — the guard marking every correct draft as not
-      // classified as a read, and the identifier check affirming an inventory it never
-      // consulted. It declines to judge instead, and the rail says which check could
-      // not reach this draft rather than what it found.
-      ...validatePlanStatement(draft.sql, planningInventory, context.capabilities.queryLanguage),
-    });
-  };
+    */
+    /**
+     * Records the statement a PLAN run drafted, when it drafted one (item 5 of the
+     * plan-mode SQL-generator design of 2026-08-15; `docs/BACKLOG.md` B44).
+     *
+     * Here rather than in the rail, because the ledger is the only thing that outlives
+     * the drive: #389's control reads SQL out of a markdown fence in the BROWSER, which
+     * works when the model fences its SQL, offers nothing when it does not, and leaves
+     * the run's own record with no statement in it to check, cite or verify.
+     *
+     * Three runs deliberately record nothing:
+     *
+     *  - an AGENT run, whose statements are drafted through a tool and already carry a
+     *    `stepId` tying each one to the call that ran it. Reading its closing prose
+     *    again would record a statement it never asked to run.
+     *  - an OPERATIONS plan, the one workflow whose deliverable is prose by decision. Its
+     *    rules WELCOME a fenced block where the engine expresses the reading as a statement
+     *    (`planningProseStatementRule`), and that changes nothing here: what is welcome is
+     *    not what was asked for, so recording it as this run's drafted statement would file
+     *    a deliverable the contract never named and put it in front of the plan verdict,
+     *    which is prose-judged on purpose. The user still gets the block — #389's fence
+     *    reading in the browser is what offers "Apply to editor", and it is withheld only
+     *    on a closing entry this layer read a statement out of.
+     *  - a run that refused, or that fenced nothing. A refusal is an outcome the verdict
+     *    reads for itself; it is not a statement, and recording one would be this layer
+     *    inventing a deliverable the model declined to write.
+     *
+     * The validation attached here is narrow on purpose and the event's own docblock
+     * says how narrow: a statement checked against the inventory is not a statement that
+     * will run, because the inventory records what exists and not what the user's role
+     * may select from.
+     */
+    const recordPlanStatement = async (closing: string): Promise<void> => {
+      if (record.mode === "agent" || record.workflowType === "operations") return;
+      // The dialect goes IN as well as onto the event (#396 review): the reader needs it
+      // to reject a block the model tagged for another engine, because stamping this
+      // connection's type onto a fence the model labelled `mysql` would file the run as
+      // having drafted for a database it explicitly did not write for.
+      const draft = readPlanStatement(closing, context.connection.type);
+      if (draft.kind !== "statement") return;
+      await service.recordEvent(runId, {
+        kind: "plan-statement-drafted",
+        sql: draft.sql,
+        // The engine this drive was given, not one read off the record: a statement is
+        // written for the connection it would actually be run against.
+        dialect: context.connection.type,
+        // The engine's own query language goes in beside the inventory (#414): both
+        // halves of this validation are SQL readers, and on an engine that speaks no SQL
+        // both were wrong at once — the guard marking every correct draft as not
+        // classified as a read, and the identifier check affirming an inventory it never
+        // consulted. It declines to judge instead, and the rail says which check could
+        // not reach this draft rather than what it found.
+        ...validatePlanStatement(draft.sql, planningInventory, context.capabilities.queryLanguage),
+      });
+    };
 
-  const conclude = async (
-    status: AgentRunTerminalStatus,
-    stopReason: AgentRunStopReason,
-  ): Promise<AgentInvestigationResult> => {
-    if (text.length > 0) {
-      await service.recordEvent(runId, { kind: "closing-statement", text });
-      // After the prose, in the order a reader folds them: the statement is a fact
-      // ABOUT that prose, and an entry claiming a draft the ledger has no output for
-      // would read as a statement arriving from nowhere.
-      await recordPlanStatement(text);
-    }
-    await service.finish(runId, status, { stopReason });
-    return { runId, status, stopReason, turns, text };
-  };
+    const conclude = async (
+      status: AgentRunTerminalStatus,
+      stopReason: AgentRunStopReason,
+    ): Promise<AgentInvestigationResult> => {
+      if (text.length > 0) {
+        await service.recordEvent(runId, { kind: "closing-statement", text });
+        // After the prose, in the order a reader folds them: the statement is a fact
+        // ABOUT that prose, and an entry claiming a draft the ledger has no output for
+        // would read as a statement arriving from nowhere.
+        await recordPlanStatement(text);
+      }
+      await service.finish(runId, status, { stopReason });
+      return { runId, status, stopReason, turns, text };
+    };
 
-  /** One turn: the model's move and everything it asked for. `null` = keep going. */
-  const driveTurn = async (remainingMs: number): Promise<AgentInvestigationResult | null> => {
-    // Inside the drive rather than before the loop, so a run that is already
-    // cancelled or already out of time ends without reading a catalog first.
-    if (!contextEstablished) await establishContext();
-    // After the context, so the inventory a first turn is given still arrives before
-    // the sentence telling it to finish, and before the turn is counted, because the
-    // notice rides on this turn rather than costing one.
-    announceReserve(remainingMs);
-    turns += 1;
-    // Whichever bound is smaller applies, and which one it was decides what the user
-    // is told: a call that never returned is not a run that used its time.
-    const turnBudgetMs = Math.min(remainingMs, turnTimeoutMs);
-    // Built after the context, because in planning mode the rules depend on whether
-    // there WAS one: a run told to plan against an inventory it was not given is the
-    // same defect as a run given one and never told to use it (#350).
-    const turn = await takeTurn(
-      model,
-      // The engine is the fence tag a plan run is told to write, so the prompt reads
-      // it from the connection this drive was given rather than from the record: the
-      // resources are what a statement would actually be run against.
-      systemPrompt(record, grounding, engine),
-      messages,
-      tools,
-      turnBudgetMs,
-    );
-    text = turn.text;
-    if (turn.aborted) return conclude("failed", turnBudgetMs < remainingMs ? "model-timeout" : "deadline-exceeded");
-    if (turn.toolCalls.length === 0) {
-      // A run that used its tools and then narrated is one call short of a report;
-      // one that established nothing has nothing to be reminded about.
-      if (remindToReport(turn.assistantMessages)) return null;
-      return conclude("succeeded", "model-stopped");
-    }
+    /** One turn: the model's move and everything it asked for. `null` = keep going. */
+    const driveTurn = async (remainingMs: number): Promise<AgentInvestigationResult | null> => {
+      // Inside the drive rather than before the loop, so a run that is already
+      // cancelled or already out of time ends without reading a catalog first.
+      if (!contextEstablished) await establishContext();
+      // After the context, so the inventory a first turn is given still arrives before
+      // the sentence telling it to finish, and before the turn is counted, because the
+      // notice rides on this turn rather than costing one.
+      announceReserve(remainingMs);
+      turns += 1;
+      // Whichever bound is smaller applies, and which one it was decides what the user
+      // is told: a call that never returned is not a run that used its time.
+      const turnBudgetMs = Math.min(remainingMs, turnTimeoutMs);
+      // Built after the context, because in planning mode the rules depend on whether
+      // there WAS one: a run told to plan against an inventory it was not given is the
+      // same defect as a run given one and never told to use it (#350).
+      const turn = await takeTurn(
+        model,
+        // The engine is the fence tag a plan run is told to write, so the prompt reads
+        // it from the connection this drive was given rather than from the record: the
+        // resources are what a statement would actually be run against.
+        systemPrompt(record, grounding, engine),
+        messages,
+        tools,
+        turnBudgetMs,
+      );
+      text = turn.text;
+      if (turn.aborted) return conclude("failed", turnBudgetMs < remainingMs ? "model-timeout" : "deadline-exceeded");
+      if (turn.toolCalls.length === 0) {
+        // A run that used its tools and then narrated is one call short of a report;
+        // one that established nothing has nothing to be reminded about.
+        if (remindToReport(turn.assistantMessages)) return null;
+        return conclude("succeeded", "model-stopped");
+      }
 
-    messages.push(...turn.assistantMessages);
-    for (const call of turn.toolCalls) {
-      // A tool this run HOLDS, read from the set the SDK was actually given. A name
-      // the model invented reached nothing, and planning mode is handed no set at all
-      // — so a run reminded on either would be told to call `compose_report`, which is
-      // a tool it has not got (#350).
-      if (tools?.[call.toolName] !== undefined) anyToolCalled = true;
-      if (call.toolName === "present_answer") answerAttempted = true;
-      // A run whose workflow answers by presenting, which read something and is about
-      // to report without presenting it, is one call short of an answer. Checked here
-      // and not after the call, because `compose_report` ends the run.
-      if (
-        call.toolName === "compose_report" &&
-        !presentReminded &&
-        !answerAttempted &&
-        AGENT_WORKFLOW_PRESENTS_ANSWER[record.workflowType]
-      ) {
-        const { record: sofar } = await service.resume(context.runId);
-        // The reading `present_answer` will ACCEPT, joined the way that tool joins it.
-        // The operation id alone is not the question: `inspect_schema` is a catalog read
-        // under that very id, and its statement is the SERVER's — so `statementBehind`
-        // finds none and the tool refuses every artifact such a run holds. A run told to
-        // present one would be told to do the impossible, which is the condition this
-        // check exists to be.
-        const drafted = new Set(
-          sofar.events.flatMap((event) => (event.kind === "statement-drafted" ? [event.stepId] : [])),
-        );
-        const hasReading = sofar.events.some(
-          (event) =>
-            event.kind === "tool-completed" &&
-            event.artifact.operationId === "sql.query.read" &&
-            drafted.has(event.stepId),
-        );
-        const presented = sofar.events.some((event) => event.kind === "answer-composed");
-        if (hasReading && !presented) {
-          presentReminded = true;
-          messages.push(toolResultMessage(call, AGENT_PRESENT_BEFORE_REPORT_NOTICE));
-          continue;
+      messages.push(...turn.assistantMessages);
+      for (const call of turn.toolCalls) {
+        // A tool this run HOLDS, read from the set the SDK was actually given. A name
+        // the model invented reached nothing, and planning mode is handed no set at all
+        // — so a run reminded on either would be told to call `compose_report`, which is
+        // a tool it has not got (#350).
+        if (tools?.[call.toolName] !== undefined) anyToolCalled = true;
+        if (call.toolName === "present_answer") answerAttempted = true;
+        // A run whose workflow answers by presenting, which read something and is about
+        // to report without presenting it, is one call short of an answer. Checked here
+        // and not after the call, because `compose_report` ends the run.
+        if (
+          call.toolName === "compose_report" &&
+          !presentReminded &&
+          !answerAttempted &&
+          AGENT_WORKFLOW_PRESENTS_ANSWER[record.workflowType]
+        ) {
+          const { record: sofar } = await service.resume(context.runId);
+          // The reading `present_answer` will ACCEPT, joined the way that tool joins it.
+          // The operation id alone is not the question: `inspect_schema` is a catalog read
+          // under that very id, and its statement is the SERVER's — so `statementBehind`
+          // finds none and the tool refuses every artifact such a run holds. A run told to
+          // present one would be told to do the impossible, which is the condition this
+          // check exists to be.
+          const drafted = new Set(
+            sofar.events.flatMap((event) => (event.kind === "statement-drafted" ? [event.stepId] : [])),
+          );
+          const hasReading = sofar.events.some(
+            (event) =>
+              event.kind === "tool-completed" &&
+              event.artifact.operationId === "sql.query.read" &&
+              drafted.has(event.stepId),
+          );
+          const presented = sofar.events.some((event) => event.kind === "answer-composed");
+          if (hasReading && !presented) {
+            presentReminded = true;
+            messages.push(toolResultMessage(call, AGENT_PRESENT_BEFORE_REPORT_NOTICE));
+            continue;
+          }
         }
+        const outcome = await handleCall({ service, context, record, call, known, notAttempted });
+        if (outcome.kind === "cancelled") {
+          // `runStep` already ended the run at its checkpoint; finishing again would
+          // refuse, and rightly.
+          return { runId, status: "cancelled", stopReason: "cancelled", turns, text };
+        }
+        if (outcome.kind === "reported") return conclude("succeeded", "report-composed");
+        messages.push(toolResultMessage(call, outcome.text));
       }
-      const outcome = await handleCall({ service, context, record, call, known, notAttempted });
-      if (outcome.kind === "cancelled") {
-        // `runStep` already ended the run at its checkpoint; finishing again would
-        // refuse, and rightly.
-        return { runId, status: "cancelled", stopReason: "cancelled", turns, text };
-      }
-      if (outcome.kind === "reported") return conclude("succeeded", "report-composed");
-      messages.push(toolResultMessage(call, outcome.text));
-    }
-    return null;
-  };
+      return null;
+    };
 
-  // The ways the loop itself can stop are together, and a turn that decides nothing
-  // simply leaves `result` null. Written as a condition rather than as `for (;;)`
-  // with returns so the loop has an end a reader — and a coverage report — can see.
-  //
-  // The cancellation check belongs here and not only inside `runStep`: a planning
-  // run reaches no tool, so `runStep`'s checkpoint is never called and a planning
-  // run would otherwise have no way to be stopped at all. A stop that arrives while
-  // the LAST turn is in flight still does not rewrite success — T7a pinned that, and
-  // the run genuinely finished its work — so this is read between turns.
-  let result: AgentInvestigationResult | null = null;
-  while (result === null) {
-    const remainingMs = resources.deadline.remainingMs();
-    if ((await service.status(runId))?.cancellationRequested === true) {
-      result = await conclude("cancelled", "cancelled");
-    } else if (remainingMs <= 0) result = await conclude("failed", "deadline-exceeded");
-    else if (turns >= maxTurns) result = await conclude("failed", "turn-limit");
-    else result = await driveTurn(remainingMs);
+    // The ways the loop itself can stop are together, and a turn that decides nothing
+    // simply leaves `result` null. Written as a condition rather than as `for (;;)`
+    // with returns so the loop has an end a reader — and a coverage report — can see.
+    //
+    // The cancellation check belongs here and not only inside `runStep`: a planning
+    // run reaches no tool, so `runStep`'s checkpoint is never called and a planning
+    // run would otherwise have no way to be stopped at all. A stop that arrives while
+    // the LAST turn is in flight still does not rewrite success — T7a pinned that, and
+    // the run genuinely finished its work — so this is read between turns.
+    let result: AgentInvestigationResult | null = null;
+    while (result === null) {
+      const remainingMs = resources.deadline.remainingMs();
+      if ((await service.status(runId))?.cancellationRequested === true) {
+        result = await conclude("cancelled", "cancelled");
+      } else if (remainingMs <= 0) result = await conclude("failed", "deadline-exceeded");
+      else if (turns >= maxTurns) result = await conclude("failed", "turn-limit");
+      else result = await driveTurn(remainingMs);
+    }
+    return result;
+  } finally {
+    service.releaseDrive(runId);
   }
-  return result;
 }
 
 async function handleCall(input: {

@@ -196,7 +196,13 @@ export async function driveAgentRun(runId: string): Promise<AgentInvestigationRe
       },
     });
   } catch (error) {
-    await recordDriveFailure(service, runId, error);
+    // A drive refused because another already owns the run is not a failure OF the
+    // run: it is healthy and in flight. Recording `failed` here would end the very
+    // run the first drive is still carrying, so the refusal is left to the caller
+    // (the drive route answers 409) and nothing is written to the ledger.
+    if (!(error instanceof AgentRunServiceError && error.reasonCode === "RUN_ALREADY_DRIVEN")) {
+      await recordDriveFailure(service, runId, error);
+    }
     throw error;
   }
 }

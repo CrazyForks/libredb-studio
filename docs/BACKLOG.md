@@ -1607,20 +1607,39 @@ consequences follow that a single-writer run never meets and a second writer wou
   *per run* — the milestone's "no tool execution performed twice" criterion is about a restart, where
   the dead process is gone by construction, and that case is genuinely covered.
 
-Not defended in code because every available defence is worse than the constraint: a lock file is
-single-instance only (which the Postgres backend exists to escape), and a lease in the ledger is a
-distributed-lock design with its own expiry semantics. The honest boundary is that single ownership of
-a running workflow belongs to the layer above rather than being re-implemented below it — and how
-strong that guarantee is depends on which backend is configured, which is the part worth stating
-plainly. On the zero-config local world it holds by construction: the queue awaits each delivery
-before attempting the next, so retries are sequential. On the opt-in Postgres backend a
+Not defended at the storage layer because every available cross-process defence is worse than the
+constraint: a lock file is single-instance only (which the Postgres backend exists to escape), and a
+lease in the ledger is a distributed-lock design with its own expiry semantics. The honest boundary is
+that single ownership of a running workflow belongs to the layer above rather than being re-implemented
+below it — and how strong that guarantee is depends on which backend is configured, which is the part
+worth stating plainly. On the zero-config local world it holds by construction: the queue awaits each
+delivery before attempting the next, so retries are sequential. On the opt-in Postgres backend a
 visibility-timeout redelivery can overlap a handler that is still alive, and that is precisely where
 the second bullet above would bite.
+
+Both of those readings describe a queue that delivers agent drives, and **nothing delivers one today**
+— which is B9, and the two entries have to be read together because B5's severity is a function of
+B9's state. `mintAgentDriveToken` has no production caller, there is no `"use workflow"` function and
+no queue producer, so a run is driven exactly once, in the process that opened it
+(`src/app/api/agent/runs/route.ts`). A second drive of one run is therefore not reachable through the
+product on EITHER backend right now: producing one takes a caller that mints its own drive credential
+from `JWT_SECRET`, which is how the fence below was exercised against a live run rather than only in
+a test. Closing B9 is what makes this live, and in that order — a producer without the fence is a
+redelivery that runs the user's statement a second time.
+
+The process-local half of the fence now exists (2026-08): `AgentRunService.claimDrive`/`releaseDrive`
+(`src/lib/agent/run-service.ts`) refuse a second concurrent drive of one run inside a single process,
+and `AgentRunStore.append` refuses an append once the run's stream has been closed
+(`RUN_ALREADY_CLOSED`), turning the silent-loss mode of the second consequence into a loud refusal.
+What remains open is the cross-process half: two replicas driving one run would still both pass the
+read-then-append check, because the durable backend offers no compare-and-append.
 
 Done when either the run ledger can append conditionally on the stream's tail index (which is what
 would make both races impossible at the storage layer), or the single-ownership guarantee the runtime
 provides is asserted by a test rather than assumed by prose — whichever the durable backend can
-actually support.
+actually support. The process-local claim is asserted in
+`tests/unit/lib/agent/run-service.test.ts`, and the append-after-close guard in
+`tests/unit/lib/agent/run-store.test.ts`.
 
 ### B6. Every agent cost ceiling is per-drive, so N resumes cost up to N times one drive's budget
 
@@ -1716,6 +1735,13 @@ the run as `failed` with a classified reason (`docs/AGENT.md`, "A drive that die
 so an unconfigured model no longer leaves a run at `queued` forever. This entry is the case where the
 process is GONE — nothing threw, nothing can record, and the run stays `running` until something asks
 for it. Recording a failure cannot close that; only a producer can.
+
+Order matters against B5, which is why each entry now names the other: the producer this asks for is
+also what first makes a SECOND drive of one run possible, and a redelivery landing on a drive that is
+still running is a second execution against the user's database. B5's process-local fence
+(`claimDrive`/`releaseDrive`) is already in place, so the single-replica case is covered before the
+producer arrives; the cross-process case is not, and a producer plus more than one replica is the
+combination B5 still has no answer for.
 
 Adopting the SDK's Next.js integration is what would supply the producer, and it was refused
 deliberately rather than overlooked. Its documented setup asks for `/.well-known/workflow/*` to be

@@ -203,6 +203,27 @@ describe("driveAgentRun", () => {
     expect(investigationCalls[1].resources.tracker).toBe(investigationCalls[0].resources.tracker);
     expect(investigationCalls[1].resources.artifacts).toBe(investigationCalls[0].resources.artifacts);
   });
+
+  test("a refused second drive does not end the run the first drive is carrying", async () => {
+    // `runInvestigation` refuses a second concurrent drive of one run by throwing
+    // `RUN_ALREADY_DRIVEN`. That refusal is about the DRIVE, not the run: the run is
+    // healthy and the first drive is still carrying it, so the composition root must
+    // not record `failed` on it. Recording would end the very run the first drive is
+    // writing to, after which every later append would fail as `RUN_ALREADY_CLOSED`.
+    await openRun("arun_alreadydriven");
+    mockRunInvestigation.mockImplementationOnce(async () => {
+      throw new AgentRunServiceError(
+        "RUN_ALREADY_DRIVEN",
+        'agent run "arun_alreadydriven" is already being driven in this process',
+      );
+    });
+
+    await expect(driveAgentRun("arun_alreadydriven")).rejects.toThrow(AgentRunServiceError);
+
+    const report = await (await getAgentRunService()).status("arun_alreadydriven");
+    expect(report?.record.status).toBe("queued");
+    expect(report?.record.events.some((event) => event.kind === "run-finished")).toBe(false);
+  });
 });
 
 /**
