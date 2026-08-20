@@ -277,23 +277,46 @@ execs directly when not running as root.
 {{- end }}
 
 {{/*
-Whether extraEnv sets HOSTNAME - the container's bind address. An explicit env
-entry beats the same key delivered by the ConfigMap through envFrom, so this is
-the only place in these values that can move the pod off the ConfigMap's
-IPv4-only 0.0.0.0. Only the key is read, never the value: "::" is the
-dual-stack answer, but an operator who set HOSTNAME at all chose the bind
-address deliberately and does not need to be told about it again.
+The bind address this release pins the container to, or empty when it leaves
+the choice to the image. An explicit env entry beats the same key delivered by
+the ConfigMap through envFrom, so an extraEnv HOSTNAME wins over
+config.bindAddress; both are read here, value included, because the value is
+now what matters - empty means "the image resolves it and prefers a verified
+dual-stack ::".
 
-Same blind spot as agentPossible: a HOSTNAME delivered through extraEnvFrom is
-not visible here, so such a release still sees the NOTES.txt warning. That is
-the safe direction - an unnecessary note rather than a silent IPv6 address that
-refuses every connection.
+Blind spot, same as agentPossible: a HOSTNAME whose value the chart cannot read
+at template time is invisible here, so such a release is treated as unpinned and
+sees no warning. Two shapes reach that: extraEnvFrom, and an extraEnv entry using
+valueFrom (a secretKeyRef or configMapKeyRef - legal, since extraEnv items are
+free-form EnvVar objects). Neither is new; the key-presence check this replaced
+stayed silent on them too. It is left silent rather than warned on because the
+value may perfectly well be "::", and a warning aimed at a deliberate IPv4 pin
+should not fire at someone who supplied the right answer through a secret. An
+operator who does pin IPv4 that way keeps the diagnosis: the container prints the
+address it bound and why.
 */}}
-{{- define "libredb-studio.extraEnvHostnameSet" -}}
+{{- define "libredb-studio.effectiveBindAddress" -}}
+{{- $bind := .Values.config.bindAddress | default "" | toString | trim }}
 {{- range .Values.extraEnv }}
 {{- if eq (.name | default "" | toString) "HOSTNAME" }}
-{{- true }}
+{{- $bind = .value | default "" | toString | trim }}
 {{- end }}
+{{- end }}
+{{- $bind }}
+{{- end }}
+
+{{/*
+Whether this release pins the container to an IPv4-only listener. True when the
+effective bind address is set and carries no ":" - "0.0.0.0", "127.0.0.1" and
+any other IPv4 literal - which is the one combination a dual-stack Service must
+not be paired with. "::" and "::1" are IPv6 forms and are left alone, and empty
+is the image-resolved default, which is dual-stack wherever the namespace
+allows it.
+*/}}
+{{- define "libredb-studio.bindPinnedToIPv4" -}}
+{{- $bind := include "libredb-studio.effectiveBindAddress" . }}
+{{- if and $bind (not (contains ":" $bind)) }}
+{{- true }}
 {{- end }}
 {{- end }}
 
@@ -304,10 +327,12 @@ when it is the only family, so templates/service.yaml's guard never sees it).
 
 Kubernetes populates the IPv6 EndpointSlice from the pod's own IPv6 address
 without ever checking what the process bound, so this is the condition under
-which the ConfigMap's IPv4-only HOSTNAME turns into a silent misconfiguration:
-a green install whose IPv6 address refuses every connection, on a pod that -
-probed only on its primary IP - stays Ready. NOTES.txt warns whenever this is
-requested without a HOSTNAME override.
+which an IPv4-only listener turns into a silent misconfiguration: a green
+install whose IPv6 address refuses every connection, on a pod that - probed
+only on its primary IP - stays Ready. Since chart 0.1.42 the container resolves
+its own address and prefers a verified dual-stack "::", so this can only happen
+when the release pins IPv4 explicitly; NOTES.txt warns about exactly that
+pairing.
 */}}
 {{- define "libredb-studio.serviceWantsIPv6" -}}
 {{- if or (has .Values.service.ipFamilyPolicy (list "PreferDualStack" "RequireDualStack")) (has "IPv6" (default (list) .Values.service.ipFamilies)) }}
