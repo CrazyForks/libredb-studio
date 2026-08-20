@@ -16,7 +16,7 @@ interface WireCompatibilityHintProps {
  * know that MySQL is the right button.
  *
  * Caveats are ANNOUNCED here, not listed. Every verified engine diverges from its
- * driver somewhere in the introspection surface, and printing sixteen caveat lines
+ * driver somewhere in the introspection surface, and printing every caveat line
  * would turn a hint into a wall; the per-engine detail lives in the docs
  * compatibility table, which is scannable and has room for it. What the dialog
  * must not do is publish a bare name and imply parity we never measured - hence
