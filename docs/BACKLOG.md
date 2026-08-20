@@ -273,6 +273,76 @@ number, not a missing one.
 Done when a per-index size on Vitess reads what `INNODB_INDEXES` holds for that index, or the panel
 reports the size as unavailable rather than 0, and this entry is deleted.
 
+### D7. Three providers answer the performance panel with a fabricated cache hit ratio
+
+`getPerformanceMetrics` has a `catch` in the MySQL provider that returns `cacheHitRatio: 99`
+(`src/lib/db/providers/sql/mysql.ts:851-857`, comment "Fallback if performance_schema is not
+available"), and the MongoDB provider has the same literal in the same position
+(`document/mongodb.ts:851-858`, which at least logs the error first). The embedded provider is the
+third and mildest case: `embedded/libredb.ts:526` returns `cacheHitRatio: 100` unconditionally. In
+every one of the three the number reaches the panel indistinguishable from a measured one.
+
+Measured on 2026-08-20 against a live OceanBase Community Edition 4.4.2.1 through the shipped `mysql`
+provider: the tenant has no `performance_schema` database at all (`ERROR 1049 Unknown database
+'performance_schema'`), so that `catch` is not an edge case there - it is the only path, and the
+panel reports **99 percent cache hit, 0 queries per second, 0 buffer pool, 0 deadlocks** on every
+refresh, forever. A reader has nothing to distinguish it from a healthy measurement.
+
+This is the failure class #424 exists to refuse, stated in that issue as "a missing panel is honest; a
+populated wrong one is not", and it is the reason Citus and TimescaleDB are recorded as problems
+despite answering every surface. The same argument applies to our own fallback, and it is worse here
+because the engine is not the author of the number - we are.
+
+Done when a provider that cannot measure the cache hit ratio reports it as unavailable rather than as
+a figure, on all three sites, and this entry is deleted.
+
+### D8. The MySQL provider sends every statement through the prepared protocol, and two registered engines lose panels to it
+
+Every read in `src/lib/db/providers/sql/mysql.ts` goes through mysql2's `conn.execute` - the binary
+PREPARED statement protocol - and never `conn.query`, the text protocol. There is no site that
+chooses: `getHealth` at line 638, `getOverview` at 769-798, `getPerformanceMetrics` at 825-841, the
+maintenance statement at 739 and the editor's own query path at 440 all call `execute`, including for
+statements that carry no parameters at all.
+
+Measured on 2026-08-20 against a live SingleStore 9.1.1
+(`ghcr.io/singlestore-labs/singlestoredb-dev:0.2.82`) through the shipped `mysql` provider, both ways
+on the same connection:
+
+| Statement | `conn.execute` | `conn.query` |
+|---|---|---|
+| `SHOW STATUS LIKE 'Uptime'` | fails | succeeds |
+| `SHOW VARIABLES LIKE 'max_connections'` | fails | succeeds |
+| `EXPLAIN FORMAT=JSON <select>` | fails | succeeds |
+| `EXPLAIN <select>` | fails | succeeds |
+| `OPTIMIZE TABLE orders` | fails | succeeds |
+| `CHECK TABLE orders` | fails | succeeds |
+| `ANALYZE TABLE orders` | succeeds | succeeds |
+
+Every failure is the same engine message, `This command is not supported in the prepared statement
+protocol yet`. The last row is the tell: `ANALYZE TABLE` is the one maintenance action that works on
+SingleStore today, and it is also the one statement in that list the prepared protocol accepts.
+
+The user-visible cost on SingleStore is **five of its six defects**: Test Connection, health, the
+overview and the monitoring dashboard are all unavailable, and so is the Explain panel, whose
+statement `src/lib/explain/mysql-json.ts:9` builds as `EXPLAIN FORMAT=JSON` and then runs down the
+same `execute` path. Two of three maintenance actions go with them.
+
+**This is not SingleStore-only, which is what makes it worth fixing.** The already-registered
+StarRocks row in `docs/providers/README.md` records its overview and health failures as being on the
+prepared-statement protocol - the same cause, met on a different engine in an earlier probe run and
+written up there as that engine's own quirk. So one change - routing parameterless `SHOW`, `EXPLAIN`, `OPTIMIZE`
+and `CHECK` statements through the text protocol - would touch two registered engines at once.
+
+**The recovery is plausible and unimplemented, and the difference matters.** What the probe measured
+is that those statements succeed on `conn.query` against a live SingleStore. It did NOT measure the
+provider working that way: nothing was changed and nothing was re-run through the panels. So the
+claim here is that six surfaces and two maintenance actions across SingleStore and StarRocks are
+candidates for recovery, not that they would recover.
+
+Done when a parameterless statement the provider issues is sent over the text protocol, the
+SingleStore and StarRocks rows in `docs/providers/README.md` are re-probed and re-written against
+what that build reports, and this entry is deleted.
+
 ---
 
 ## Value interpolation
@@ -2774,7 +2844,7 @@ directly, so it fails loudly rather than skipping, but it fails at the worst mom
 Done when the next release's channel E2Es pass on deb, rpm and snap, and this entry is deleted - or
 they fail and `--with-deps` comes back for those three jobs only.
 
-### B52. The PostgreSQL grounding capture's row cap is reached by the server's own catalogs, not by a wide user schema
+### B52. The PostgreSQL grounding capture's row cap is reached by what the image ships, not by a wide user schema
 
 `composeCatalogRead` records a known limitation with a number: the PostgreSQL projection is one row
 per COLUMN against `maxResultRows: 200`, so an unnarrowed call "overflows at roughly 25 tables of
@@ -2809,13 +2879,73 @@ too broad (`is_superuser`, `reads_server_files`, `writes_server_files`, `execute
 row budget is only reached after a least-privilege `agentUser` has been created by hand - and it is
 then reached anyway.
 
-The consequence is that the agent is unusable out of the box on both TimescaleDB and Cloudberry, and
-the same shape will appear on any PostgreSQL-wire server with wide catalogs of its own. Two candidate
-fixes, both listed in the existing comment as belonging to the consuming layer: aggregate columns per
-table so the projection is one row per OBJECT (symmetric with the SQLite side), or have the capture
-exclude the schemas the object browser already treats as internal. The second is narrower and would
-not change what a caller parses - and it now has two schema sets to exclude rather than one, which is
-an argument for the first.
+**A third engine settles which fix is viable, and it is not the schemas.** Measured on 2026-08-20
+against `google/alloydbomni:17.9.0` (AlloyDB Omni 17.9.0, PostgreSQL 17.9) with the same two user
+tables: `CATALOG_READ_REFUSED`, "Read-only execution exceeded the row budget: 536 rows > 200 allowed".
+Only **7 of those 536 rows are the user's** - `customers` 3 columns and `orders` 4. As the agent role
+sees it the total splits `public` **348**, `google_ml` 144, `ai` 44 - and **341 of the 348 in `public`
+are the 49 extension views the image installs into `public` itself**, not into a schema of its own.
 
-Done when a plan run against a stock TimescaleDB and one against a stock Cloudberry both report a
-captured schema naming the user's tables, and this entry is deleted.
+That is what makes this measurement decisive rather than a third repetition. On TimescaleDB (473 of
+478 in `_timescaledb_*`) and on Cloudberry (282 of 289 in `gp_toolkit`) the overflow sits in a
+separate internal schema, so the second candidate fix - have the capture exclude the schemas the
+object browser already treats as internal - would rescue both. Here it rescues nothing: narrowing the
+capture to `schema=public` still refuses, at **348 rows against the 200 allowed**, because the views
+are in the user's own schema. The only selector that fits is a single table (`schema=public
+table=orders` projects 4 rows), which is not a schema capture at all. **So of the two candidate fixes
+only the first survives: aggregate columns per table so the projection is one row per OBJECT
+(symmetric with the SQLite side).** The schema-exclusion fix is refuted by the AlloyDB Omni
+measurement and should not be attempted.
+
+Two controls keep the AlloyDB numbers attributable. Plain PostgreSQL 18.4, run in the same pass,
+projects **7 rows** and captures its 2 tables, so the path is fine. And the `relations` capture kind
+projects 0 rows as the agent role and 3 as a superuser on AlloyDB - but the plain PostgreSQL baseline
+behaves identically, so that is PostgreSQL's own privilege rule and **not** an AlloyDB property.
+
+AlloyDB Omni also fails the same step earlier as Cloudberry, for the same reason: as the image's own
+`postgres` superuser both `agent-read-only` and `agent-operations` are refused with
+`PROFILE_PRIVILEGES_TOO_BROAD` (`is_superuser`, `reads_server_files`, `writes_server_files`,
+`executes_programs`). With a hand-made least-privilege role both profiles acquire and `queryReadOnly`
+is present, so the boundary itself works - and the capture is then refused anyway.
+
+The consequence is that the agent is unusable out of the box on TimescaleDB, Cloudberry and AlloyDB
+Omni, and the same shape will appear on any PostgreSQL-wire server whose image ships wide catalogs or
+wide extension views before the user creates anything. Both candidate fixes were listed in the
+existing comment as belonging to the consuming layer; after the third measurement only the
+one-row-per-OBJECT aggregation is left standing.
+
+Done when a plan run against a stock TimescaleDB, one against a stock Cloudberry and one against a
+stock AlloyDB Omni all report a captured schema naming the user's tables, and this entry is deleted.
+
+### B54. A refused grounding capture leaves no trace in the run's own ledger, so B52 cannot be diagnosed from the record
+
+`docs/llms/setup.md` states the rule this entry breaks: "Every run writes its ledger to
+`.workflow-data`, and that is the authority on what a run did." For a capture that SUCCEEDS that is
+true - `investigation.ts` records a `context-captured` event carrying the fingerprint, the table count
+and the whole snapshot. For a capture that is REFUSED it is not: the `capture.kind === "unavailable"`
+branch pushes `planningUngroundedNote(capture.detail, ...)` into the model's prompt and returns
+without recording anything at all.
+
+Measured on 2026-08-20 against a live AlloyDB Omni 17.9.0, in the browser, with a least-privilege
+agent role. The two ledgers side by side are the whole argument:
+
+- Vitess, capture succeeded: `context-captured`, `fingerprint ctx_3ce059ca...`, `tableCount 2`, plus
+  the full snapshot.
+- AlloyDB Omni, capture refused: four events - `run-opened`, `run-started`, `closing-statement`,
+  `run-finished` - and nothing between the second and the third. The 849-byte ledger names no
+  catalog read, no reason code and no row count.
+
+So the only record that the run was ungrounded is the model's own sentence, "This run was given no
+inventory of this database". The reason it was ungrounded - `CATALOG_READ_REFUSED`, 536 rows against
+a 200-row budget, 341 of them extension views in `public` - is computed in `context-snapshot.ts`,
+handed to the model, and then dropped. It is not in the ledger and it is not in the server log
+either: grepping the run's own log for `CATALOG_READ_REFUSED`, `row budget` and `536` finds nothing.
+
+That is worse than a gap in telemetry, because this repo has already recorded the trap it walks into:
+a missing event reads as work that was not needed rather than knowledge that was lost. An operator
+diagnosing B52 on TimescaleDB, Cloudberry or AlloyDB Omni today has to reproduce the run outside the
+product to learn why it had no schema.
+
+Done when a refused capture records an event carrying its `reasonCode` and, where the reason is the
+row budget, the two numbers - rows projected and rows allowed - and a plan run whose capture was
+refused can be explained from its ledger alone, and this entry is deleted.

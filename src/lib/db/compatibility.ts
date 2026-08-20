@@ -88,10 +88,15 @@ export interface WireCompatibleEngine {
 /**
  * Verified relatives, each measured by a live gate-4 probe on 2026-08-18, with
  * TimescaleDB, YugabyteDB, TiDB and StarRocks added from a second probe run on
- * 2026-08-20, and Apache Cloudberry and Vitess from a third run the same day.
+ * 2026-08-20, Apache Cloudberry and Vitess from a third run the same day,
+ * AlloyDB Omni from a fourth run the same day, and OceanBase Community Edition
+ * and SingleStore from a fifth run the same day.
  * Names still awaiting an instance are tracked in issue #424, never here: there
  * is no "pending" state on purpose, because a reader cannot tell a pending entry
- * from a probed one.
+ * from a probed one. A name that WAS probed and did not earn an entry has no
+ * representation here either - Cloud Spanner's PostgreSQL dialect answered 1 of 15
+ * surfaces - so that result is recorded in `docs/providers/README.md` beside this
+ * table, with the number that refused it.
  */
 export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
   {
@@ -175,6 +180,23 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     ],
   },
   {
+    name: "AlloyDB Omni",
+    via: "postgres",
+    tier: "full",
+    probedVersion: "PostgreSQL 17.9 (AlloyDB Omni 17.9.0)",
+    caveats: [
+      'The version panel cannot be told apart from a stock PostgreSQL 17: version() reports only "PostgreSQL 17.9 on x86_64-pc-linux-gnu" and names AlloyDB nowhere, so the product identity is visible only in the alloydb.* settings and in the image tag.',
+      "Row counts and sizes are exact, checked against the engine: 2000 rows read as 2000, and 270336 total bytes as 270336 (180224 table plus 90112 index). Foreign keys are both read back and enforced.",
+      "Eight of AlloyDB's own google_ml tables appear in the object browser, so it lists 10 objects for 2 user tables: auth_info, embed_gen_progress, embed_gen_settings, model_family_info, models, native_models, proxy_models_query_mapping and supported_vertex_models.",
+      "The browser understates what the image installed: outside the system schemas there are 70 objects for 2 user tables, because 49 extension VIEWS are installed into public itself (g_columnar_* x27, google_db_advisor_* x18, g_agg_stat_statements, g_lap_timer, hypopg_list_indexes and a columnar vectorized-join view), plus 4 views in ai and 11 more in google_ml. They are hidden only because the schema query filters table_type = 'BASE TABLE'.",
+      "Those eight google_ml tables are readable by a role with no grants at all: a LOGIN role given only CONNECT, with ALL revoked on schema public, still lists them and answered SELECT count(*) FROM google_ml.supported_vertex_models with 15 rows.",
+      'The slow-query panel is always empty and health says why: pg_stat_statements ships with the image but is not installed in it, reported as "pg_stat_statements extension not enabled".',
+      "The columnar engine is off by default and turning it on needs ALTER SYSTEM plus a restart, not a reload. With it on, the on-disk sizes stay exact but do not count the columnar copy.",
+      "The agent cannot ground a run: the image's own postgres superuser is refused as too broad, and a least-privilege role acquires both profiles but has its schema capture refused at 536 rows against a 200-row budget, of which only 7 are the user's - 341 of the rest are the 49 extension views installed into public itself, so narrowing the capture to public alone still refuses at 348 rows (B52).",
+      "Probed on the 17.9.0 image only; the 15.x and 16.x lines were not probed.",
+    ],
+  },
+  {
     name: "MariaDB",
     via: "mysql",
     tier: "full",
@@ -224,6 +246,46 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
       "Setting a session variable can fail where reading it works: SET @@cte_max_recursion_depth is rejected with VT05006 unknown system variable, while SELECT @@cte_max_recursion_depth answers 1000.",
       "Probed on an unsharded single-shard keyspace only (show vitess_shards returns probe/0); nothing here is measured about a sharded keyspace.",
       "No permission-error class could be measured, and the reason is the test image rather than Vitess: vttestserver accepts any username with any password and grants it full rights, and CREATE USER is a vtgate parse error, so no restricted role could be created to test with.",
+    ],
+  },
+  {
+    name: "OceanBase",
+    via: "mysql",
+    tier: "partial",
+    probedVersion: "5.7.25-OceanBase_CE-v4.4.2.1",
+    caveats: [
+      "Fourteen of the fifteen surfaces return without throwing, but only twelve of them do their job, which is what makes this partial rather than full.",
+      "Health is the one hard failure: the tenant has no performance_schema database at all (ERROR 1049 Unknown database 'performance_schema'). Health passes on the MySQL 26.7.0 baseline probed in the same pass, so this is the engine's.",
+      "Performance metrics and storage stats are answered but useless, and the overview, table statistics and index statistics carry useless zeros in their size fields while their row and structure data is real.",
+      "Every size reads 0 B - table, index, database and storage - because OceanBase reports DATA_LENGTH 0 and INDEX_LENGTH 0 in information_schema.TABLES.",
+      "Storage stats list a phantom InnoDB row at ibdata1:12M:autoextend whose size reads N/A: OceanBase fakes innodb_data_file_path for compatibility and there is no such file.",
+      "The slow-query panel reads 0 rows, which is an honest empty rather than a fabricated number.",
+      "The header badge reads Slow rather than Online, and it does not mean latency: the badge is set from whether the health request succeeded, and health is the one surface this engine refuses.",
+      "Row counts are correct once ANALYZE TABLE has run - 2000 reported for 2000 real - and it must be the MySQL-mode statement: the Oracle-mode ANALYZE TABLE t COMPUTE STATISTICS is rejected with ERROR 1235.",
+      "The object browser is clean, 2 objects for 2 user tables: the schema query scopes to TABLE_SCHEMA and to TABLE_TYPE = 'BASE TABLE', and OceanBase's own 860 + 70 + 18 catalog objects are all SYSTEM TABLE or SYSTEM VIEW, so neither filter admits them.",
+      "A foreign key is both read back and enforced (an orphan insert is refused with ERROR 1452), but OceanBase creates no backing index for one, so index counts will not match an equivalent MySQL schema.",
+      "Cancelling a running query genuinely cancels it, and the Explain panel genuinely describes without executing: an 11-row ASCII plan with an EST.ROWS column.",
+      "Sign in to the BUSINESS tenant rather than sys: MODE=mini creates a user tenant named test, so the login is root@test, and the sys tenant exposes nine databases including Oracle-mode artifacts (LBACSYS, ORAAUDITOR, SYS, ocs, sys_external_tbs) that the user tenant does not have.",
+      "Probed on the oceanbase/oceanbase-ce:4.4.2-lts image with MODE=mini only.",
+    ],
+  },
+  {
+    name: "SingleStore",
+    via: "mysql",
+    tier: "partial",
+    probedVersion: "SingleStoreDB 9.1.1 (advertises MySQL 5.7.32)",
+    caveats: [
+      'Ten of the fifteen surfaces answer. Test Connection, health, the overview and the monitoring dashboard all fail with one engine message, "This command is not supported in the prepared statement protocol yet", and the Explain panel fails with a syntax error on EXPLAIN FORMAT=JSON.',
+      "No version is displayed anywhere, because the panel that carries it is one of the unavailable ones. Were it fixed it would read MySQL 5.7.32, the wire version SingleStore advertises, not SingleStoreDB 9.1.1.",
+      "Row counts and sizes are missing rather than wrong: a 2000-row table reads rowCount 0 and 0 B in the object browser, the table statistics and the storage panel, against a ground truth of 2000 rows and 77046 bytes measured four independent ways.",
+      "SingleStore leaves information_schema.TABLES zeroed and keeps the real numbers elsewhere - SHOW TABLE STATUS, information_schema.OPTIMIZER_STATISTICS.ROW_COUNT and the EXPLAIN plan's est_table_rows - and running ANALYZE does not change what the panels read.",
+      "The index panel lists 4 rows for 2 tables against the MySQL baseline's 2: SingleStore auto-creates a shard key on every table and reports it as an index named __SHARDKEY with indexType SHARD, beside PRIMARY.",
+      "Foreign keys do not exist: ALTER TABLE ... ADD FOREIGN KEY fails with ERROR 2752, and with SET GLOBAL ignore_foreign_keys = ON a CREATE TABLE carrying an inline foreign key is accepted and the constraint silently stripped, which is the one shape where a user could believe they have a key they do not.",
+      "Of the maintenance actions, Analyze works; Optimize and Check fail with the same prepared-statement error.",
+      "The header badge reads Slow rather than Online, and it does not mean latency: the badge is set from whether the health request succeeded, and health is one of the surfaces refused over the prepared-statement protocol.",
+      "Permission errors are identical to MySQL and surface with the server's own text intact, and under a SELECT-only role the table list correctly showed only the granted table.",
+      "The dev image needs no licence key: it self-licenses with ROOT_PASSWORD as the only variable set, its log recording an unlimited expiration and the Developer Image edition.",
+      "Probed on the ghcr.io/singlestore-labs/singlestoredb-dev:0.2.82 image only.",
     ],
   },
   {
