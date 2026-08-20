@@ -27,6 +27,73 @@ entries:
       artifacthub.io/prerelease: "false"
     apiVersion: v2
     appVersion: 0.12.0
+    created: "2026-08-20T13:19:10.779517565Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting thirteen engines
+      - PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Redis, Couchbase,
+      ClickHouse, Apache Druid, Elasticsearch, OpenSearch and Apache Trino
+    digest: 5af1e4e0c244736b022af801e50aa44d8398dfa4d2fe43859b561bc83ccdd30a
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - couchbase
+    - clickhouse
+    - druid
+    - elasticsearch
+    - opensearch
+    - trino
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.41/libredb-studio-0.1.41.tgz
+    version: 0.1.41
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
+        - "The Service can be dual-stack: service.ipFamilyPolicy and service.ipFamilies are rendered onto it, so a dual-stack cluster can hand this release an IPv6 address (#432)"
+        - "Both are unset by default, so an existing install upgrades to a byte-identical Service - Kubernetes reads an explicit SingleStack as intent to release a secondary clusterIP, which is why the chart writes neither field unless asked"
+        - "Two address families without a dual-stack policy now fails at render time, with the message the API server would have returned at install time"
+        - "The pairing is documented rather than assumed: a dual-stack Service in front of the pod's default IPv4-only listener advertises an IPv6 address that refuses every connection, so the README recipe sets extraEnv HOSTNAME to :: alongside it"
+        - "No application change: the appVersion stays 0.12.0 and the deployed image is the same one 0.1.37 installs"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.12.0
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.12.0
     created: "2026-08-20T07:58:30.584396914Z"
     dependencies:
     - condition: postgresql.enabled
@@ -2186,4 +2253,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-08-20T07:58:30.577198708Z"
+generated: "2026-08-20T13:19:10.772636417Z"
