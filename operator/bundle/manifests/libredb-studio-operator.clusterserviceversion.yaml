@@ -22,10 +22,11 @@ metadata:
     capabilities: Basic Install
     categories: Database, Developer Tools
     containerImage: ghcr.io/libredb/libredb-studio-operator:0.12.0
-    createdAt: "2026-08-19T11:25:23Z"
-    description: Open-source web-based SQL IDE for thirteen engines - PostgreSQL,
+    createdAt: "2026-08-21T10:50:26Z"
+    description: Open-source web-based SQL IDE for fourteen engines - PostgreSQL,
       MySQL, Oracle, SQL Server, SQLite, MongoDB, Redis, Couchbase, ClickHouse, Apache
-      Druid, Elasticsearch, OpenSearch and Apache Trino - with AI-powered query assistance.
+      Druid, Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra - with AI-powered
+      query assistance.
     operators.operatorframework.io/builder: operator-sdk-v1.42.3
     operators.operatorframework.io/project_layout: helm.sdk.operatorframework.io/v1
     repository: https://github.com/libredb/libredb-studio
