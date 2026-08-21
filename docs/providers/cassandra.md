@@ -163,7 +163,13 @@ absence and zero are different facts: a zero is a measurement, and the Storage t
 formatted a `0 B` total and divided a 0.0% breakdown out of it. With the field absent the tab's two
 size cards read `N/A`, carry no percentage, and the breakdown is replaced by *"No storage size
 information available."* A provider that publishes a real `0` (Trino, Druid) has measured one and is
-unaffected. The **table, index and storage panels report nothing**. Two other engines are
+unaffected. The **table, index and storage panels report nothing** — and for the table panel that
+became true only when the same rule was applied there. Measured 2026-08-21 in Chrome against this
+node, the monitoring **Tables** tab still summarised the empty `getTableStats()` as *Tables* `0` over
+*0 rows*, *Size* `0 B` over *Total*, and *Vacuum* `0` over *OK*, in the very frame where the Overview
+tab read *Tables 6 / 2 indexes* out of `system_schema`: the `0 B` was the sentinel this section had
+just deleted, surviving one component over, and the *OK* was a clean bill of health for an operation
+Cassandra does not have at all ([§7.4](#74-the-panels-that-report-nothing)). Two other engines are
 recorded in `compatibility.ts` as failures for doing the opposite (Citus and TimescaleDB report row
 counts and sizes that are wrong rather than missing), and this provider is not going to join them.
 
@@ -638,6 +644,15 @@ second — there is no queries-per-second figure to read. `cacheHitRatio` itself
 server reports null (an unused cache): `DEFAULT_THRESHOLDS` scores that metric `direction: "below"`
 with `critical: 80`, so a substituted zero would paint an idle cluster red.
 
+Two panels read those absences, and both used to fill them in. The Overview tab's Performance card
+drew `bufferPoolUsage` as *0%* with an empty bar and `deadlocks` as a `0` badge in the healthy
+variant; the Performance tab's Buffer card rated the same `0` **Poor** in red, and its Deadlocks card
+badged `0` **Healthy** over *None detected* — a verdict on a measurement nobody made, and in the
+deadlock case a verdict read off a counter this engine does not keep. Both now read `N/A` beside the
+words *Not measured*, and the Buffer Pool and Deadlock trend charts say the same instead of drawing a
+flat line along zero. `cacheHitRatio` is the one field here that was measured, so it keeps its gauge
+and its rating.
+
 ### 7.3 Active sessions are running statements with no owner
 
 ```sql
@@ -660,12 +675,17 @@ connection list rather than a session list.
 
 ### 7.4 The panels that report nothing
 
-| Panel | Why empty |
-|---|---|
-| Slow queries | There is no aggregate of finished statements anywhere CQL can read. `system_views.system_logs` is a tail of the node's log file (0 rows on this image), and the slow-query threshold that exists writes to that log. **No statement is sent** to discover this |
-| Table statistics | `TableStats` needs a row count and a byte size; see [§3.2](#32-there-is-no-honest-row-count-and-no-honest-size). **No statement is sent** |
-| Index statistics | `system_schema.indexes` gives a name, a table and a target column — all of which the tree already shows — and `IndexStats` also wants a size and a scan count. Nothing reachable from CQL reports either, and a zeroed scan count reads as "never used" |
-| Storage statistics | The only storage figures a statement can read are whole mebibytes per table, so `databaseSizeBytes` is omitted rather than zeroed and the tab says so in words ([§3.2](#32-there-is-no-honest-row-count-and-no-honest-size)) |
+Each of these returns an empty list, and the second column is why. The third is what the panel does
+with it: an empty list is the only way a required field can decline, so a panel that reduces one into
+a total publishes a figure the engine refused to give — which is what the Tables and Queries tabs did
+here until the rule of [§3.2](#32-there-is-no-honest-row-count-and-no-honest-size) reached them.
+
+| Panel | Why empty | What it renders |
+|---|---|---|
+| Slow queries | There is no aggregate of finished statements anywhere CQL can read. `system_views.system_logs` is a tail of the node's log file (0 rows on this image), and the slow-query threshold that exists writes to that log. **No statement is sent** to discover this | *Queries*, *Avg Time* and *Slow* all read `N/A`. They used to read `0`, `0.00ms` and `0`, and an average over no statements is not zero milliseconds |
+| Table statistics | `TableStats` needs a row count and a byte size; see [§3.2](#32-there-is-no-honest-row-count-and-no-honest-size). **No statement is sent** | *Tables* and *Size* read `N/A`, and the list below them says *No table statistics available.* rather than *No tables found.* The tab separates the two cases by the **required** `overview.tableCount`, which `system_schema` fills honestly (6 here): tables the engine knows about, with statistics for none of them, means the figures are not knowable rather than that the keyspace is empty |
+| Index statistics | `system_schema.indexes` gives a name, a table and a target column — all of which the tree already shows — and `IndexStats` also wants a size and a scan count. Nothing reachable from CQL reports either, and a zeroed scan count reads as "never used" | There is no index panel; `IndexStats` feeds the Storage tab's *Indexes* card, which reads `N/A` on the absent `databaseSizeBytes` rather than on this list ([§3.2](#32-there-is-no-honest-row-count-and-no-honest-size)) |
+| Storage statistics | The only storage figures a statement can read are whole mebibytes per table, so `databaseSizeBytes` is omitted rather than zeroed and the tab says so in words ([§3.2](#32-there-is-no-honest-row-count-and-no-honest-size)) | Both size cards read `N/A` with no percentage, and the breakdown is replaced by *No storage size information available.* |
 
 ---
 
@@ -685,6 +705,16 @@ one of the six `MaintenanceType` values, and a user who wants it can type it.
 
 The two label triads are rewritten anyway — the cards do not render, but the inherited copy would
 promise a user that this panel updates planner statistics and reclaims space.
+
+`supportsMaintenance: false` is read in one more place than the maintenance controls. The monitoring
+**Tables** tab carries a *Vacuum* summary card, and it counted rows over a bloat ratio to decide
+between *Need* and *OK* — with no rows it said `0` over **OK** in green, which is a clean bill of
+health for an operation that does not exist here. Whether an engine *has* vacuum is a capability
+question rather than a data question, so the card now reads the declared capability and says `N/A`
+over *Not supported*. (The same tab's per-row *Last Vacuum* column now shows a dash rather than
+*Never* on an engine that declares no `vacuum` — on PostgreSQL a null there is the measurement "never
+vacuumed", elsewhere it is a history for an operation there is none of. No row of it renders here,
+because there are no table statistics to list at all.)
 
 ---
 
