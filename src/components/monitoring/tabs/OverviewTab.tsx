@@ -222,11 +222,11 @@ function PerformanceSummaryCard({
   bufferPoolUsage,
   deadlocks,
   checkpointWriteTime,
-}: {
+}: Readonly<{
   bufferPoolUsage: number | undefined;
   deadlocks: number | undefined;
   checkpointWriteTime: string | undefined;
-}) {
+}>) {
   return (
     <Card className="p-0">
       <CardHeader className="p-3 sm:p-4 pb-2">
@@ -281,7 +281,7 @@ function PerformanceSummaryCard({
 }
 
 /** Slow-query and session counts, read straight off the payload. */
-function QuickStatsCard({ data }: { data: MonitoringData | null }) {
+function QuickStatsCard({ data }: Readonly<{ data: MonitoringData | null }>) {
   return (
     <Card className="p-0">
       <CardHeader className="p-3 sm:p-4 pb-2">

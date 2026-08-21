@@ -62,13 +62,13 @@ function MetricTrendCard({
   data,
   color,
   unit,
-}: {
+}: Readonly<{
   heading: string;
   title: string;
   data: { timestamp: number; value: number }[];
   color: string;
   unit?: string;
-}) {
+}>) {
   return (
     <Card className="p-0">
       <CardHeader className="p-2 sm:p-3 pb-0">

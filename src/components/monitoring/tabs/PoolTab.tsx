@@ -121,7 +121,7 @@ export function PoolTab({ connection }: PoolTabProps) {
  * `measured === null` is the unmeasured case for every card at once, so each renders
  * "N/A" and drops its sub-label rather than showing a zero nobody read.
  */
-function PoolStatsGrid({ measured, usagePercent }: { measured: PoolStats | null; usagePercent: number }) {
+function PoolStatsGrid({ measured, usagePercent }: Readonly<{ measured: PoolStats | null; usagePercent: number }>) {
   return (
     <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-4">
       <Card className="p-0">

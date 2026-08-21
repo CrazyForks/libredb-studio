@@ -69,11 +69,11 @@ function VacuumNote({
   stateKnown,
   needingVacuum,
   unsupported,
-}: {
+}: Readonly<{
   stateKnown: boolean;
   needingVacuum: number;
   unsupported: boolean;
-}) {
+}>) {
   if (stateKnown) {
     return <p className="text-xs sm:text-xs text-muted-foreground mt-1">{needingVacuum > 0 ? "Need" : "OK"}</p>;
   }
