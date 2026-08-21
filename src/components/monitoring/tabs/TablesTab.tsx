@@ -22,6 +22,73 @@ const MAINTENANCE_ACTIONS: { type: MaintenanceType; label: string; Icon: LucideI
   { type: "reindex", label: "Reindex", Icon: Zap, className: "h-6 w-6 sm:h-8 sm:w-8 hidden sm:inline-flex" },
 ];
 
+/**
+ * Pure formatters, at module scope rather than re-created inside `TablesTab` on every
+ * render. They also keep the component's own cognitive complexity to the decisions it
+ * actually makes about absence, which is what this panel is about.
+ */
+function formatBytes(bytes: number): string {
+  if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(2)} GB`;
+  if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(2)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+  return `${bytes} B`;
+}
+
+function formatNumber(n: number): string {
+  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+  return n.toString();
+}
+
+/**
+ * `lastVacuum` is optional, and its absence means two different things. On PostgreSQL a
+ * NULL `last_vacuum` really does mean the table has never been vacuumed, so "Never" is a
+ * measurement; on an engine with no vacuum at all the same word claims a history for an
+ * operation that does not exist. Only an engine that declares vacuum gets the word - the
+ * rest get the dash this table already uses for a cell it cannot fill (`indexSize`).
+ */
+function formatVacuumDate(date: Date | undefined, vacuumSupported: boolean): string {
+  if (!date) return vacuumSupported ? "Never" : "-";
+  return new Date(date).toLocaleDateString();
+}
+
+/**
+ * Three states, not two, which is why this is a function and not the nested ternary it
+ * replaces: the vacuum figure can be a real reading, a denial from an engine with no
+ * vacuum, or simply unknown because the engine published no table statistics at all. The
+ * unknown case must not borrow the green of a healthy reading.
+ */
+function vacuumIconClass(stateKnown: boolean, needingVacuum: number): string {
+  if (!stateKnown) return "text-muted-foreground";
+  if (needingVacuum > 0) return "text-yellow-500";
+  return "text-green-500";
+}
+
+/** The same three states, as the note under the figure. `null` is the unknown case. */
+function VacuumNote({
+  stateKnown,
+  needingVacuum,
+  unsupported,
+}: {
+  stateKnown: boolean;
+  needingVacuum: number;
+  unsupported: boolean;
+}) {
+  if (stateKnown) {
+    return <p className="text-xs sm:text-xs text-muted-foreground mt-1">{needingVacuum > 0 ? "Need" : "OK"}</p>;
+  }
+  if (unsupported) {
+    return <p className="text-xs sm:text-xs text-muted-foreground mt-1">Not supported</p>;
+  }
+  return null;
+}
+
+function bloatBadgeVariant(ratio: number): "destructive" | "outline" | "secondary" {
+  if (ratio > 20) return "destructive";
+  if (ratio > 10) return "outline";
+  return "secondary";
+}
+
 interface TablesTabProps {
   data: MonitoringData | null;
   loading: boolean;
@@ -80,29 +147,6 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
     capabilities?.supportsMaintenance === true && capabilities.maintenanceOperations.includes("vacuum");
   const vacuumStateKnown = !vacuumUnsupported && !statsAbsent;
 
-  const formatBytes = (bytes: number) => {
-    if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(2)} GB`;
-    if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(2)} MB`;
-    if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)} KB`;
-    return `${bytes} B`;
-  };
-
-  const formatNumber = (n: number) => {
-    if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
-    if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
-    return n.toString();
-  };
-
-  // `lastVacuum` is optional, and its absence means two different things. On PostgreSQL a
-  // NULL `last_vacuum` really does mean the table has never been vacuumed, so "Never" is a
-  // measurement; on an engine with no vacuum at all the same word claims a history for an
-  // operation that does not exist. Only an engine that declares vacuum gets the word — the
-  // rest get the dash this table already uses for a cell it cannot fill (`indexSize`).
-  const formatDate = (date?: Date) => {
-    if (!date) return vacuumSupported ? "Never" : "-";
-    return new Date(date).toLocaleDateString();
-  };
-
   const handleMaintenance = async (type: MaintenanceType, tableName: string) => {
     setActionLoading(`${type}-${tableName}`);
     await onRunMaintenance(type, tableName);
@@ -147,22 +191,16 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-2 sm:p-4 pb-1 sm:pb-2">
             <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Vacuum</CardTitle>
             <AlertTriangle
-              className={`h-3 w-3 sm:h-4 sm:w-4 ${
-                !vacuumStateKnown
-                  ? "text-muted-foreground"
-                  : tablesNeedingVacuum > 0
-                    ? "text-yellow-500"
-                    : "text-green-500"
-              }`}
+              className={`h-3 w-3 sm:h-4 sm:w-4 ${vacuumIconClass(vacuumStateKnown, tablesNeedingVacuum)}`}
             />
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
             <div className="text-lg sm:text-2xl font-medium">{vacuumStateKnown ? tablesNeedingVacuum : "N/A"}</div>
-            {vacuumStateKnown ? (
-              <p className="text-xs sm:text-xs text-muted-foreground mt-1">{tablesNeedingVacuum > 0 ? "Need" : "OK"}</p>
-            ) : vacuumUnsupported ? (
-              <p className="text-xs sm:text-xs text-muted-foreground mt-1">Not supported</p>
-            ) : null}
+            <VacuumNote
+              stateKnown={vacuumStateKnown}
+              needingVacuum={tablesNeedingVacuum}
+              unsupported={vacuumUnsupported}
+            />
           </CardContent>
         </Card>
       </div>
@@ -232,18 +270,13 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
                           // variant would report a measurement the engine never made.
                           <span className="text-xs text-muted-foreground">-</span>
                         ) : (
-                          <Badge
-                            variant={
-                              table.bloatRatio > 20 ? "destructive" : table.bloatRatio > 10 ? "outline" : "secondary"
-                            }
-                            className="text-xs sm:text-xs"
-                          >
+                          <Badge variant={bloatBadgeVariant(table.bloatRatio)} className="text-xs sm:text-xs">
                             {table.bloatRatio.toFixed(1)}%
                           </Badge>
                         )}
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground hidden lg:table-cell py-2">
-                        {formatDate(table.lastVacuum)}
+                        {formatVacuumDate(table.lastVacuum, vacuumSupported)}
                       </TableCell>
                       <TableCell className="text-right py-2">
                         {isAdmin && availableActions.length > 0 ? (

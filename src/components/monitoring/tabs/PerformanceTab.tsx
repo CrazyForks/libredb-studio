@@ -20,6 +20,71 @@ import { MetricChart } from "./MetricChart";
  */
 const METRIC_UNAVAILABLE = "N/A";
 
+/**
+ * One trend series, built from history. Missing samples are DROPPED, not zeroed: an
+ * engine that cannot measure a cache hit ratio (Druid) reports none, and mapping that to
+ * 0 would plot a measured 0% trend - exactly the fabricated metric the current-value
+ * cards withhold. Dropping leaves an empty series, which `MetricTrendCard` renders as
+ * "Not measured" rather than as a line along the floor.
+ */
+function metricSeries(
+  history: TimeSeriesPoint<MonitoringData>[],
+  read: (performance: MonitoringData["performance"] | undefined) => number | undefined,
+): { timestamp: number; value: number }[] {
+  return history.flatMap((h) => {
+    const value = read(h.data.performance);
+    return value === undefined ? [] : [{ timestamp: h.timestamp, value }];
+  });
+}
+
+/**
+ * Three states, not two, which is why this is a function and not the nested ternary it
+ * replaces: no deadlock counter at all (Trino takes no locks, Cassandra and Druid omit
+ * the field), a real count above zero, or a measured zero. The absence must not borrow
+ * the green of an engine that looked and found none.
+ */
+function deadlockIconClass(deadlocks: number | undefined): string {
+  if (deadlocks === undefined) return "text-muted-foreground";
+  if (deadlocks > 0) return "text-red-500";
+  return "text-green-500";
+}
+
+/**
+ * One trend card. The three below differ only in their copy, colour and unit, and an
+ * empty series is the dropped-sample case from `flatMap` above: the engine published no
+ * reading, so the card says so instead of drawing a line along the floor. `heading` is
+ * passed rather than derived from `title` because the deadlock card is labelled
+ * "Deadlock Trend" while its chart is titled "Deadlocks".
+ */
+function MetricTrendCard({
+  heading,
+  title,
+  data,
+  color,
+  unit,
+}: {
+  heading: string;
+  title: string;
+  data: { timestamp: number; value: number }[];
+  color: string;
+  unit?: string;
+}) {
+  return (
+    <Card className="p-0">
+      <CardHeader className="p-2 sm:p-3 pb-0">
+        <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">{heading}</CardTitle>
+      </CardHeader>
+      <CardContent className="p-2 sm:p-3 pt-0">
+        {data.length === 0 ? (
+          <p className="text-xs sm:text-xs text-muted-foreground">Not measured</p>
+        ) : (
+          <MetricChart data={data} color={color} title={title} unit={unit} />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 interface PerformanceTabProps {
   data: MonitoringData | null;
   loading: boolean;
@@ -75,26 +140,11 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
       ? "healthy"
       : evaluateThreshold(deadlocks, DEFAULT_THRESHOLDS.find((t) => t.metric === "deadlocks")!);
 
-  // Build trend data from history
-  // Missing samples are DROPPED, not zeroed. An engine that cannot measure a cache hit
-  // ratio (Druid) reports none, and mapping that to 0 would plot a measured 0% trend -
-  // exactly the fabricated metric the current-value card above withholds. Dropping
-  // leaves an empty series, which the chart renders as no data rather than as a floor.
-  const cacheHistory = history.flatMap((h) =>
-    h.data.performance?.cacheHitRatio === undefined
-      ? []
-      : [{ timestamp: h.timestamp, value: h.data.performance.cacheHitRatio }],
-  );
-  const bufferHistory = history.flatMap((h) =>
-    h.data.performance?.bufferPoolUsage === undefined
-      ? []
-      : [{ timestamp: h.timestamp, value: h.data.performance.bufferPoolUsage }],
-  );
-  const deadlockHistory = history.flatMap((h) =>
-    h.data.performance?.deadlocks === undefined
-      ? []
-      : [{ timestamp: h.timestamp, value: h.data.performance.deadlocks }],
-  );
+  // Build trend data from history. See `metricSeries` for why a missing sample is
+  // dropped rather than read as a zero.
+  const cacheHistory = metricSeries(history, (p) => p?.cacheHitRatio);
+  const bufferHistory = metricSeries(history, (p) => p?.bufferPoolUsage);
+  const deadlockHistory = metricSeries(history, (p) => p?.deadlocks);
 
   return (
     <div className="p-3 sm:p-6 space-y-4 sm:space-y-6">
@@ -173,11 +223,7 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
         <Card className={`p-0 border-2 transition-colors ${getThresholdColor(deadlockThreshold)}`}>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-2 sm:p-4 pb-1 sm:pb-2">
             <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Deadlocks</CardTitle>
-            <AlertTriangle
-              className={`h-3 w-3 sm:h-4 sm:w-4 ${
-                deadlocks === undefined ? "text-muted-foreground" : deadlocks ? "text-red-500" : "text-green-500"
-              }`}
-            />
+            <AlertTriangle className={`h-3 w-3 sm:h-4 sm:w-4 ${deadlockIconClass(deadlocks)}`} />
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
             {deadlocks === undefined ? (
@@ -207,42 +253,15 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
       {/* Trend Charts */}
       {history.length >= 2 && (
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-4">
-          <Card className="p-0">
-            <CardHeader className="p-2 sm:p-3 pb-0">
-              <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Cache Hit Trend</CardTitle>
-            </CardHeader>
-            <CardContent className="p-2 sm:p-3 pt-0">
-              {cacheHistory.length === 0 ? (
-                <p className="text-xs sm:text-xs text-muted-foreground">Not measured</p>
-              ) : (
-                <MetricChart data={cacheHistory} color="#22c55e" title="Cache Hit" unit="%" />
-              )}
-            </CardContent>
-          </Card>
-          <Card className="p-0">
-            <CardHeader className="p-2 sm:p-3 pb-0">
-              <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Buffer Pool Trend</CardTitle>
-            </CardHeader>
-            <CardContent className="p-2 sm:p-3 pt-0">
-              {bufferHistory.length === 0 ? (
-                <p className="text-xs sm:text-xs text-muted-foreground">Not measured</p>
-              ) : (
-                <MetricChart data={bufferHistory} color="#3b82f6" title="Buffer Pool" unit="%" />
-              )}
-            </CardContent>
-          </Card>
-          <Card className="p-0">
-            <CardHeader className="p-2 sm:p-3 pb-0">
-              <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Deadlock Trend</CardTitle>
-            </CardHeader>
-            <CardContent className="p-2 sm:p-3 pt-0">
-              {deadlockHistory.length === 0 ? (
-                <p className="text-xs sm:text-xs text-muted-foreground">Not measured</p>
-              ) : (
-                <MetricChart data={deadlockHistory} color="#ef4444" title="Deadlocks" />
-              )}
-            </CardContent>
-          </Card>
+          <MetricTrendCard heading="Cache Hit Trend" title="Cache Hit" data={cacheHistory} color="#22c55e" unit="%" />
+          <MetricTrendCard
+            heading="Buffer Pool Trend"
+            title="Buffer Pool"
+            data={bufferHistory}
+            color="#3b82f6"
+            unit="%"
+          />
+          <MetricTrendCard heading="Deadlock Trend" title="Deadlocks" data={deadlockHistory} color="#ef4444" />
         </div>
       )}
 

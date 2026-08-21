@@ -111,64 +111,75 @@ export function PoolTab({ connection }: PoolTabProps) {
       )}
 
       {/* Pool Stats Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-4">
-        <Card className="p-0">
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
-            <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Total</CardTitle>
-            <Server strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-blue-500" />
-          </CardHeader>
-          <CardContent className="p-3 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.total : "N/A"}</div>
-            {measured !== null && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Max pool size</p>}
-          </CardContent>
-        </Card>
+      <PoolStatsGrid measured={measured} usagePercent={usagePercent} />
+    </div>
+  );
+}
 
-        <Card className="p-0">
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
-            <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Active</CardTitle>
-            <Activity strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-green-500" />
-          </CardHeader>
-          <CardContent className="p-3 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.active : "N/A"}</div>
-            {measured !== null && (
-              <>
-                <Progress value={usagePercent} className="h-1 mt-1 sm:mt-2" />
-                <p className="text-xs sm:text-xs text-muted-foreground mt-1">{usagePercent}% utilized</p>
-              </>
-            )}
-          </CardContent>
-        </Card>
+/**
+ * The four figures, once `PoolTab` has decided whether anything was measured.
+ * `measured === null` is the unmeasured case for every card at once, so each renders
+ * "N/A" and drops its sub-label rather than showing a zero nobody read.
+ */
+function PoolStatsGrid({ measured, usagePercent }: { measured: PoolStats | null; usagePercent: number }) {
+  return (
+    <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-4">
+      <Card className="p-0">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
+          <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Total</CardTitle>
+          <Server strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-blue-500" />
+        </CardHeader>
+        <CardContent className="p-3 sm:p-4 pt-0">
+          <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.total : "N/A"}</div>
+          {measured !== null && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Max pool size</p>}
+        </CardContent>
+      </Card>
 
-        <Card className="p-0">
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
-            <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Idle</CardTitle>
-            <Clock strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-yellow-500" />
-          </CardHeader>
-          <CardContent className="p-3 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.idle : "N/A"}</div>
-            {measured !== null && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Available</p>}
-          </CardContent>
-        </Card>
+      <Card className="p-0">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
+          <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Active</CardTitle>
+          <Activity strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-green-500" />
+        </CardHeader>
+        <CardContent className="p-3 sm:p-4 pt-0">
+          <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.active : "N/A"}</div>
+          {measured !== null && (
+            <>
+              <Progress value={usagePercent} className="h-1 mt-1 sm:mt-2" />
+              <p className="text-xs sm:text-xs text-muted-foreground mt-1">{usagePercent}% utilized</p>
+            </>
+          )}
+        </CardContent>
+      </Card>
 
-        <Card className="p-0">
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
-            <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Waiting</CardTitle>
-            {measured !== null && (
-              <Badge variant={measured.waiting ? "destructive" : "secondary"} className="text-xs">
-                {measured.waiting}
-              </Badge>
-            )}
-          </CardHeader>
-          <CardContent className="p-3 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.waiting : "N/A"}</div>
-            {measured !== null && (
-              <p className="text-xs sm:text-xs text-muted-foreground mt-1">
-                {measured.waiting ? "Queued requests" : "No queue"}
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+      <Card className="p-0">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
+          <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Idle</CardTitle>
+          <Clock strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-yellow-500" />
+        </CardHeader>
+        <CardContent className="p-3 sm:p-4 pt-0">
+          <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.idle : "N/A"}</div>
+          {measured !== null && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Available</p>}
+        </CardContent>
+      </Card>
+
+      <Card className="p-0">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
+          <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Waiting</CardTitle>
+          {measured !== null && (
+            <Badge variant={measured.waiting ? "destructive" : "secondary"} className="text-xs">
+              {measured.waiting}
+            </Badge>
+          )}
+        </CardHeader>
+        <CardContent className="p-3 sm:p-4 pt-0">
+          <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.waiting : "N/A"}</div>
+          {measured !== null && (
+            <p className="text-xs sm:text-xs text-muted-foreground mt-1">
+              {measured.waiting ? "Queued requests" : "No queue"}
+            </p>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }
