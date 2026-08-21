@@ -39,14 +39,10 @@ annotations:
   artifacthub.io/category: database
   artifacthub.io/license: MIT
   artifacthub.io/prerelease: "false"
-  # False for this chart version, and this one needs saying, because 0.13.0 does
-  # carry a dependency pin with a CVE attached: adm-zip is held at ^0.6.0 for
-  # CVE-2026-39244, outside what cassandra-driver's own range would resolve to.
-  # It arrives WITH cassandra-driver rather than fixing anything 0.12.0 shipped -
-  # 0.12.0 has no cassandra-driver, therefore no adm-zip - so upgrading removes
-  # no exposure a user of the previous release had. The app-level fixes are
-  # recorded on 0.1.37, which is the chart version that first shipped them, and
-  # the IPv6 bind behaviour is 0.1.42's, unchanged here.
+  # False, and for this release it is simply true: 0.13.1 changes no dependency and
+  # no security behaviour. Its content is provider correctness on MongoDB and Redis.
+  # The app-level security fixes remain recorded on 0.1.37, the chart version that
+  # first shipped them; the adm-zip pin note belongs to 0.1.44 and is unchanged.
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |
     - name: libredb-studio
@@ -62,14 +58,11 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "Four more database engines, fourteen in all: Apache Cassandra over CQL, Apache Trino over its own client protocol with no runtime dependency added, and Elasticsearch and OpenSearch as two engines over one shared SQL transport"
-    - "Eighteen further engines are published as wire-compatible, each measured against a live instance rather than assumed from a protocol - MariaDB, TiDB, Vitess, StarRocks, OceanBase, SingleStore, Citus, TimescaleDB, YugabyteDB, AlloyDB Omni, Apache Cloudberry, CockroachDB, Materialize, RisingWave, Valkey, DragonflyDB, KeyDB and FerretDB - so fourteen drivers now reach thirty-two named products"
-    - "How much of the product each of those eighteen gives you differs per engine and is published per engine: full, partial, or SQL editor only. The connection dialog names the relatives a driver serves, and the docs table records the exact version probed and what was found broken"
-    - "Monitoring stops reporting an absent measurement as a measurement: five panels that printed a confident 0 for engines that keep no such counter now leave the field blank"
-    - "The schema explorer emits Redis commands for Redis instead of SQL it cannot run there, from a generator of its own"
-    - "OIDC logout resolves generic end-session URLs from the provider's discovery document rather than building one by hand"
-    - "The query agent enforces single-drive ownership and refuses appends once a run has closed, and its rail answers first instead of narrating its steps"
-    - "Chart 0.1.44 changes no template: its content is the appVersion move to 0.13.0 and the cassandra keyword that ArtifactHub search needs. The IPv6 bind behaviour is 0.1.42's, unchanged"
+    - "MongoDB is usable again on a managed connection: the seeded copy reaches the browser without its connection string, which made the app read every MongoDB capability as absent and answer with SQL - Find Documents on a collection wrote SELECT * FROM <collection> LIMIT 50 against a document engine"
+    - "Profile Table works on MongoDB. It had asked the provider for an operation the provider has never supported, so every collection answered HTTP 400"
+    - "The MongoDB schema tree names the fields inside a subdocument - shipping.city, not just shipping - to a depth of three and up to 200 fields per collection, which is also what the query agent is grounded on"
+    - "The query agent drafts statements a user can actually run on MongoDB and Redis: the JSON command object rather than mongosh shell syntax, and one Redis command rather than a numbered list of two"
+    - "Chart 0.1.45 changes no template: its content is the appVersion move to 0.13.1. The IPv6 bind behaviour is 0.1.42's, unchanged"
     - "Track app release 0.13.1 (appVersion bump; default image tag follows)"
 dependencies:
   - name: postgresql
