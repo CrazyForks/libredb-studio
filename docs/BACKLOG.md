@@ -510,8 +510,9 @@ keep its precision, the API serializes to JSON, and a `timestamp` is a string by
 reads it. So a value-shaped guess can only recover integer, boolean and text, and the dialect
 spellings #422 added (`NUMBER(19)`, `BINARY_DOUBLE`, `DATETIME2`, …) apply to those three kinds.
 
-The type is not lost, only unreported. `QueryResult.columnTypes` is the channel, and only ClickHouse
-and Druid populate it today.
+The type is not lost, only unreported. `QueryResult.columnTypes` is the channel, and six provider
+families populate it today: ClickHouse, Druid, Trino, Cassandra and the two search engines. The gap is
+the drivers that hand back strings — `pg`, `mysql2`, `oracledb`, `mssql`.
 
 Guessing from a string's SHAPE is not the fix and should not be attempted: it types a text column
 holding `2026-01-01` as a timestamp.
@@ -2578,8 +2579,10 @@ policy still omits `unsafe-eval`.
 `roles` appears only under `defaults` is rejected with
 `Invalid seed config: connections.0.roles: expected array, received undefined`.
 
-Either the merge is narrower than the sentence, or the sentence is wrong. A config file is not the place
-to find out by experiment.
+`mergeDefaults` (`src/lib/seed/connection-filter.ts`) merges `managed`, `environment` and `ssl`, and
+nothing else. The values table in that doc lists only those three, so the schema and the table agree —
+it is the prose ("merged into every connection") that overstates. A config file is not the place to
+find that out by experiment.
 
 **Done when:** the documented behaviour and the schema agree, whichever way is chosen, with a test
 covering a config that sets `roles` only in `defaults`.
