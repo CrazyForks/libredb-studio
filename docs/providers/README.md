@@ -145,9 +145,11 @@ grid. Each row was verified against the running container on 2026-08-19, and the
 2026-08-20 — the credentials are the ones the fixture actually accepts, not the ones its environment
 block asks for (twice those differ; see the notes).
 
-Start the twelve always-on services with a plain `docker compose -f database-compose.yml up -d` -
-eleven engine containers plus the one-shot `couchbase-init` seed sidecar; the `Profile` column names
-the ones that need asking for.
+Start the thirteen always-on services with a plain `docker compose -f database-compose.yml up -d` -
+twelve engine containers plus the one-shot `couchbase-init` seed sidecar; the `Profile` column names
+the ones that need asking for. The count is derived, not written: a service in this file carries no
+`profiles:` key precisely when it backs a SHIPPED provider, so a plain `up -d` can reproduce that
+provider's integration pass.
 
 | Provider | Compose service | Host | Port | User | Password | Database / service | Profile |
 |---|---|---|---|---|---|---|---|
@@ -163,6 +165,7 @@ the ones that need asking for.
 | Elasticsearch | `elasticsearch` | localhost | 9200 | *none* | *none* | *none* | — |
 | OpenSearch | `opensearch` | localhost | **9201** | *none* | *none* | *none* | — |
 | Apache Trino | `trino` | localhost | 8080 | *none* | *none* | `tpch` (catalog) | — |
+| Apache Cassandra | `cassandra` | localhost | **19042** | *none* | *none* | `probe` (keyspace) | — |
 | SQLite | *no service* | — | — | — | — | a file path on the Studio host | — |
 | LibreDB | *no service* | — | — | — | — | a directory on the Studio host | — |
 
@@ -173,6 +176,14 @@ security extension in a default install, both search services run with their sec
 connection**: the coordinator answers `401 Password not allowed for insecure authentication` even
 with authentication off, so a password breaks a connection that works without one
 ([trino.md §4.3](./trino.md#43-tls-and-the-password-rule)).
+
+**Cassandra needs one field this table has no column for, and will not connect without it.** `Local
+Data Center` must be `datacenter1` - a stock single node names its own data centre that, and the
+driver refuses to open a session when the field is empty rather than defaulting to the only data
+centre it can see ([cassandra.md §3.4](./cassandra.md#34-localdatacenter-is-a-required-connection-field-and-nothing-else-here-has-one)).
+Its port is the second thing to watch: the compose service publishes the native protocol on **19042**
+rather than 9042, while the connection dialog prefills the default, so leaving the port untouched
+answers `ECONNREFUSED`. `docker port libredb-cassandra` prints the mapping.
 
 **The two embedded providers have no container, and that is the whole point of them.** SQLite takes a
 path resolved *in the Studio process* and LibreDB a directory; neither reaches a network. Both also

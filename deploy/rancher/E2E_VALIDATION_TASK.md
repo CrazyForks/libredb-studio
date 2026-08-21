@@ -276,9 +276,9 @@ Common conventions for every scenario:
   install works zero-config there as it does from the live Helm repo. The scenario still
   only previews catalog presentation - installing from it is S1's job, not this one.
 - **Known and expected:** the card's description line comes from `Chart.yaml`, which now
-  names thirteen engines, while the app-readme still names ten. The ten-engine wording is
+  names fourteen engines, while the app-readme still names ten. The ten-engine wording is
   deliberate and version-scoped — the catalog prose describes a released version and stays
-  at ten until a tag ships Elasticsearch, OpenSearch and Apache Trino — so this mismatch is
+  at ten until a tag ships Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra — so this mismatch is
   expected, is tracked in `CATALOG_LISTING.md`, and must NOT be reported as a rendering
   failure. Record a screenshot/API dump of the card.
 

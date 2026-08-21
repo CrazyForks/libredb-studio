@@ -33,15 +33,25 @@ partner contact.
 > `UPDATE` or `CREATE TABLE` — so "manage data across …" must not be extended to include
 > them.
 >
-> The chart's own `description` in `Chart.yaml` names thirteen and **has not been updated
-> for Cassandra**, deliberately: `charts/libredb-studio/` is a packaged path, so editing it
-> requires a `Chart.yaml` version bump in the same PR (#167's required check) plus the
-> README `--version` examples and the `operator/helm-charts` mirror. That is a
-> release-coupled change and it belongs to whoever cuts the next chart, not to the PR that
-> added the engine. The same applies to every marketplace and packaging description that
-> spells the count (`deploy/azure`, `deploy/railway`, `deploy/caprover`, `packaging/*`,
-> `desktop/src-tauri/tauri.conf.json`, the operator CSVs): all of them describe a released
-> artifact. Read the number from `SHIPPED` when you update them.
+> **The chart's own `description` is not release-coupled and does name Cassandra.** An
+> earlier revision of this note said it deliberately did not, on the reasoning that
+> `charts/libredb-studio/` is a packaged path and editing it drags in a `Chart.yaml` version
+> bump (#167's required check), the README `--version` examples and the `operator/helm-charts`
+> mirror. Those four edits are the cost, not a reason to defer: the chart has been carried
+> with the engine since [#438](https://github.com/libredb/libredb-studio/pull/438), which
+> moved the description to thirteen and 0.1.39 to 0.1.40 in the PR that added Trino. Cassandra
+> followed the same path at chart 0.1.43. So a PR that adds an engine updates all four files;
+> it does not hand them to whoever cuts the next chart. Note the mirror must stay
+> byte-identical — run `bun run chart:bump` rather than editing
+> `operator/helm-charts/libredb-studio/` by hand, or the sync guard fails the required check.
+>
+> What *is* release-coupled is every marketplace and packaging description that spells the
+> count: `deploy/azure`, `deploy/railway`, `deploy/caprover`, `packaging/winget`,
+> `packaging/chocolatey`, `packaging/homebrew` and `desktop/src-tauri/tauri.conf.json` all
+> still say thirteen, because each describes an artifact a user can already download and
+> 0.12.0 ships no Cassandra provider. Read the number from `SHIPPED` when a tag carries it.
+> (`packaging/linux/nfpm.yaml` and the operator CSVs are the exception: both are consumed at
+> release time from `main`, so they name fourteen now and the next tag publishes it.)
 
 ## Listing facts
 
