@@ -1377,15 +1377,14 @@ in the image. `undici` was checked specifically, because the agent runtime sits 
 tracing cannot follow.
 
 #374 moved the shipped copy from 3.2.7 to 3.4.8 by upgrading Monaco itself, which
-cleared 14 of the 17. **Three or four remain** (FOSSA counts three, GitHub
-Advanced Security four - one advisory postdates FOSSA's scan) and none can be
-closed here: they need 3.4.9, 3.4.11, 3.4.12 and 3.4.13, Monaco pins dompurify
-exactly, and 0.56.0 is its newest release.
+cleared 14 of the 17. **Four remain**, on GitHub Advanced Security's count, and
+none can be closed here: they need 3.4.9, 3.4.11, 3.4.12 and 3.4.13, Monaco pins
+dompurify exactly, and 0.56.0 is its newest release.
 
 **Do not "fix" these with a `package.json` override.** Monaco ships DOMPurify
 inlined in its prebuilt `min/vs` bundle and nothing in `src/` imports the package,
 so an override would change a lockfile entry no shipped code reads, leave the
-bundle byte-identical, and turn `bun audit`, FOSSA and Trivy green at once. The
+bundle byte-identical, and turn `bun audit` and Trivy green at once. The
 GHAS findings land on `bun.lock:<line>`, which is the tell: every one of those
 tools reads the manifest, not the artefact.
 
@@ -1395,53 +1394,10 @@ chosen; and the LGPL-3.0 `@img/sharp-libvips-*` binaries never reach the runtime
 image, because the runner stage copies `node_modules` selectively and nothing in
 `src/` uses `next/image`.
 
-Consequence for the README: FOSSA publishes a second badge
-(`?type=shield&issueType=security`) alongside the license one already there, and
-it is red for exactly these advisories. Adding it was declined on 2026-08-15 -
-it would advertise a standing failure caused by an upstream pin rather than by
-anything neglected here. Add it when it goes green.
-
 Done when Monaco ships a dompurify at or past 3.4.13. Re-check on each Monaco
 release; verify by grepping the staged bundle for the version literal
 (`grep -o '"3\.4\.[0-9]*"' public/monaco/vs/editor-*.js`) rather than trusting the
 lockfile.
-
-### C11. The FOSSA integration reports three permanent failures
-
-FOSSA was connected in August 2026 and posts three commit statuses -
-`License Compliance`, `Security Analysis`, `Dependency Quality`. Under its default
-`Standard Bundle Distribution` policy all three fail, and they fail on every
-commit rather than on a regression, because they describe the standing dependency
-tree. They are commit statuses rather than check runs, so they carry no log to
-click through, and they are not in `main`'s required-check list, so they do not
-block a merge.
-
-The exported license issues (19) are almost entirely artefacts of how they are
-counted. Fourteen are the same LGPL-3.0 `@img/sharp-libvips-*` package counted
-once per platform binary, none of which ships (see C10). Two are file-level
-detections inside the `next` bundle (MPL-2.0 and a denied CC-BY-SA-4.0) against a
-package that is itself MIT. One is `highlight.js` CC-BY-SA-4.0 at depth 4 behind
-`@arethetypeswrong/cli`, a devDependency. One is the project itself at depth 0,
-denied for CC-BY-SA-3.0, which is the deliberately-vendored sample database in C8.
-That leaves `elkjs` EPL-2.0 - C9, and the only entry that is both real and ours.
-
-The cost of leaving it is that a permanently-red status trains everyone, including
-outside contributors, to read red as normal; #362 is the case where a genuine
-red mattered and was noticed only because nothing else was red.
-
-**Largely resolved on 2026-08-15.** The owner worked the FOSSA dashboard: the
-license findings above were ignored with their reasons, and `License Compliance`
-and `Dependency Quality` now pass. `Security Analysis` still reports three, which
-is the honest number - they are the Monaco-pinned DOMPurify advisories in C10, and
-this is now a status that means something rather than one that is always red.
-
-What remains is the cause rather than the symptom. FOSSA reads `bun.lock` but does
-not apply the manifest's dev/production split, so every devDependency is scanned as
-if it shipped - that is why `highlight.js`, four devDependency-only chains and the
-platform binaries appeared at all. Each new devDependency can therefore raise a
-finding that has to be ignored by hand. Done when that is reported upstream and
-fixed, or when the policy is scoped to production dependencies so the ignore list
-stops growing.
 
 ---
 
