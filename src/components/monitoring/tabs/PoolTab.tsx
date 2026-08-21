@@ -77,7 +77,19 @@ export function PoolTab({ connection }: PoolTabProps) {
     );
   }
 
-  const usagePercent = stats && stats.total > 0 ? Math.round((stats.active / stats.total) * 100) : 0;
+  // Absence and zero are different inputs. `/api/db/pool-stats` answers a literal
+  // `{total: 0, idle: 0, active: 0, waiting: 0, message: "Pool statistics not available
+  // for this provider"}` for every provider without `getPoolStats` - only postgres,
+  // oracle and mssql have one, so Cassandra, MySQL, SQLite, ClickHouse, Druid, Trino,
+  // Mongo, Redis and Couchbase all land there - and `stats === null` is the state of the
+  // very first paint, before any request has been made. In both cases nothing was
+  // inspected, so `message` (present in exactly the unmeasured case) is what separates
+  // them from a real reading: postgres before its pool opens returns an all-zero body
+  // with no message, and that IS a measurement - 0 connections, truthfully - which keeps
+  // the arithmetic and the labels below unchanged.
+  const measured = stats !== null && stats.message === undefined ? stats : null;
+  const usagePercent =
+    measured !== null && measured.total > 0 ? Math.round((measured.active / measured.total) * 100) : 0;
 
   return (
     <div className="p-3 sm:p-6 space-y-4 sm:space-y-6">
@@ -92,8 +104,10 @@ export function PoolTab({ connection }: PoolTabProps) {
         </Button>
       </div>
 
-      {stats?.message && (
-        <div className="text-xs text-muted-foreground bg-muted/30 rounded-lg p-3">{stats.message}</div>
+      {measured === null && (
+        <div className="text-xs text-muted-foreground bg-muted/30 rounded-lg p-3">
+          {stats?.message ?? "No connection pool information available."}
+        </div>
       )}
 
       {/* Pool Stats Cards */}
@@ -104,8 +118,8 @@ export function PoolTab({ connection }: PoolTabProps) {
             <Server strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-blue-500" />
           </CardHeader>
           <CardContent className="p-3 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{stats?.total ?? 0}</div>
-            <p className="text-xs sm:text-xs text-muted-foreground mt-1">Max pool size</p>
+            <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.total : "N/A"}</div>
+            {measured !== null && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Max pool size</p>}
           </CardContent>
         </Card>
 
@@ -115,9 +129,13 @@ export function PoolTab({ connection }: PoolTabProps) {
             <Activity strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-green-500" />
           </CardHeader>
           <CardContent className="p-3 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{stats?.active ?? 0}</div>
-            <Progress value={usagePercent} className="h-1 mt-1 sm:mt-2" />
-            <p className="text-xs sm:text-xs text-muted-foreground mt-1">{usagePercent}% utilized</p>
+            <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.active : "N/A"}</div>
+            {measured !== null && (
+              <>
+                <Progress value={usagePercent} className="h-1 mt-1 sm:mt-2" />
+                <p className="text-xs sm:text-xs text-muted-foreground mt-1">{usagePercent}% utilized</p>
+              </>
+            )}
           </CardContent>
         </Card>
 
@@ -127,23 +145,27 @@ export function PoolTab({ connection }: PoolTabProps) {
             <Clock strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-yellow-500" />
           </CardHeader>
           <CardContent className="p-3 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{stats?.idle ?? 0}</div>
-            <p className="text-xs sm:text-xs text-muted-foreground mt-1">Available</p>
+            <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.idle : "N/A"}</div>
+            {measured !== null && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Available</p>}
           </CardContent>
         </Card>
 
         <Card className="p-0">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
             <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Waiting</CardTitle>
-            <Badge variant={stats?.waiting ? "destructive" : "secondary"} className="text-xs">
-              {stats?.waiting ?? 0}
-            </Badge>
+            {measured !== null && (
+              <Badge variant={measured.waiting ? "destructive" : "secondary"} className="text-xs">
+                {measured.waiting}
+              </Badge>
+            )}
           </CardHeader>
           <CardContent className="p-3 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{stats?.waiting ?? 0}</div>
-            <p className="text-xs sm:text-xs text-muted-foreground mt-1">
-              {stats?.waiting ? "Queued requests" : "No queue"}
-            </p>
+            <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.waiting : "N/A"}</div>
+            {measured !== null && (
+              <p className="text-xs sm:text-xs text-muted-foreground mt-1">
+                {measured.waiting ? "Queued requests" : "No queue"}
+              </p>
+            )}
           </CardContent>
         </Card>
       </div>

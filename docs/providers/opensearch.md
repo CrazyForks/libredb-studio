@@ -836,8 +836,12 @@ The honest empties, each with its reason:
 - **`getPerformanceMetrics()` returns `{}`, not zeroes**, and this is load-bearing. `cacheHitRatio` is
   scored `direction: "below"` with `critical: 80` by `DEFAULT_THRESHOLDS`, so a "neutral" 0 would paint
   a red critical cache fault on every healthy cluster; the monitoring tabs default an **absent** ratio
-  to a healthy 100 instead. Every other metric would read as a measurement of zero. The numbers exist
-  on this product's stats endpoints, so this is a recorded gap rather than an impossibility.
+  to a healthy 100 instead. Every other metric would read as a measurement of zero — and **the tabs did
+  read them that way** until the rule #448 settled for the Storage tab reached them: measured
+  2026-08-19 on this product, the Overview showed *Buffer Pool 0%* and *Deadlocks 0* for two fields
+  this payload omits. Both cards now read `N/A` beside *Not measured*, so the empty payload survives to
+  the screen. The numbers exist on this product's stats endpoints, so this is a recorded gap rather
+  than an impossibility.
 - **`getSlowQueries()` and `getActiveSessions()` return `[]` rather than throwing.** Nothing is broken
   and nothing is misconfigured, so a monitoring tab should render as quiet, not as failed. Only
   `runMaintenance()` throws, because that one is a *request to act*.
@@ -878,7 +882,10 @@ rather than a row claiming the cluster stores zero bytes.
 **There is none.** `supportsMaintenance` is `false` and `maintenanceOperations` is `[]`, so no
 maintenance control renders for this connection: `TablesTab.tsx` reads the connected provider's
 capabilities (#272) and `OperationsTab.tsx` hides the whole Global Operations group where
-`supportsMaintenance` is false (#282).
+`supportsMaintenance` is false (#282). That first tab's *Vacuum* summary card reads the same
+declaration: it counted rows over a bloat ratio this provider never publishes, so it always said `0`
+over a green **OK** — a clean bill of health for an operation named below as impossible here — and it
+now says `N/A` over *Not supported*, with a dash in the per-row *Bloat* and *Last Vacuum* cells.
 
 Every `MaintenanceType` is either an index API rather than a statement, or impossible on this surface
 altogether:

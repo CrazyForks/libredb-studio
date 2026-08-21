@@ -470,6 +470,16 @@ There is no embedded stats API.
 `getOverview().tableCount` calls `getSchema()` internally — it is a full scan, so it honors the
 10 000-key cap and may undercount for very large files.
 
+The `[]` and the absent metrics above now reach the panels as absence rather than as zero. The
+**Tables** tab reads the empty `getTableStats()` against `tableCount` — prefix groups the store does
+know about, with statistics for none of them — so its *Tables* and *Size* cards read `N/A` and the
+list says *No table statistics available.* instead of summing `0` and `0 B`; the **Queries** tab's
+three cards read `N/A` for the same reason, an average over no statements not being `0.00ms`; and
+because `getPerformanceMetrics()` reports only `cacheHitRatio`, the *Buffer* and *Deadlocks* cards on
+the Overview and Performance tabs read `N/A` beside *Not measured* rather than `0%` and a `0` badged
+healthy. `cacheHitRatio: 100` is the one figure here that is stated rather than absent, and it keeps
+its gauge.
+
 ---
 
 ## 8. Maintenance
@@ -483,8 +493,10 @@ QueryError: Maintenance operation "<type>" is not supported for LibreDB
 This is reflected in `getCapabilities().supportsMaintenance = false` and
 `maintenanceOperations = []`. Both tabs that offer maintenance now hide it for this provider: the
 monitoring **Tables** tab renders no per-row control when a provider declares maintenance
-unsupported (issue #272), and the admin **Operations** tab hides its whole Global Operations group
-and its per-table buttons on the same reading (issue #282). Neither offers a control that could only
+unsupported (issue #272) — and, on the same reading, its *Vacuum* summary card now reads `N/A` over
+*Not supported* rather than the `0` over green **OK** that a bloat count over no rows produced, which
+was a clean bill of health for an operation this provider does not offer — and the admin
+**Operations** tab hides its whole Global Operations group and its per-table buttons (issue #282). Neither offers a control that could only
 answer HTTP 400. The schema explorer's own per-row `Analyze`/`Vacuum` items are hidden here too, but
 for a different reason — the rows are derived groupings, see 5.3.
 

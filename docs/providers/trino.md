@@ -348,6 +348,14 @@ The rate is read from JMX rather than derived from the query log on purpose: the
 in-memory history the coordinator trims, so counting rows in it over a window would report a rate
 that **falls to zero on a busy cluster** the moment the history wraps.
 
+The panels keep the absences absent, which they did not always: the Overview and Performance tabs read
+`bufferPoolUsage` and `deadlocks` as `?? 0` and so drew a `0 %` bar rated **Poor** in red and a `0`
+deadlock count badged **Healthy** — a fault and a clean bill of health for two figures this provider
+declines to publish. Both now read `N/A` beside the words *Not measured*, and their trend charts say
+the same instead of tracing zero. The monitoring Tables tab's per-row *Bloat* column went the same
+way: `getTableStats()` sets no bloat ratio, and a `0.0%` badge in the healthy variant reported a
+measurement nobody made, so the cell is a dash.
+
 ### 3.11 Values are passed through exactly as the wire encodes them
 
 Measured on 476, one statement:

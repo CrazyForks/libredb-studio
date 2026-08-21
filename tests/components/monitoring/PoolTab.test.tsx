@@ -62,4 +62,60 @@ describe("PoolTab", () => {
       expect(queryByText("Pool not available")).not.toBeNull();
     });
   });
+
+  // Absence and zero are different inputs. `/api/db/pool-stats` answers a literal
+  // all-zero body plus `message` for every provider without `getPoolStats` (Cassandra,
+  // MySQL, SQLite, ClickHouse, Druid, Trino, Mongo, Redis, Couchbase), so those zeros
+  // are the route's, not the engine's, and must not be rendered as measurements.
+  test("renders absence as words when the provider reports no pool statistics", async () => {
+    mockFetch.mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            total: 0,
+            idle: 0,
+            active: 0,
+            waiting: 0,
+            message: "Pool statistics not available for this provider",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    const { queryAllByText, queryByText } = render(<PoolTab connection={conn} />);
+    await waitFor(() => {
+      expect(queryByText("Pool statistics not available for this provider")).not.toBeNull();
+    });
+    // One "N/A" per card: Total, Active, Idle, Waiting.
+    expect(queryAllByText("N/A").length).toBe(4);
+    // The sub-labels each assert a fact about a pool nobody inspected.
+    expect(queryByText("Max pool size")).toBeNull();
+    expect(queryByText("Available")).toBeNull();
+    expect(queryByText("0% utilized")).toBeNull();
+    expect(queryByText("No queue")).toBeNull();
+  });
+
+  // The pin for the other input: postgres with no pool opened yet returns a real
+  // all-zero reading and no `message`. That is a measurement, and its rendering must
+  // stay byte-for-byte what it is today so the two inputs can never be collapsed.
+  test("keeps today's rendering for a measured zero", async () => {
+    mockFetch.mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ total: 0, idle: 0, active: 0, waiting: 0 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    const { queryAllByText, queryByText } = render(<PoolTab connection={conn} />);
+    await waitFor(() => {
+      expect(queryByText("Max pool size")).not.toBeNull();
+    });
+    expect(queryByText("Available")).not.toBeNull();
+    expect(queryByText("0% utilized")).not.toBeNull();
+    expect(queryByText("No queue")).not.toBeNull();
+    // Four card values plus the Waiting badge.
+    expect(queryAllByText("0").length).toBe(5);
+    expect(queryAllByText("N/A").length).toBe(0);
+  });
 });
