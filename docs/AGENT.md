@@ -270,7 +270,7 @@ from *answered* — a run that stopped because the model composed a cited report
 because the model had nothing more to say are both `succeeded`, and only this says which. The rail
 reads it and states the difference. The STATUS word is deliberately not the thing that carries it —
 [Whether the run answered](#whether-the-run-answered) is the field that does, beside the status
-rather than instead of it (B24).
+rather than instead of it.
 
 `stopReason` sits beside `reason`, which says why a drive died before or outside the loop. They
 answer different questions and are mutually exclusive in practice; when both are present, `reason`
@@ -1698,7 +1698,7 @@ Two honest limits, both deliberate:
   own words to decide whether the model answered would be grading the answer with the
   answer. What is checked is what the claims **rested on**, which is a fact about the run.
   A citation the ledger cannot resolve is skipped rather than assumed empty.
-- **The verdict is on the ledger, beside the status rather than instead of it** (B24, ratified
+- **The verdict is on the ledger, beside the status rather than instead of it** (ratified
   2026-08-13). `run-finished` carries an optional `goalVerdict`, written by
   `AgentRunService.finalize` — the one method every terminal path goes through, including the
   cancellation checkpoint that ends a run without returning to the loop. The status vocabulary is
@@ -2235,11 +2235,11 @@ They are listed here so the honest boundary is visible from the behaviour docume
 from the tracker.
 
 **Inherited from the enforcement layer** — `docs/BACKLOG.md`, section "Agent M1 deferrals (#328)",
-entries A1-A3 (that file carries a second, unrelated A-series under its security section). These bound
-what any agent statement can be promised: a SQLite statement is not preempted, so its timeout is post-execution and
-an overrunning statement blocks the runtime (A1); `VACUUM INTO` can create an empty file at a chosen
-path (A2); out-of-scope **reads** have no database-native control on either provider — the
-declared-target allowlist, the statement guard and the role's own grants are the whole boundary (A3).
+entries A1-A3. These bound what any agent statement can be promised: a SQLite statement is not
+preempted, so its timeout is post-execution and an overrunning statement blocks the runtime (A1);
+`VACUUM INTO` can create an empty file at a chosen path (A2); out-of-scope **reads** have no
+database-native control on either provider — the declared-target allowlist, the statement guard and
+the role's own grants are the whole boundary (A3).
 
 **From this milestone:**
 
