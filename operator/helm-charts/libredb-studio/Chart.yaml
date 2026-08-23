@@ -39,12 +39,14 @@ annotations:
   artifacthub.io/category: database
   artifacthub.io/license: MIT
   artifacthub.io/prerelease: "false"
-  # False: 0.13.3 changes no dependency and no security behaviour. Its whole
-  # content is a file mode inside the Linux desktop AppImage, which reaches
-  # neither the chart nor the image this chart deploys. The app-level security
-  # fixes remain recorded on 0.1.37, the chart version that first shipped them;
-  # the adm-zip pin note belongs to 0.1.44 and is unchanged.
-  artifacthub.io/containsSecurityUpdates: "false"
+  # True, and narrowly: no dependency moved and no CVE is involved, but a pasted
+  # rediss:// or couchbases:// URL landed on SSL mode `disable`, so a connection
+  # the user asked to encrypt was made in the clear - and the Couchbase transport
+  # was posting plain HTTP to the TLS management port. An operator deciding whether
+  # to upgrade should see that, which is what this flag is for. The app-level
+  # security fixes of earlier releases remain recorded on 0.1.37, the chart version
+  # that first shipped them; the adm-zip pin note belongs to 0.1.44, unchanged.
+  artifacthub.io/containsSecurityUpdates: "true"
   artifacthub.io/images: |
     - name: libredb-studio
       image: ghcr.io/libredb/libredb-studio:0.13.3
@@ -59,8 +61,12 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "The Linux desktop AppImage shipped a launcher only its builder could execute: linuxdeploy writes AppRun.wrapped as 0770 root:root, so anything reading the image with real permission checks - an extracted AppDir owned by another uid, a non-root container, or firejail's --appimage mount - died with Permission denied and never opened a window"
-    - "A private FUSE mount skips that check, which is why the ordinary double-click always worked and no gate ever saw it. The build now audits the bundled file modes and repacks the image, reusing the original runtime bytes so the change cannot alter whether the image mounts at all"
+    - "Every MySQL DDL and DML statement reported a failure for work the server had already applied: the driver returns an object rather than a row array for anything that returns no rows, so CREATE TABLE, INSERT, UPDATE and DELETE all answered with a TypeError while the change was committed. A SQL IDE reporting an error for a statement that ran is the worst available answer, because the user retries it"
+    - "A cache hit ratio was fabricated in eight providers rather than measured: SQLite claimed a fixed 95%, Couchbase published 0% when the stats read was denied (the ordinary case there, and 0 rates as critical), and Postgres, Oracle and SQL Server defaulted to 100 or 0 inside our own SQL. Absent metrics now read as not measured, and buffer pool usage stopped being the same quantity drawn twice"
+    - "MySQL lost its whole health panel, not one metric, on a tenant with no performance_schema database, because the ratio query ran uncaught"
+    - "A result exported as DDL typed numeric and timestamp columns as TEXT, and a binary value was written as its JSON shape - 46 bytes of JSON text where six bytes belonged. Postgres, MySQL, Oracle and SQL Server now report the engine's own column types, and every dialect writes a binary literal its own engine accepts, verified by replaying the export into seven engines"
+    - "A pasted rediss:// or couchbases:// URL landed on SSL mode disable, so the scheme was silently dropped - and the Couchbase transport was posting plain HTTP to the TLS management port"
+    - "The Linux desktop AppImage shipped a launcher only its builder could execute: linuxdeploy writes AppRun.wrapped as 0770 root:root, so anything reading the image with real permission checks - an extracted AppDir owned by another uid, a non-root container, or firejail's --appimage mount - died with Permission denied and never opened a window. A private FUSE mount skips that check, which is why the ordinary double-click always worked and no gate ever saw it"
     - "Chart 0.1.47 changes no template: its content is the appVersion move to 0.13.3"
     - "Track app release 0.13.3 (appVersion bump; default image tag follows)"
 dependencies:
