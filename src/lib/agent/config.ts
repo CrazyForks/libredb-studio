@@ -69,6 +69,37 @@ export const AGENT_WORLD_TARGET_ENV = "WORKFLOW_TARGET_WORLD";
  */
 const AGENT_TURN_TIMEOUT_ENV = "AGENT_MODEL_TURN_TIMEOUT_MS";
 
+/** Exported like the other variable names this file owns, so a test names it rather than spelling it. */
+export const AGENT_MODEL_TUNING_ENV = "AGENT_MODEL_TUNING_PATH";
+
+/**
+ * A file of measured per-model settings to layer over the ones Studio ships with, if any.
+ *
+ * This is how a model Studio has never measured gets settings somebody else measured: mount a
+ * file, name it here, restart. No release, no code change, no settings screen — which is how
+ * everything else in this product is configured.
+ *
+ * A path rather than a URL, deliberately. It works with no egress, it needs no cache and no
+ * story about what a run should do while a fetch is in flight, and a file an operator put on
+ * their own disk needs no provenance argument that a remote document would.
+ *
+ * Blank is the same as unset, because an empty variable is what a template renders when nobody
+ * filled it in, and reading it as "load the file called ''" would turn an unconfigured install
+ * into a warning on every boot. Whether the file parses is not decided here: see
+ * `model-tuning/index.ts`, which ignores a document it cannot read and keeps the bundled one.
+ *
+ * Resolved to an absolute path, so a relative value is reported as the file that was actually
+ * opened. The working directory is a different place in each way this ships — `/app` in the
+ * container, wherever the user stood under `npx`, the checkout in development — so `models.json`
+ * is really a question about which directory, and the answer belongs in the diagnosis rather than
+ * in whoever is guessing. Resolved rather than refused: refusing would add a failure mode, and an
+ * absolute path in the report says everything the refusal would have.
+ */
+export function agentModelTuningPath(): string | undefined {
+  const raw = process.env[AGENT_MODEL_TUNING_ENV]?.trim();
+  return raw === undefined || raw === "" ? undefined : path.resolve(raw);
+}
+
 /**
  * The configured per-turn ceiling, or `undefined` when nothing usable was set.
  *

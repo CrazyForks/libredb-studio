@@ -67,6 +67,22 @@ Note these, because a number without them cannot be compared:
 Then add a row to the model's page, or a new page under the family folder if the
 family is not covered. Sizes are rows inside a version page, not separate files.
 
+## Making it take effect
+
+A page records a measurement; it does not change how the model is driven. If yours needed
+something the defaults do not give it — a longer turn, a lower call ceiling, an empty turn asked
+again — write those settings as a **model-tuning document** and mount it. No Studio release, no
+code change.
+
+[`model-tuning.md`](model-tuning.md) is the contract: where the file goes, what every setting
+means and is bounded by, and how to check `GET /api/agent/config` to see whether it was applied or
+ignored. Start from [`model-tuning.example.json`](model-tuning.example.json) and change it.
+
+Two things worth knowing before you write one. An entry replaces the shipped entry for that model
+**whole**, so re-stating a model Studio already measured and mentioning one setting drops the rest
+to the defaults rather than keeping half the old entry. And a document may not carry wording: the
+sentences Studio says to a model stay in Studio.
+
 ## Five consecutive runs, not one
 
 One run per cell was the old method here and it was the weakest thing about it. These models are

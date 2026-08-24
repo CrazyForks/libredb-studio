@@ -1,40 +1,40 @@
 /**
- * Per-model settings for the agent loop: one file per model, and this is the register.
+ * Per-model settings for the agent loop: this is where a run asks what it was measured with.
  *
- * EVERY model has a file, including the ones the defaults already suit. That is the point. The
- * defaults are shared values, and a shared value is what has twice cost this repository a
- * locked cell — sampling pinned to 0 won five cells and lost one, a workflow rules reorder won
- * nothing and lost one. A model whose file states `temperature: 0` explicitly cannot be
- * reached by a later change to the default; a model relying on the default can.
+ * The settings themselves are DATA — `../model-tuning/measured-profiles.json`, which used to be
+ * ten TypeScript modules. Nothing about the discipline changed in moving them, and one part of it
+ * got stronger: those modules wrote `sampling: DEFAULT_SAMPLING`, a live reference, so each one's
+ * promise that a later change to the defaults could not reach its measurement was false. The
+ * document states the number, so the promise holds.
  *
- * A file is therefore not a place for preferences. It is the record of the settings a model's
- * numbers were obtained under, so the numbers still mean something after the defaults move.
- * `measured` carries those numbers and a test refuses a profile without them.
+ * The discipline itself is unchanged and worth restating. EVERY measured model has an entry,
+ * including the ones the defaults already suit, because a shared value is what has twice cost
+ * this repository a locked cell — sampling pinned to 0 won five cells and lost one, a workflow
+ * rules reorder won nothing and lost one. An entry is not a place for preferences: it records
+ * the settings a model's numbers were obtained under, so the numbers still mean something after
+ * the defaults move, and `measured` carries those numbers.
  *
- * Two files currently differ from the defaults, and each says why in its own words:
- * `qwen3-8b.ts` samples at 0.8 on query-optimization, `gemma4-26b.ts` narrows at 9 unreported
- * calls rather than 12. Both were written from ledger readings, and both record what they are
- * working around so the next reader knows when to re-measure and delete them.
+ * TWO LAYERS, later winning, which is what a run resolves through:
  *
- * A model with no file here is one nobody has measured yet — a genuinely new release. It gets
- * the defaults, which is the honest treatment of an unmeasured model.
+ *     compiled defaults  ->  the model's own entry
+ *
+ * There was briefly a third, between them: a per-PROVIDER tier, for settings that hold for
+ * everything reaching one provider rather than for one set of weights. It is gone, and the reason
+ * it is gone is the reason it should not come back until a measurement asks for it. Across the ten
+ * measured models NO setting is shared by all models of any provider — the overrides do not
+ * cluster that way — so the tier had a schema, a resolver, a merge order and tests, and no data.
+ * A layer that always resolves to nothing is worse than a missing one: it reads as working. When a
+ * measurement does cluster by provider, the layer is a small change to `resolve` below and a key
+ * in the document; that is a better trade than carrying it empty until then.
+ *
+ * A model nobody has measured therefore resolves exactly to the compiled defaults, which is the
+ * honest treatment of a model nobody has measured.
  */
 
+import { activeTuning } from "../model-tuning";
 import type { AgentRunWorkflowType } from "../types";
-import { BASELINE_NOTICES } from "./notices";
-import { GEMINI_3_5_FLASH_LITE } from "./gemini-3-5-flash-lite";
-import { GEMMA4_26B } from "./gemma4-26b";
-import { GRANITE4_1_30B } from "./granite4-1-30b";
-import { GRANITE4_1_8B } from "./granite4-1-8b";
-import { ORNITH_9B } from "./ornith-9b";
-import { QWEN3_14B } from "./qwen3-14b";
-import { QWEN3_4B } from "./qwen3-4b";
-import { QWEN3_5_9B } from "./qwen3-5-9b";
-import { QWEN3_8_LATEST } from "./qwen3-8-latest";
-import { QWEN3_8B } from "./qwen3-8b";
 import {
   type AgentModelProfile,
-  type AgentNotices,
   type AgentSampling,
   DEFAULT_PLAN_STATEMENT_RETRIES,
   DEFAULT_REPORT_REMINDER_LIMIT,
@@ -50,21 +50,30 @@ export type { AgentModelProfile } from "./profile";
 /**
  * The register, keyed by lower-cased model name.
  *
- * Lower-cased because the same weights answer to more than one spelling, and a key matched
- * exactly would silently stop applying the day a tag changed.
+ * Lower-cased because the same weights answer to more than one spelling. Note what that does and
+ * does not do: `QWEN3:8B` finds `qwen3:8b`, but a bare `qwen3.8` does NOT find `qwen3.8:latest`,
+ * because only the case is normalised and not the tag. The pinned table records both, so the day
+ * that is fixed the fix is visible; it is not fixed here, where no run was measured against it.
  */
-export const MODEL_PROFILES: Readonly<Record<string, AgentModelProfile>> = Object.freeze({
-  "gemini-3.5-flash-lite": GEMINI_3_5_FLASH_LITE,
-  "gemma4:26b": GEMMA4_26B,
-  "granite4.1:30b": GRANITE4_1_30B,
-  "granite4.1:8b": GRANITE4_1_8B,
-  "ornith:9b": ORNITH_9B,
-  "qwen3.5:9b": QWEN3_5_9B,
-  "qwen3.8:latest": QWEN3_8_LATEST,
-  "qwen3:14b": QWEN3_14B,
-  "qwen3:4b": QWEN3_4B,
-  "qwen3:8b": QWEN3_8B,
-} satisfies Record<string, AgentModelProfile>);
+export function modelProfiles(): Readonly<Record<string, AgentModelProfile>> {
+  return activeTuning().models;
+}
+
+/** One model's own entry, or nothing. */
+function entryFor(modelId: string): AgentModelProfile | undefined {
+  return activeTuning().models[modelId.toLowerCase()];
+}
+
+/**
+ * One setting, or nothing when this model states none.
+ *
+ * Written once rather than repeated in nine resolvers so that each resolver below is only the
+ * default it falls back to. It is also the one place a layer between the defaults and a model's
+ * own entry would be added, which is why it stays a function over a direct lookup.
+ */
+function resolve<K extends keyof AgentModelProfile>(modelId: string, key: K): AgentModelProfile[K] | undefined {
+  return entryFor(modelId)?.[key];
+}
 
 /**
  * How many unreported calls this model may make before the run is narrowed.
@@ -73,7 +82,7 @@ export const MODEL_PROFILES: Readonly<Record<string, AgentModelProfile>> = Objec
  * the loop, and a caller wanting one has no business resolving the other.
  */
 export function ceilingFor(modelId: string): number {
-  return MODEL_PROFILES[modelId.toLowerCase()]?.unreportedCallCeiling ?? DEFAULT_UNREPORTED_CALL_CEILING;
+  return resolve(modelId, "unreportedCallCeiling") ?? DEFAULT_UNREPORTED_CALL_CEILING;
 }
 
 /**
@@ -83,7 +92,7 @@ export function ceilingFor(modelId: string): number {
  * time, and a function that answered two questions would be called where only one was wanted.
  */
 export function reportReminderLimitFor(modelId: string): number {
-  return MODEL_PROFILES[modelId.toLowerCase()]?.reportReminderLimit ?? DEFAULT_REPORT_REMINDER_LIMIT;
+  return resolve(modelId, "reportReminderLimit") ?? DEFAULT_REPORT_REMINDER_LIMIT;
 }
 
 /**
@@ -93,7 +102,7 @@ export function reportReminderLimitFor(modelId: string): number {
  * model but the one whose ledgers asked for it.
  */
 export function planStatementRetriesFor(modelId: string): number {
-  return MODEL_PROFILES[modelId.toLowerCase()]?.planStatementRetries ?? DEFAULT_PLAN_STATEMENT_RETRIES;
+  return resolve(modelId, "planStatementRetries") ?? DEFAULT_PLAN_STATEMENT_RETRIES;
 }
 
 /**
@@ -103,14 +112,9 @@ export function planStatementRetriesFor(modelId: string): number {
  * so introducing the retry changed no other model's turn count.
  */
 export function retriesEmptyTurn(modelId: string): boolean {
-  return MODEL_PROFILES[modelId.toLowerCase()]?.retryEmptyTurn ?? DEFAULT_RETRY_EMPTY_TURN;
+  return resolve(modelId, "retryEmptyTurn") ?? DEFAULT_RETRY_EMPTY_TURN;
 }
 
-/**
- * How many times this model's report may be held to ask for the answer beside it.
- *
- * One everywhere but the model measured reporting straight through the first telling.
- */
 /**
  * This model's own turn limit, or undefined where the shipped one fits it.
  *
@@ -119,23 +123,16 @@ export function retriesEmptyTurn(modelId: string): boolean {
  * would put the same number in two places for a resolver to disagree with later.
  */
 export function turnTimeoutMsFor(modelId: string): number | undefined {
-  return MODEL_PROFILES[modelId.toLowerCase()]?.turnTimeoutMs;
-}
-
-export function presentReminderLimitFor(modelId: string): number {
-  return MODEL_PROFILES[modelId.toLowerCase()]?.presentReminderLimit ?? DEFAULT_PRESENT_REMINDER_LIMIT;
+  return resolve(modelId, "turnTimeoutMs");
 }
 
 /**
- * Every sentence this model is told, resolved from its own file.
+ * How many times this model's report may be held to ask for the answer beside it.
  *
- * The baseline fills only what a profile leaves unsaid, and for a measured model that is
- * nothing: each carries all four, so editing one model's wording reaches no other model and no
- * regression sweep is owed. The fallback exists for a model with no file at all, which is a
- * model nobody has measured.
+ * One everywhere but the model measured reporting straight through the first telling.
  */
-export function noticesFor(modelId: string): AgentNotices {
-  return { ...BASELINE_NOTICES, ...MODEL_PROFILES[modelId.toLowerCase()]?.notices };
+export function presentReminderLimitFor(modelId: string): number {
+  return resolve(modelId, "presentReminderLimit") ?? DEFAULT_PRESENT_REMINDER_LIMIT;
 }
 
 /**
@@ -145,7 +142,7 @@ export function noticesFor(modelId: string): AgentNotices {
  * not need the drive to tell it who it is refusing.
  */
 export function offersRefusalExamples(modelId: string): boolean {
-  return MODEL_PROFILES[modelId.toLowerCase()]?.refusalExamples ?? DEFAULT_REFUSAL_EXAMPLES;
+  return resolve(modelId, "refusalExamples") ?? DEFAULT_REFUSAL_EXAMPLES;
 }
 
 /**
@@ -153,8 +150,7 @@ export function offersRefusalExamples(modelId: string): boolean {
  * value for this surface. Later wins, and every layer is optional.
  */
 export function samplingFor(modelId: string, workflow: AgentRunWorkflowType | undefined): AgentSampling {
-  const profile = MODEL_PROFILES[modelId.toLowerCase()];
-  if (profile === undefined) return DEFAULT_SAMPLING;
-  const perWorkflow = workflow === undefined ? undefined : profile.perWorkflow?.[workflow];
-  return { ...DEFAULT_SAMPLING, ...profile.sampling, ...perWorkflow };
+  const own = entryFor(modelId);
+  const ownSurface = workflow === undefined ? undefined : own?.perWorkflow?.[workflow];
+  return { ...DEFAULT_SAMPLING, ...own?.sampling, ...ownSurface };
 }
