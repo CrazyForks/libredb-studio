@@ -6,10 +6,11 @@
  * also how a document that arrives from somewhere else will be checked.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { activeTuning, operatorTuningStatus, resetTuning } from "@/lib/agent/model-tuning";
+import { activeTuning, operatorTuningStatus, resetTuning, tuningProvenance } from "@/lib/agent/model-tuning";
 import bundled from "@/lib/agent/model-tuning/measured-profiles.json";
 import {
   ModelTuningError,
@@ -463,6 +464,25 @@ describe("a document an operator supplies", () => {
     expect(status.state === "ignored" && status.reason).toContain("JSON");
   });
 
+  test("reports a digest of the document it applied, so a later edit is visible", () => {
+    /*
+      The status says WHICH file; the digest says WHICH VERSION of it. A run recorded against a
+      path alone cannot be told apart from a run against the same path after somebody edited it,
+      which is most of the value of recording the path at all.
+
+      Of the bytes as read, not of the parsed result: a parsed object would have to be serialised
+      to be hashed, and two serialisations of one document are the same file while two files with
+      the same meaning are not the same evidence.
+    */
+    const body = JSON.stringify(document());
+    process.env[ENV] = writeDocument(body);
+    resetTuning();
+    const status = operatorTuningStatus();
+
+    expect(status.state).toBe("applied");
+    expect(status.state === "applied" && status.digest).toBe(createHash("sha256").update(body).digest("hex"));
+  });
+
   test("reports the document it applied, and how many models it carried", () => {
     process.env[ENV] = writeDocument(document());
     resetTuning();
@@ -484,6 +504,45 @@ describe("a document an operator supplies", () => {
     const status = operatorTuningStatus();
     expect(status.state).toBe("ignored");
     expect(status.state === "ignored" && status.path).toBe(resolve("not-a-real-document.json"));
+  });
+
+  test("says operator ONLY for a model the operator's document actually supplied", () => {
+    /*
+      The provenance answers "what drove THIS run", not "what was configured on this server", and
+      the two come apart the moment a document names a model the run is not using.
+
+      Demonstrated by accident before it was fixed: a live check mounted a document for
+      `mistral-small:24b` — chosen precisely so it would not change the running model — drove
+      `gemini-3.5-flash-lite`, and the ledger recorded `operator` with that document's digest while
+      gemini's settings had come from the bundled one. The event named a file that had not touched
+      the run.
+
+      Lower-cased on the way in, because that is how the register is keyed and a provenance that
+      disagreed with the resolver about which entry applies would be worse than no provenance.
+    */
+    const body = JSON.stringify(
+      document({ models: [{ id: "Some-Model:9B", measured: "m", settings: { retryEmptyTurn: true } }] }),
+    );
+    process.env[ENV] = writeDocument(body);
+    resetTuning();
+
+    expect(tuningProvenance("some-model:9b")).toEqual({
+      origin: "operator",
+      digest: createHash("sha256").update(body).digest("hex"),
+    });
+    // Applied, but silent about this model — so this model was driven by the shipped settings.
+    expect(tuningProvenance("gemini-3.5-flash-lite")).toEqual({ origin: "bundled" });
+  });
+
+  test("projects the other two states onto what a run records", () => {
+    resetTuning();
+    expect(tuningProvenance("qwen3:8b")).toEqual({ origin: "bundled" });
+
+    process.env[ENV] = writeDocument("{ not json");
+    resetTuning();
+    // No path: the ledger is readable by any owner of the run, and a server filesystem path is
+    // not theirs to read. Which file it was belongs to `GET /api/agent/config`, which is admin-only.
+    expect(tuningProvenance("qwen3:8b")).toEqual({ origin: "operator-ignored" });
   });
 
   test("reports nothing configured when no path was set", () => {

@@ -189,6 +189,45 @@ describe("foldLedgerEntries", () => {
     that says the run stopped without a cited report — which is the difference
     between "succeeded" and "answered".
   */
+  test("the rail names the model that drove the run, and never the document behind it", () => {
+    /*
+      Two halves, and the second is the one worth having.
+
+      SHOWN: which model produced a run was not visible anywhere in this interface. For somebody
+      running several local models it is the first thing they want to know about a run they are
+      reading back, and the ledger now carries it.
+
+      NOT SHOWN: the tuning provenance the same event carries. Its digest is an auditing detail —
+      it answers "which settings drove this" for whoever deploys the server, and that reader has
+      `GET /api/agent/config`. Asserted as an absence rather than trusted to the mapping, which is
+      how the path would have been caught had it stayed on the event at all.
+    */
+    const view = foldLedgerEntries([
+      OPENED,
+      event({ kind: "event", event: { kind: "run-started", atMs: 2, mode: "agent" } }),
+      event({
+        kind: "event",
+        event: {
+          kind: "driver-resolved",
+          atMs: 3,
+          modelId: "qwen3:8b",
+          provider: "ollama",
+          tuning: { origin: "operator", digest: "c".repeat(64) },
+        },
+      }),
+    ]);
+
+    const driver = view.items.at(-1);
+    expect(driver?.headline).toBe("Driven by qwen3:8b");
+    expect(driver?.chrome).toBe(true);
+    expect(driver?.tone).toBe("neutral");
+    // The digest is the whole of what the event carries about the document now — the path was
+    // removed from the event itself, because this record is served to the run's owner and a
+    // server path is not theirs. The rail still must not print the digest: it identifies a
+    // deployment's configuration and answers a question the user did not ask.
+    expect(JSON.stringify(view.items)).not.toContain("c".repeat(64));
+  });
+
   test("the model's closing prose becomes an entry of its own", () => {
     const view = foldLedgerEntries([
       OPENED,
