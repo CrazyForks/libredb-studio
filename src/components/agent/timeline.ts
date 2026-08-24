@@ -63,6 +63,19 @@ export type AgentTimelineTone = "neutral" | "progress" | "refused" | "done";
 type PlanStatementEvent = Extract<AgentRunEvent, { kind: "plan-statement-drafted" }>;
 
 /**
+ * What each sentence the drive says is called in the rail, in the reader's terms.
+ *
+ * A table rather than the notice's own text: the wording is per model now
+ * (`lib/agent/models/notices.ts`), and a rail that printed the paragraph would be handing the
+ * user prose written for a model to act on.
+ */
+const GUIDANCE_HEADLINE: Record<Extract<AgentRunEvent, { kind: "guidance-issued" }>["notice"], string> = {
+  "report-reminder": "Asked to file its report",
+  "plan-statement": "Asked for a runnable statement",
+  "report-reserve": "Told this is its last turn",
+};
+
+/**
  * What a surface needs to render the statement a PLAN run drafted, taken from the
  * ledger's own record of it (item 7 of the plan-mode SQL-generator design of
  * 2026-08-15).
@@ -937,6 +950,63 @@ function describeEvent(
         // gate's outcome is the ledger's, so the rail acts on what was RECORDED
         // rather than deciding again in the browser what may be run.
         ...(event.handover === "none" ? {} : { handover: { kind: event.handover, sql: event.sql } }),
+      };
+    case "call-held":
+      return {
+        /*
+          Not a failure and not progress: the server turned a call back and said what it
+          wanted instead. Rendered because a reader who cannot see it reads the run as
+          having reported once, when what happened is that it tried, was asked for
+          something, and tried again — and on the runs where the model declines the offer,
+          this entry is the only place the offer exists at all.
+        */
+        // `refused` is the existing tone for "the server did not run this", which is
+        // exactly what happened here; a new tone would be a second colour for one fact.
+        tone: "refused",
+        headline: `Held back ${event.tool}`,
+        detail: event.reason,
+      };
+    case "call-declined":
+      return {
+        /*
+          The tool said no. Same tone as a held call, because the user-visible fact is the
+          same — this server did not run it — and a second colour for one fact would make the
+          rail harder to read rather than more precise.
+
+          The reason CODE is shown rather than a translation of it. A reader looking at a run
+          that produced no answer needs the word the server used, because that word is what a
+          search of this repository finds; a friendlier paraphrase would be a third name for
+          something that already has two.
+        */
+        tone: "refused",
+        headline: `Declined ${event.tool}`,
+        detail: event.reasonCode,
+      };
+    case "guidance-issued":
+      return {
+        /*
+          Something this server said, on a turn where it refused nothing. Neutral, because
+          nothing was turned back — a held call gets the `refused` tone and says so — and named
+          rather than quoted: the wording is per model now, and a rail that printed the whole
+          sentence would be repeating a paragraph the user did not ask to read.
+        */
+        tone: "neutral",
+        headline: GUIDANCE_HEADLINE[event.notice],
+      };
+    case "model-stopped-saying":
+      return {
+        /*
+          What the model said as it stopped without filing anything. Neutral rather than
+          refused: nothing was turned back and nothing failed — the run simply ended, and the
+          entry exists so a reader can see WHY rather than staring at a run that trails off.
+
+          Carried as `prose`, because these are the model's own words: `detail` is the field
+          for this application's sentences, and putting a model's paragraph there once rendered
+          an entire markdown answer as one run of literal characters.
+        */
+        tone: "neutral",
+        headline: "Stopped after saying",
+        prose: event.text,
       };
     case "closing-statement":
       return {

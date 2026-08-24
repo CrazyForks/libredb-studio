@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { forgetHeldSnapshots } from "@/lib/agent/context-snapshot";
 import { DEPARTMENTS, type EvalEngine, type EvalRun, openEvalRun } from "../isolated/fixtures/agent-eval-harness";
-import { type Turn, answersProse, callsTool, reportOn } from "../isolated/fixtures/agent-scripted-model";
+import { type Turn, answersProse, callsTool, promptText, reportOn } from "../isolated/fixtures/agent-scripted-model";
+import { chatToolCallStream } from "../isolated/fixtures/agent-transport";
 import { QueryError } from "@/lib/db/errors";
 
 /**
@@ -334,7 +335,18 @@ describe("an engine that cannot serve a reading", () => {
       answersProse("This server keeps no slow-query statistics."),
     ]);
 
-    expect(drive.kinds).toEqual(["run-started", "tool-invoked", "tool-refused", "closing-statement", "run-finished"]);
+    // `model-stopped-saying` is one entry more than this arc used to write, and it belongs to
+    // this scenario as much as the refusal does: the run was refused, said something, and
+    // stopped. Which of those three the reader is looking at used to be a guess.
+    expect(drive.kinds).toEqual([
+      "run-started",
+      "tool-invoked",
+      "tool-refused",
+      "guidance-issued",
+      "model-stopped-saying",
+      "closing-statement",
+      "run-finished",
+    ]);
     expect(drive.status).toBe("succeeded");
     // Nothing was cited, so the run is honestly recorded as not having answered —
     // the workflow's bar is a cited reading, and it took none.
@@ -399,5 +411,163 @@ describe("an engine that cannot serve a reading", () => {
 
     expect(drive.verdict.outcome).toBe("answered");
     expect(drive.statements).toEqual([]);
+  });
+});
+
+describe("a run that took readings and cited none is asked once, with the ids", () => {
+  /*
+    Measured, and the shape is unambiguous: one evaluated model called
+    `inspect_operations` SIX times, every call completed, and then composed a report whose
+    only citation was the schema inventory — `no-reading`, the arm #411 made necessary.
+    `verifyOperationsGoal` asks for one `source: "artifact"` reference and got none.
+
+    The run had done the work. It cited the wrong thing, and nothing told it so at a
+    moment it could still act — `compose_report` ends the run. So the call is held back
+    once and the ids of the readings it actually took are named, exactly as the
+    plan notices name plan ids.
+
+    This is the general form of that mistake and it is not confined to `operations`: on
+    every other agent workflow the same misdirection scores `empty-evidence` when the only
+    artifacts cited came back with no rows while the run held ones that did.
+
+    The #350 guard applies as always: the notice fires only when the run HOLDS a usable
+    artifact. A run with nothing to cite is told nothing, because it would be being asked
+    for the impossible.
+  */
+  const citesSnapshotOnly =
+    (claim: string) =>
+    (turn: Turn): Response => {
+      const match = /\{"source":"context-snapshot","fingerprint":"(ctx_[a-z0-9]+)"\}/.exec(promptText(turn));
+      if (match === null) throw new Error(`no snapshot citation offered: ${promptText(turn).slice(0, 600)}`);
+      return chatToolCallStream(
+        "compose_report",
+        JSON.stringify({ claims: [{ claim, evidence: [{ source: "context-snapshot", fingerprint: match[1] }] }] }),
+        "call_report",
+      );
+    };
+
+  test("the report is held back, a reading id is named, and the run may still answer", async () => {
+    const run = await open("postgres");
+
+    const drive = await run.drive([
+      reads("sessions"),
+      citesSnapshotOnly("One session has been blocked on a lock for over four minutes."),
+      reportOn("One session has been blocked on a lock for over four minutes."),
+    ]);
+
+    expect(drive.transcripts[2]).toContain("cited none of them");
+    // The notice carries the id of the reading this run took, so the model has nothing to
+    // look up.
+    const reading = drive.events.find((event) => event.kind === "tool-completed");
+    if (reading?.kind !== "tool-completed") throw new Error("expected a reading");
+    expect(drive.transcripts[2]).toContain(reading.artifact.correlationId);
+    // And the run went on to answer, so the notice cost it nothing.
+    expect(drive.verdict).toEqual({ outcome: "answered", verifier: "agent-operations.2", unmet: [] });
+  });
+
+  test("a run that ignores the notice still reports, and still fails the bar honestly", async () => {
+    // The guarantee every notice in this loop has to keep: offered ONCE, then out of the
+    // way. A notice that could swallow a report would trade `no-reading` for `no-report`,
+    // which is the worse verdict.
+    const run = await open("postgres");
+
+    const drive = await run.drive([
+      reads("sessions"),
+      citesSnapshotOnly("One session has been blocked on a lock for over four minutes."),
+      citesSnapshotOnly("One session has been blocked on a lock for over four minutes."),
+    ]);
+
+    expect(drive.stopReason).toBe("report-composed");
+    expect(drive.verdict.unmet).toEqual(["no-reading"]);
+  });
+
+  test("a run holding no reading at all is told the OTHER sentence, not this one", async () => {
+    /*
+      This test used to assert that such a run is told nothing at all, on the #350 reasoning
+      that a run with nothing to cite would be asked for the impossible. Half right: it
+      cannot be asked to CITE, which is why this notice still stays silent for it. But it
+      can be asked to READ, and never being told that is what an entire cell was made of —
+      see the describe block below, where one model loses this surface 5 times out of 5
+      without ever calling `inspect_operations`.
+
+      So the two sentences divide by what the run holds: artifacts and the wrong citation
+      gets the ids named here; no artifacts at all gets sent to the reading tool. What this
+      test still pins is that the id-naming notice is not the one that fires when there are
+      no ids.
+    */
+    const run = await open("postgres");
+
+    // Three, because narrating instead of reporting earns the report reminder and the drive
+    // takes another turn for it.
+    const drive = await run.drive([
+      citesSnapshotOnly("Nothing is blocked as far as I can tell."),
+      answersProse("ok"),
+      answersProse("still ok"),
+    ]);
+
+    expect(drive.transcripts[1]).not.toContain("cite the reading");
+    expect(drive.transcripts[1]).toContain("inspect_operations");
+  });
+});
+
+describe("a run that read NOTHING is told what this workflow is scored on", () => {
+  /*
+    The other half of the cite notice, and the one that had no sentence at all.
+
+    `citeWhatYouReadNotice` fires only when the run HOLDS a usable artifact — a run with
+    nothing to cite would be asked for the impossible. That guard is right, and it left a
+    hole: a run that took NO reading and reported off the captured inventory holds nothing,
+    hears nothing, and dies of `no-reading` having never been told the bar exists.
+
+    Measured, and it is an entire cell. One model loses `operations` 5 times out of 5, and
+    all five ledgers are four events long: started, context captured, report composed,
+    finished. Five to six seconds. It answers "eight tables with no associated indexes"
+    from the inventory it was handed and never calls `inspect_operations`. It is a 24B model
+    that reads competently on other surfaces — this is not capacity, it is a run answering
+    on turn one because nothing said the answer had to rest on a reading.
+
+    NOT narrowed, and that is load-bearing: `AGENT_NARROWED_EXTRA_TOOLS.operations` is `[]`,
+    so narrowing here would take `inspect_operations` away — the one tool the sentence asks
+    for. The same trap `no-plan-evidence` documents.
+  */
+  const citesSnapshotOnly =
+    (claim: string) =>
+    (turn: Turn): Response => {
+      const match = /\{"source":"context-snapshot","fingerprint":"(ctx_[a-z0-9]+)"\}/.exec(promptText(turn));
+      if (match === null) throw new Error(`no snapshot citation offered: ${promptText(turn).slice(0, 600)}`);
+      return chatToolCallStream(
+        "compose_report",
+        JSON.stringify({ claims: [{ claim, evidence: [{ source: "context-snapshot", fingerprint: match[1] }] }] }),
+        "call_report",
+      );
+    };
+
+  test("reporting off the inventory alone is held once, and the run may still answer", async () => {
+    const run = await open("postgres");
+
+    const drive = await run.drive([
+      citesSnapshotOnly("Eight tables, and none of them carry an index."),
+      callsTool("inspect_operations", { kind: "sessions" }, "call_sessions"),
+      reportOn("One session is connected and idle."),
+    ]);
+
+    // Told at the moment it can still act, and told which tool the bar names.
+    expect(drive.transcripts[1]).toContain("inspect_operations");
+    // And the tool it was sent to was still in its hands when it got there.
+    expect(drive.kinds).toContain("tool-completed");
+    expect(drive.verdict.outcome).toBe("answered");
+  });
+
+  test("a run that will not read still gets its honest verdict", async () => {
+    // The guarantee every notice here keeps: offered once, then out of the way.
+    const run = await open("postgres");
+
+    const drive = await run.drive([
+      citesSnapshotOnly("Eight tables, and none of them carry an index."),
+      citesSnapshotOnly("Eight tables, and none of them carry an index."),
+      citesSnapshotOnly("Eight tables, and none of them carry an index."),
+    ]);
+
+    expect(drive.verdict.unmet).toEqual(["no-reading"]);
   });
 });

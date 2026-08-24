@@ -238,6 +238,43 @@ describe("the drafted statement is read out of the closing prose", () => {
     expect(draft).toEqual({ kind: "statement", sql: "SELECT 'NO STATEMENT: none' AS note", tag: "sql" });
   });
 
+  /*
+    Measured, and it is our defect rather than the models'. `no-statement` blocks four cells
+    and four of the losing runs across THREE models, `qwen3:4b` among them, end with exactly
+    this:
+
+        NO STATEMENT:
+        The provided schema inventory includes the complete answer to the question, so a
+        runnable SQL query is not needed. The question that would allow writing such a
+        statement is: "..."
+
+    The marker line ends where it ends and the explanation starts on the next line. Every one
+    of those runs did what plan mode asks — refused, said what was missing, asked the one
+    question — and every one was scored as having said nothing, because this reader looked
+    only at the remainder of the marker's OWN line and found it empty.
+
+    The #396 rule the empty check exists for is untouched: a marker with nothing after it
+    ANYWHERE is still `absent`, because the convention exists so the run says what it lacks
+    and a token that says nothing is not the ending the mode is for. What changes is where
+    "after it" is allowed to be.
+  */
+  test("a refusal whose reason begins on the next line is still a refusal", () => {
+    expect(readPlanStatement("NO STATEMENT:\nThe inventory has no table of payments.")).toEqual({
+      kind: "refusal",
+      detail: "The inventory has no table of payments.",
+    });
+    // Trailing space after the marker, and a blank line before the reason: both measured.
+    expect(readPlanStatement("NO STATEMENT: \n\nThe inventory has no table of payments.")).toEqual({
+      kind: "refusal",
+      detail: "The inventory has no table of payments.",
+    });
+  });
+
+  test("a marker with nothing after it anywhere is still not a refusal", () => {
+    expect(readPlanStatement("NO STATEMENT:")).toEqual({ kind: "absent" });
+    expect(readPlanStatement("NO STATEMENT:\n\n   \n")).toEqual({ kind: "absent" });
+  });
+
   test("only the first refusal line is read, so a run repeating itself says one thing", () => {
     expect(readPlanStatement("NO STATEMENT: first.\nNO STATEMENT: second.")).toEqual({
       kind: "refusal",
@@ -441,5 +478,79 @@ describe("an engine whose statements are not SQL is not judged by a SQL reader (
     expect(validation.guardApplicable).toBe(true);
     expect(validation.readOnly).toBe(false);
     expect(validation.guardViolation).toBe("NON_READ_STATEMENT");
+  });
+});
+
+describe("a statement the model wrote without a fence", () => {
+  /*
+    Measured, and the two shapes it comes in have to be told apart.
+
+    One model was asked for a plan and produced this, verbatim:
+
+        sqlite
+        SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' …
+
+        The statement retrieves the names of the tables in the database. …
+
+    It had understood the contract well enough to write the engine tag on its own line
+    and the statement under it. It simply left out the backticks, and the run was scored
+    `no-statement` — the plan-mode bar — for a formatting slip around a real statement.
+
+    Another produced the other shape on the same objective:
+
+        sqlite
+        <sqlite>
+        The tables are: current_dept_emp, department, dept_emp, …
+        </sqlite>
+
+    That is prose, and it must NOT be read as a statement. `plan-statement-drafted` is
+    recorded whenever this reader returns one and the validation result rides along
+    rather than gating it, so a reader that accepted this would score the run answered
+    while the user looked at a sentence. The whole value of loosening the fence rule
+    depends on it staying closed to that.
+
+    So an unfenced candidate is accepted only when the text plainly opens a statement —
+    a line beginning with a query verb. That admits the first and rejects the second,
+    and the guard and identifier checks still judge what it admits.
+  */
+  const ENGINE_THEN_SQL = [
+    "sqlite",
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';",
+    "",
+    "The statement retrieves the names of the tables in the database.",
+  ].join("\n");
+
+  const ENGINE_THEN_PROSE = ["sqlite", "<sqlite>", "The tables are: department, employee, salary.", "</sqlite>"].join(
+    "\n",
+  );
+
+  test("an unfenced statement is read, because the slip is the backticks and not the SQL", () => {
+    const draft = readPlanStatement(ENGINE_THEN_SQL, "sqlite");
+
+    expect(draft.kind).toBe("statement");
+    if (draft.kind !== "statement") throw new Error("expected a statement");
+    expect(draft.sql).toStartWith("SELECT table_name");
+    // The prose that followed it is not part of the statement.
+    expect(draft.sql).not.toContain("The statement retrieves");
+  });
+
+  test("prose is still not a statement, however the model wrapped it", () => {
+    expect(readPlanStatement(ENGINE_THEN_PROSE, "sqlite").kind).toBe("absent");
+  });
+
+  test("a fenced block still wins, so nothing about the normal path changes", () => {
+    const both = ["Here is my plan.", "```sql", "SELECT 1;", "```", "SELECT 2;"].join("\n");
+
+    const draft = readPlanStatement(both, "sqlite");
+
+    if (draft.kind !== "statement") throw new Error("expected a statement");
+    expect(draft.sql).toBe("SELECT 1;");
+  });
+
+  test("a refusal still wins over an unfenced statement, for the reason it wins over a fenced one", () => {
+    // A run that declined and then illustrated has not produced a deliverable.
+    const text = [`${PLAN_NO_STATEMENT_MARKER} Tell me which column records the price.`, "SELECT 1;"].join("\n");
+
+    expect(readPlanStatement(text, "sqlite").kind).toBe("refusal");
   });
 });

@@ -1,31 +1,28 @@
 # ornith
 
-`ollama pull ornith:9b` · one size measured: 9b (5.6 GB)
+`ollama pull ornith:<size>` · sizes supported: 9b
 
-An unproven family that passes everything, quickly, at a size a laptop can hold. One
-of the two models worth reaching for first on modest hardware.
+Every size listed here runs **all six agent surfaces**, five consecutive times each: 30 of 30
+runs. One size, and it clears every surface with no setting of its own beyond a single extra plan turn.
 
-## Results
+## What it does, and how long it takes
 
-| Size | Disk | Investigate | Operate | Analyze | Score |
-| --- | --- | --- | --- | --- | --- |
-| **9b** | **5.6 GB** | ✅ 14s | ✅ 26s | ✅ 21s | **3/3** |
+Seconds are the median of the runs that passed, per surface.
 
-Every workflow inside half a minute, including the analysis question, where it read
-the data, presented the result and reported with citations. No runtime fix was needed
-for any of it.
+| Size | Disk | Investigate | Optimize | Assess | Operate | Analyze | Plan | Median | Slowest |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ornith:9b | 5.5 GB | 20s | 36s | 51s | 21s | 16s | 31s | **31s** | 1:58 |
 
-```bash
-ollama pull ornith:9b
-LLM_PROVIDER=ollama LLM_MODEL=ornith:9b LLM_API_URL=http://localhost:11434/v1
-```
+Every cell is 5/5, so the table says how long rather than whether.
 
-## Why it is here
+## What it needs that the defaults do not give it
 
-It was pulled as a deliberate long shot — a family with no track record for this
-workload — on the reasoning that a user browsing the model library will try exactly
-such a model, so the docs should say what happens when they do. It scores 3/3.
+### `ornith:9b`
 
-For an even smaller download at the same score, see
-[`qwen3:4b`](../qwen/qwen3.md) at 2.5 GB. `ornith:9b` has more headroom on the
-analysis question.
+**one extra plan turn.** Its plans describe the schema correctly and completely and stop one sentence short of the runnable statement the surface is scored on.
+
+
+---
+
+Method, and where these numbers stop being safe to generalise from:
+[`methodology.md`](../methodology.md).

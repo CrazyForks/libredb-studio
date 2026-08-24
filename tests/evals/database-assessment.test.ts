@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { type EvalEngine, type EvalRun, openEvalRun } from "../isolated/fixtures/agent-eval-harness";
-import { type Turn, answersProse, callsTool, reportOn } from "../isolated/fixtures/agent-scripted-model";
+import {
+  type Turn,
+  answersProse,
+  callsTool,
+  promptText,
+  reportCitingWhatWasOffered,
+  reportOn,
+  reportOnAll,
+} from "../isolated/fixtures/agent-scripted-model";
 import { chatToolCallStream } from "../isolated/fixtures/agent-transport";
 import { ConnectionError, QueryError } from "@/lib/db/errors";
 
@@ -113,6 +121,66 @@ describe("the assessment arc, on both reference engines", () => {
   }
 });
 
+describe("the bar this workflow is judged against is stated to the model", () => {
+  /*
+    The #350/#356 rule, applied to the one workflow that was still missing it.
+
+    `verifyDatabaseAssessmentGoal` requires a `table-profiled` event: a report resting
+    on the schema inventory alone is `no-table-profile` however good its prose. The
+    rules said "profile the tables that matter", which reads as advice about WHERE to
+    look rather than as the condition the report is judged by — and the `operations`
+    rules already show what stating a bar looks like ("your report must cite at least
+    one reading you took"), with a comment saying why: a rule the model is never told
+    is a rule live runs fail.
+
+    Measured across 25 local models on this workflow: 18 failed it, and five of those
+    composed a report having called NO tool at all. They were not refusing to profile;
+    nothing had told them a profile was required.
+
+    The rule names the TOOL for a measured reason, which is why this asserts the tool
+    name and not a paraphrase. Told "profile at least one table", one model composed
+    eighteen count statements by hand with `run_read_query` and three other models went
+    to `inspect_schema`: every one of them had done what the sentence asked and none
+    produced the `table-profiled` event the verifier reads.
+  */
+  test("a run is told which tool it must call before it reports", async () => {
+    const prompts: string[] = [];
+    const run = await open("sqlite");
+
+    await run.drive([
+      (turn) => {
+        prompts.push(promptText(turn));
+        return answersProse("nothing to do")(turn);
+      },
+    ]);
+
+    expect(prompts[0]).toContain("call profile_table on at least one table before you report");
+  });
+
+  test("and a run that reports without one is judged exactly that way", async () => {
+    // The other half, so the rule above is stated because it is enforced rather than
+    // as decoration. Both directions are asserted for the reason the operations
+    // verifier test gives: an arm that only ever fires would fail every accurate run.
+    const run = await open("sqlite");
+
+    // Citing the inventory the server captured, which is the shape a live run took:
+    // a report about the data resting on the list of table names alone.
+    // Twice: the run is asked for a profile once before its report is allowed through, and
+    // this one is about what happens when it does not take the offer.
+    const drive = await run.drive([
+      reportCitingWhatWasOffered("The data looks incomplete in places."),
+      reportCitingWhatWasOffered("The data looks incomplete in places."),
+      reportCitingWhatWasOffered("The data looks incomplete in places."),
+    ]);
+
+    expect(drive.verdict).toEqual({
+      outcome: "unanswered",
+      verifier: "agent-database-assessment.1",
+      unmet: ["no-table-profile"],
+    });
+  });
+});
+
 describe("a profile's artifact is an artifact like any other", () => {
   test("it settles a step, so it is citable, fetchable and charged to the budget", async () => {
     // Three consumers read `tool-completed` and nothing else: `composeReportTool`'s
@@ -172,8 +240,17 @@ describe("THE GATE: the verifier fails the run when the template's own artifact 
     test(`${engine}: a cited report written from the schema alone does not assess the data`, async () => {
       const run = await open(engine);
 
+      /*
+        Two report turns, because the run is now told what its report is missing BEFORE
+        that report lands (`shortfallsIfReported`): held back once and asked for a
+        profile. The second report is the model declining, which is what this gate is
+        about — the bar closes on a run that will not profile, and the nudge does not
+        rescue it.
+      */
       const drive = await run.drive([
         callsTool("run_read_query", { sql: "SELECT 1", rationale: "a look" }),
+        reportOn("The schema has eight tables and looks reasonable."),
+        reportOn("The schema has eight tables and looks reasonable."),
         reportOn("The schema has eight tables and looks reasonable."),
       ]);
 
@@ -305,5 +382,231 @@ describe("a profile that does not settle cleanly", () => {
 
     expect(resumed.transcripts[1]).toContain("outcome was never recorded");
     expect(resumed.kinds).not.toContain("table-profiled");
+  });
+});
+
+describe("the verdict is previewed before the report lands, not after the run dies", () => {
+  /*
+    The architectural form of every notice in this loop, and the reason it exists.
+
+    Seven separate fixes were measured today and all seven were the same mistake wearing
+    different names: the model did the work and then missed a protocol detail on its
+    finishing move — wrote the report as prose, wrote SQL without a fence, cited the
+    inventory instead of its readings, took one plan instead of two, analysed with
+    `run_read_query` instead of `profile_table`. Each cost the run everything it had done,
+    because the finishing move gets exactly one attempt.
+
+    Five of those were answered by hand-written notices, one per shortfall. That does not
+    scale and it drifts: a bar this repository stated in its own words for `database-assessment`
+    was phrased as an activity rather than a tool, and four models satisfied the sentence
+    while failing the check.
+
+    So the notice is DERIVED from the verifier instead. `VerifiableAgentRun` is a Pick over
+    the record, so the loop can assemble the run it is about to become — the ledger so far
+    plus the report being submitted — hand it to `verifyRunGoal`, and read the shortfalls
+    that report WOULD earn. What the model is told is then the verifier's own vocabulary,
+    which cannot fall out of step with the check the way a duplicated sentence can.
+
+    `no-table-profile` is the largest shortfall not already covered by a hand-written
+    notice: 8 of 25 models on this surface, four of them having called no tool at all.
+  */
+  test("an assessment reporting without a profile is held back and told which tool to call", async () => {
+    const run = await open("sqlite");
+
+    const drive = await run.drive([
+      callsTool("run_read_query", { sql: "SELECT count(*) FROM engineering", rationale: "counting by hand" }),
+      reportOnAll("The engineering table looks sparsely populated."),
+      profiles("engineering", "basic"),
+      reportOnAll("The engineering table has a sparsely populated column."),
+    ]);
+
+    // Held back once, and told the tool by name — the wording that was measured to matter.
+    expect(drive.transcripts[2]).toContain("profile_table");
+    // And the run went on to clear its own bar.
+    expect(drive.kinds).toContain("table-profiled");
+    expect(drive.verdict).toEqual({ outcome: "answered", verifier: "agent-database-assessment.1", unmet: [] });
+  });
+
+  test("and it is narrowed to what would fix it, so it cannot spend the turn elsewhere", async () => {
+    /*
+      Measured with the ledger's own record of the hold, once `call-held` made holds
+      visible. On that model the notice fired and it then called `inspect_schema`
+      four times and `run_read_query` three times without ever profiling; on `qwen3:8b` it
+      fired and the run went back to `inspect_schema`. `qwen3.5:9b` took the offer on one
+      run and answered.
+
+      So the notice is heard and the wandering is what beats it — which is what the
+      narrowing mechanism already exists for. A held call narrows the run to the tools its
+      own verdict accepts, and on this workflow that is exactly `profile_table` and
+      `compose_report`: it can fix the thing it was asked to fix, or say nothing.
+    */
+    const named: string[][] = [];
+    const run = await open("sqlite");
+
+    await run.drive([
+      callsTool("run_read_query", { sql: "SELECT count(*) FROM engineering", rationale: "by hand" }),
+      reportOnAll("The engineering table looks sparsely populated."),
+      (turn) => {
+        named.push(
+          ((turn.body.tools ?? []) as { function?: { name?: string } }[]).map((entry) => entry.function?.name ?? ""),
+        );
+        return answersProse("nothing further")(turn);
+      },
+      // One more, because narrating instead of acting earns the report reminder and the
+      // drive takes another turn for it.
+      answersProse("still nothing further"),
+    ]);
+
+    expect(named[0]?.sort()).toEqual(["compose_report", "profile_table"]);
+  });
+
+  test("a run that ignores it still reports, and still fails the bar honestly", async () => {
+    // The guarantee every notice here keeps: offered once, then out of the way. Trading
+    // `no-table-profile` for `no-report` would be the worse outcome, not a smaller one.
+    const run = await open("sqlite");
+
+    // Three reports: the run is held twice — a model that ignored the first ask gets a
+    // second — and the third is let through so the gate can close on it.
+    const drive = await run.drive([
+      callsTool("run_read_query", { sql: "SELECT count(*) FROM engineering", rationale: "counting by hand" }),
+      reportOnAll("The engineering table looks sparsely populated."),
+      reportOnAll("The engineering table looks sparsely populated."),
+      reportOnAll("The engineering table looks sparsely populated."),
+    ]);
+
+    expect(drive.stopReason).toBe("report-composed");
+    expect(drive.verdict.unmet).toEqual(["no-table-profile"]);
+  });
+
+  test("every turn is sampled deterministically, because the bar is consistency", async () => {
+    /*
+      The agent loop never set a sampling temperature, so every run so far inherited Ollama's
+      defaults: temperature 0.8, top_p 0.9.
+
+      That is the wrong setting for what this harness measures. A cell counts as working only
+      at 5/5 consecutive passes, which makes it a variance test as much as a capability one,
+      and 26 of the cells that do not lock sit at 4/5 — one run away. A twelve-step tool chain
+      sampled at 0.8 is a large avoidable source of exactly the flapping that keeps them
+      there. Choosing a tool and filling its arguments is a structural task, not a creative
+      one: there is no upside to sampling it.
+
+      Asserted on the request body rather than on an outcome, because that is where it either
+      is or is not — a default this loop never states is a default nobody notices.
+    */
+    const seen: unknown[] = [];
+    const run = await open("sqlite");
+
+    await run.drive([
+      (turn) => {
+        seen.push({ temperature: turn.body.temperature, topP: turn.body.top_p });
+        return answersProse("looking at the schema")(turn);
+      },
+      answersProse("still looking"),
+    ]);
+
+    expect(seen[0]).toEqual({ temperature: 0, topP: 1 });
+  });
+
+  test("a report that already meets its bar is not delayed by a turn", async () => {
+    const run = await open("sqlite");
+
+    const drive = await run.drive(assessmentArc("engineering"));
+
+    expect(drive.kinds).toEqual([
+      "run-started",
+      "context-captured",
+      "tool-invoked",
+      "table-profiled",
+      "tool-completed",
+      "report-composed",
+      "run-finished",
+    ]);
+  });
+});
+
+describe("a run that reports past the notice is asked again, up to a bound", () => {
+  /*
+    Measured at five repeats on three models, and the shape is identical every time:
+
+      inspect_schema, inspect_schema
+      call-held            <- the notice fires and the run is narrowed to {profile_table, compose_report}
+      report-composed      <- and the model reports anyway
+      no-table-profile
+
+    `qwen3:8b`, `qwen3:14b` and a third model lose this surface 5 times out of 5, so it is not
+    variance: told once, left holding only the two tools its verdict accepts, the model picks
+    the report again. One ask was a guess, and fifteen consecutive losses are the answer to it.
+
+    BOUNDED at three, and the bound is what separates this from the change reverted earlier
+    today. That one repeated the ask on SILENCE, which every run passes through, and eighteen
+    tests failed because every run took two more turns. This fires only where a report is being
+    submitted that its own verdict would reject — a run already losing — so a run that is about
+    to pass cannot reach it. What an uncooperative model costs is two extra turns before the
+    same verdict it was going to get.
+  */
+  test("a second report without a profile is held too", async () => {
+    const run = await open("sqlite");
+
+    const drive = await run.drive([
+      callsTool("run_read_query", { sql: "SELECT count(*) FROM engineering", rationale: "by hand" }),
+      reportOnAll("The engineering table looks sparsely populated."),
+      reportOnAll("The engineering table looks sparsely populated."),
+      profiles("engineering", "basic"),
+      reportOnAll("The engineering table has a sparsely populated column."),
+    ]);
+
+    // Held twice, and the run still ended by clearing its own bar.
+    expect(drive.events.filter((event) => event.kind === "call-held")).toHaveLength(2);
+    expect(drive.verdict).toEqual({ outcome: "answered", verifier: "agent-database-assessment.1", unmet: [] });
+  });
+
+  test("and it asks for the table the report is actually about", async () => {
+    /*
+      The bug the repeated ask uncovered, and the reason repeating it alone changed nothing.
+
+      `qwen3:8b` was measured again after the second ask shipped: still 0/5, and now the
+      ledger showed the notice firing TWICE and being ignored twice. What it was asking for
+      was the problem. The notice named `inventory[0]` — the first table in the snapshot —
+      and on the sample database that is `current_dept_emp`, a VIEW the catalog read
+      describes with no columns at all. Meanwhile the model's pending report was about
+      `dept_emp`: 450,000 rows, five percent of its `dept_no` values referencing no
+      department. We were telling it to go profile something it had no interest in, and it
+      declined, which is not unreasonable of it.
+
+      So the notice asks about the table the report is ALREADY making claims about. That is
+      both likelier to be obeyed and more correct: what this verdict wants established is the
+      claims being made, not an arbitrary table.
+
+      This fixture's first table is `engineering`, which every other test here also reports
+      on — which is exactly why the evals never caught it. Reporting on a later table is what
+      makes the two candidates different.
+    */
+    const run = await open("sqlite");
+
+    const drive = await run.drive([
+      callsTool("run_read_query", { sql: "SELECT count(*) FROM research", rationale: "by hand" }),
+      reportOnAll("The research table is missing most of its second column."),
+      profiles("research", "basic"),
+      reportOnAll("The research table has a sparsely populated column."),
+    ]);
+
+    const held = drive.events.filter((event) => event.kind === "call-held");
+    expect(held[0]?.reason).toContain('"research"');
+    expect(held[0]?.reason).not.toContain("engineering");
+  });
+
+  test("the asking stops, so a model that will not profile still gets its honest verdict", async () => {
+    const run = await open("sqlite");
+
+    const drive = await run.drive([
+      callsTool("run_read_query", { sql: "SELECT count(*) FROM engineering", rationale: "by hand" }),
+      ...Array.from({ length: 5 }, () => reportOnAll("The engineering table looks sparsely populated.")),
+    ]);
+
+    expect(drive.stopReason).toBe("report-composed");
+    expect(drive.verdict.unmet).toEqual(["no-table-profile"]);
+    // Three asks and no more: the bound is what keeps an uncooperative run from spending its
+    // budget on being asked.
+    expect(drive.events.filter((event) => event.kind === "call-held").length).toBeLessThanOrEqual(3);
   });
 });

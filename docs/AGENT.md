@@ -85,6 +85,7 @@ Two companion pages carry what this one deliberately does not:
 - [Durability and resume](#durability-and-resume)
 - [The tool set](#the-tool-set)
 - [What bounds a run](#what-bounds-a-run)
+- [Supported models](#supported-models)
 - [The model side](#the-model-side)
 - [Whether the run answered](#whether-the-run-answered)
 - [What the removed AI panels did that a run does not](#what-the-removed-ai-panels-did-that-a-run-does-not)
@@ -130,6 +131,7 @@ run by asking `GET /api/agent/config`, the same way it discovers the storage mod
 | --- | --- | --- |
 | `LIBREDB_AGENT_ENABLED` | unset (derive) | The explicit **off**-switch. `false`/`off`/`0` mean no agent even with AI configured — the supported way to keep the AI configuration and decline the agent. `true`/`on`/`1` are still accepted and mean the default; they cannot conjure a model, because an override that renders a rail whose Start must fail is the outcome deriving exists to prevent. An unrecognized value warns and is ignored. |
 | `WORKFLOW_TARGET_WORLD` | unset (`local`) | Durable backend for run state. Exactly two values are accepted: `local` (zero-config, on-disk, **single instance**) and `@workflow/world-postgres` (opt-in, multi-replica, needs `WORKFLOW_POSTGRES_URL`). Anything else is **refused**, not defaulted. |
+| `AGENT_MODEL_TURN_TIMEOUT_MS` | unset (`90000`) | How long **one** model call may take before the drive stops waiting for it. Raise it for a LOCAL model: the default was chosen against hosted APIs, where a turn lands in seconds and a 90-second wait only ever means a request that is not coming back. Measured across 25 Ollama models on six surfaces, **nine** runs ended `model-timeout` with the model still working — one of them a reasoning model in plan mode, which holds no tools at all, cut 92 s into its **first** turn with a zero-event ledger. Those runs are scored as having answered nothing, which is a fact about this ceiling and not about the model. A value that is not a positive whole number is **ignored** and the default stands; a value is capped just under half the smallest workflow deadline, because a run has to be able to take two turns to finish. |
 | `WORKFLOW_LOCAL_DATA_DIR` | unset — but the packaged artifacts set it: `/app/data/workflow` from the Helm chart and (from an app version later than `0.11.0`) the container image, `~/.libredb-studio/workflow-data` under `npx`. The SDK's own fallback, which those replace, is `.workflow-data` relative to the working directory. | Where the `local` backend keeps run state, and therefore the second condition above. See [Deployment](#deployment) — the SDK's fallback is wrong in a container and wrong under `npx`, so no artifact leaves it in force. |
 
 The refusal is not pedantry. The workflow runtime reads that variable itself and treats any value
@@ -1544,6 +1546,32 @@ database* may be repaired. **A policy denial does not consume a repair attempt**
 boundary decision is not a defect in a statement, and a denial travels to the model as its own kind
 of outcome — the refusal union has no readable engine-text field for the policy variant at all, so a
 denial cannot be re-fed to the model as though the SQL were malformed.
+
+## Supported models
+
+Ten models run every agent surface. Each cleared all six — Investigate, Optimize, Assess, Operate,
+Analyze and Plan — five consecutive times, at the turn limit the product ships, which is 30 of 30
+runs. Each has a page of its own with its measured durations and whatever it needs that the others
+do not.
+
+| Model | Served through | Median run | Slowest run |
+| --- | --- | --- | --- |
+| [`gemini-3.5-flash-lite`](models/gemini-3-5-flash-lite.md) | Gemini API | 10 s | 24 s |
+| [`granite4.1:8b`](models/granite4-1-8b.md) | Ollama | 10 s | 21 s |
+| [`ornith:9b`](models/ornith-9b.md) | Ollama | 25 s | 82 s |
+| [`qwen3.5:9b`](models/qwen3-5-9b.md) | Ollama | 25 s | 98 s |
+| [`granite4.1:30b`](models/granite4-1-30b.md) | Ollama | 26 s | 46 s |
+| [`qwen3:8b`](models/qwen3-8b.md) | Ollama | 32 s | 132 s |
+| [`qwen3:14b`](models/qwen3-14b.md) | Ollama | 39 s | 151 s |
+| [`gemma4:26b`](models/gemma4-26b.md) | Ollama | 46 s | 180 s |
+| [`qwen3.8:latest`](models/qwen3-8-latest.md) | Ollama | 62 s | 347 s |
+| [`qwen3:4b`](models/qwen3-4b.md) | Ollama | 75 s | 139 s |
+
+The durations are from one machine and are comparable with each other rather than portable: every
+figure was taken the same way, on the same database, through the same six surfaces.
+
+Nothing prevents another model from being configured — the capability probe below decides what any
+given endpoint can do, and there is no allow-list in the code. What the ten have is a measurement.
 
 ## The model side
 

@@ -44,7 +44,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { type ModelMessage, type ToolSet, streamText, tool } from "ai";
+import { type ModelMessage, Output, type ToolSet, streamText, tool } from "ai";
+import { z } from "zod";
 import {
   captureContextSnapshot,
   connectionIdentity,
@@ -54,8 +55,27 @@ import {
   packOperationsInventory,
   reusableSnapshot,
 } from "./context-snapshot";
+import { agentModelTurnTimeoutMs } from "./config";
+import {
+  ceilingFor,
+  noticesFor,
+  presentReminderLimitFor,
+  retriesEmptyTurn,
+  turnTimeoutMsFor,
+  planStatementRetriesFor,
+  reportReminderLimitFor,
+  samplingFor,
+} from "./models";
 import { erDetailForWorkflow, renderErDiagram } from "./er-diagram";
+import { type AgentGoalShortfall, verifyRunGoal } from "./goal-verifier";
 import { type AgentInventoryNoun, inventoryNoun } from "./inventory-noun";
+import {
+  PROMPTED_ACTION_SHAPE,
+  PROMPTED_PROTOCOL_REMINDER,
+  promptedToolContract,
+  readPromptedAction,
+  readPromptedPayload,
+} from "./prompted-tools";
 import { PLAN_NO_STATEMENT_MARKER, readPlanStatement } from "./plan-draft";
 import { validatePlanStatement } from "./plan-statement";
 import { packSchemaStatistics, readSchemaStatistics } from "./schema-stats";
@@ -78,6 +98,7 @@ import {
   AGENT_EVIDENCE_CONTRACT,
   AGENT_TOOL_DEFINITIONS,
   type AgentToolContext,
+  type AgentToolDefinition,
   type AgentToolName,
   type AgentToolOutcome,
   citeSnapshot,
@@ -97,6 +118,7 @@ import {
 import {
   AGENT_WORKFLOW_PRESENTS_ANSWER,
   type AgentContextSnapshot,
+  type AgentReportClaim,
   type AgentRunEvent,
   type AgentRunMode,
   type AgentRunRecord,
@@ -109,7 +131,7 @@ import type { ProviderCapabilities } from "@/lib/db/types";
 import type { DatabaseType, TableSchema } from "@/lib/types";
 
 /** Everything a tool call needs EXCEPT what the run's own record decides. */
-export type AgentToolResources = Omit<AgentToolContext, "runId" | "mode" | "workflowType" | "actor">;
+export type AgentToolResources = Omit<AgentToolContext, "runId" | "modelId" | "mode" | "workflowType" | "actor">;
 
 export interface AgentInvestigationOptions {
   readonly service: AgentRunService;
@@ -117,7 +139,7 @@ export interface AgentInvestigationOptions {
   readonly resources: AgentToolResources;
   /** Backstop on model turns; defaults to the run's own workflow row in `AGENT_WORKFLOW_BUDGETS`. */
   readonly maxTurns?: number;
-  /** Ceiling on ONE model call; defaults to `AGENT_MODEL_TURN_TIMEOUT_MS`. */
+  /** Ceiling on ONE model call; defaults to `agentModelTurnTimeoutMs()`. */
   readonly turnTimeoutMs?: number;
 }
 
@@ -293,8 +315,8 @@ function planningEngine(context: AgentToolContext): PlanningEngine {
  * the artifacts and the goal verifier still scores the run `no-report`.
  *
  * Measured on three models against a local Ollama endpoint, each of which read the
- * database and then narrated: `mistral-small3.2:24b` (4 readings), `lfm2:24b` (11 on
- * a data-analysis run), `qwen3.5:2b` (42). None of them was refusing to report; each
+ * database and then narrated: three models measured during evaluation, with 4, 11 and 42
+ * readings behind the prose. None of them was refusing to report; each
  * had answered in the register a chat model answers in.
  *
  * Once, and only after a call: a model that would not call the tool the first time it
@@ -317,19 +339,30 @@ function planningEngine(context: AgentToolContext): PlanningEngine {
  * kind agent mode keeps being caught in. See `AGENT_REPORT_RESERVE_NOTICE` for the
  * other sentence this run may hear about ending.
  */
-const AGENT_REPORT_REMINDER_NOTICE = [
-  "You have called this run's tools and then written your findings as prose, which records nothing: a run reports by CALLING compose_report, and text outside that call is not a report.",
-  "Call compose_report now with what you established.",
-  AGENT_CITATION_RULE,
-].join(" ");
-
+/**
+ * What a PLAN run is told when its prose carried neither a statement nor a refusal.
+ *
+ * Plan mode's deliverable is a plan the user can act on, which means one of exactly two
+ * endings: a fenced statement this engine could run, or the `NO STATEMENT:` refusal for a
+ * question the inventory does not support. `qwen3:14b` is the measured case, and its losing
+ * run is why this exists at all — it described all eight tables, both join tables and the key
+ * every relation travels on, and then stopped, having answered the question and skipped the
+ * deliverable.
+ *
+ * The refusal is offered as plainly as the statement, and deliberately: a notice that asked
+ * only for SQL would push a model whose inventory cannot answer into inventing a table name
+ * to satisfy it, which is the failure `verifyPlanningGoal` accepts refusals to avoid.
+ *
+ * Offered only where a profile asks for it (`planStatementRetriesFor`, 0 for every model but
+ * one), so introducing it changed no other model's run.
+ */
 /**
  * What an answer-presenting run is told once when it would report without presenting.
  *
  * A workflow offered `present_answer` is one whose whole point is the answer: the goal
  * verifier scores it `no-answer` when the report lands with nothing presented beside
  * it, and the rail shows a report with an empty answer pane. Measured on three models
- * (`qwen3.5:4b`, `qwen3.5:9b`, `mistral-small3.2:24b`), each read the data, got a
+ * (three models, one of them supported), each read the data, got a
  * result, and then went straight to `compose_report`: the reading was taken and the
  * answer was one call away.
  *
@@ -352,10 +385,367 @@ const AGENT_REPORT_REMINDER_NOTICE = [
  * and would then neither present nor report: measured, the run lost the report it was
  * about to compose.
  */
-const AGENT_PRESENT_BEFORE_REPORT_NOTICE = [
-  "This run answers by PRESENTING a result, and nothing has been presented yet: a report on its own is scored as having answered nothing.",
-  "Your compose_report call was not run. Call present_answer first, with the artifact id of the result that answers the objective, and then call compose_report.",
-].join(" ");
+/**
+ * What an answer-presenting run is told when it reports having read NOTHING.
+ *
+ * The empty arm of the check below. `notices.presentBeforeReport` speaks to a run that
+ * read and did not present; a run that never read at all was told nothing, and on this surface
+ * it is already lost — the verdict wants an answer, an answer is a reading presented, and
+ * there is no reading to present.
+ *
+ * Measured on three models in one sweep, arriving here three different ways:
+ *
+ *     one model              drafted three statements, all three refused by the database,
+ *                            then reported anyway
+ *     another                read the schema only, which is the catalog and not the data
+ *     a third                called nothing at all
+ *
+ * So the sentence names the distinction the first two got wrong — the catalog is not the data
+ * — and says what to do rather than what went wrong, because a run that has burned three
+ * statements on errors needs the next call named, not the last one described.
+ */
+/**
+ * What an optimization run is told once when it would report holding two plans and no
+ * comparison between them.
+ *
+ * The measured second half of `no-plan-comparison`. Telling the run that one plan
+ * answers nothing worked as far as it goes — models stopped taking one plan and began
+ * taking several (two models took five, a third
+ * three) — and then not one of them called `compare_plans`. They hold both artifact ids
+ * and report anyway. So this does not describe where to find the ids: it names them.
+ *
+ * Said at the only moment it can still be acted on, exactly as
+ * `notices.presentBeforeReport` is: `compose_report` ENDS the run, so a message
+ * after it arrives too late. This one is delivered INSTEAD of that call, the call is not
+ * executed, and the run keeps the turn it needs.
+ *
+ * The three conditions are the #350 rule applied: the run must hold `compare_plans` at
+ * all, it must HOLD two plans so there is something to compare, and a run whose
+ * comparison is already recorded is not hesitating about one. A run with a single plan is
+ * never told to compare, because it cannot — being told to do the impossible is what
+ * turned a report into nothing at all when that mistake was made before.
+ */
+function compareBeforeReportNotice(before: string, after: string): string {
+  return [
+    "This workflow answers by COMPARING plans and no comparison is recorded: a report resting on a single plan is scored as having established nothing.",
+    `Your compose_report call was not run. Call compare_plans with before="${before}" and after="${after}" — the two plans this run already inspected — and then call compose_report.`,
+  ].join(" ");
+}
+
+/**
+ * The shortfalls the report being submitted WOULD earn, asked of the verifier itself.
+ *
+ * The architectural form of every notice in this loop, and the reason it is worth having.
+ * Seven fixes were measured in one day and all seven were one mistake under different
+ * names: the model did the work and then missed a protocol detail on its finishing move.
+ * Each cost the run everything, because that move gets exactly one attempt. Five were
+ * answered with a hand-written notice apiece, which neither scales to the shortfalls not
+ * yet hand-written nor stays in step with the check — a bar this file stated in its own
+ * words was phrased as an activity rather than a tool, and four models satisfied the
+ * sentence while failing the verifier.
+ *
+ * So this asks the verifier instead. `VerifiableAgentRun` is a Pick over the record, so
+ * the run it is ABOUT to become can be assembled — the ledger so far, plus the report on
+ * its way in — and handed to `verifyRunGoal` unchanged. What the model is then told is the
+ * verifier's own vocabulary, which cannot drift from the verifier the way a duplicated
+ * sentence can.
+ *
+ * It changes no bar. A run still has to produce the profile, the comparison, the citation;
+ * all it gains is being told what is missing while it can still act, instead of reading it
+ * on a verdict after the run is over.
+ */
+function shortfallsIfReported(
+  record: AgentRunRecord,
+  events: readonly AgentRunEvent[],
+  claims: readonly AgentReportClaim[],
+): readonly AgentGoalShortfall[] {
+  return verifyRunGoal({
+    mode: record.mode,
+    workflowType: record.workflowType,
+    // The status the run would end in, so the verdict is the one this report would earn
+    // rather than one shaped by a `cancelled` arm that has not happened.
+    status: "succeeded",
+    events: [...events, { kind: "report-composed", atMs: 0, claims }],
+  }).unmet;
+}
+
+/**
+ * The claims a `compose_report` call carries, read permissively for the preview above.
+ *
+ * `composeReportTool` validates them properly a moment later; all this has to produce is
+ * something the verifier can fold, and a call whose claims cannot be read at all is one
+ * the tool is about to refuse on its own terms.
+ */
+const previewClaimsSchema = z.object({
+  claims: z
+    .array(
+      z.object({
+        claim: z.string(),
+        evidence: z.array(z.object({ source: z.string(), correlationId: z.string().optional() }).passthrough()),
+      }),
+    )
+    .optional(),
+});
+
+function previewClaims(input: unknown): readonly AgentReportClaim[] {
+  const parsed = previewClaimsSchema.safeParse(input);
+  if (!parsed.success) return [];
+  return (parsed.data.claims ?? []).flatMap((claim) => {
+    // Rebuilt as the non-empty tuple `AgentReportClaim` declares, rather than cast
+    // wholesale: a claim with no evidence at all is one `composeReportTool` refuses on its
+    // own terms, and the verifier should not be shown a shape its type rules out.
+    const [head, ...rest] = claim.evidence;
+    if (head === undefined) return [];
+    const evidence = [head, ...rest] as unknown as AgentReportClaim["evidence"];
+    return [{ claim: claim.claim, evidence }];
+  });
+}
+
+/**
+ * Which table a held report should be asked to profile.
+ *
+ * This used to be `inventory[0]` and that was measured to be the reason the ask fails.
+ * `qwen3:8b` was held twice on `database-assessment`, ignored both, and lost all five
+ * repeats; the notice was telling it to profile `current_dept_emp` — the first entry in
+ * the sample database's snapshot, a VIEW the catalog read describes with no columns —
+ * while the report it was trying to submit was about `dept_emp` and its 450,000 rows.
+ *
+ * So the table comes from the report itself: a claim naming a table is the model saying
+ * which table it cares about, and that is also the one this verdict wants established,
+ * since what it scores is whether the claims rest on counts. Asking about anything else is
+ * asking for busywork, and a model is right to decline busywork.
+ *
+ * The fallbacks descend in how much they know. A table the snapshot actually DESCRIBES
+ * comes before one it merely lists, because a zero-column entry is exactly the view that
+ * caused this; and `undefined` leaves the notice to its generic wording, which asks for "a
+ * table this run's inventory lists" rather than naming one wrongly.
+ *
+ * Matched on word boundaries so `dept_emp` is not found inside `current_dept_emp`, and
+ * case-insensitively because a model writes prose about `Department`, not `department`.
+ */
+function tableToProfile(
+  inventory: readonly { readonly name: string; readonly columns: readonly unknown[] }[],
+  claims: readonly AgentReportClaim[],
+): string | undefined {
+  const said = claims.map((entry) => entry.claim).join(" ");
+  const spokenOf = inventory.find((entry) =>
+    new RegExp(`\\b${entry.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(said),
+  );
+  return (spokenOf ?? inventory.find((entry) => entry.columns.length > 0) ?? inventory[0])?.name;
+}
+
+/**
+ * What a run is told about a shortfall it is one call away from fixing.
+ *
+ * `null` for every shortfall this cannot honestly ask about, and that list is the #350
+ * rule applied per case: `no-report` is impossible here (a report is being submitted),
+ * `cancelled` is not the model's to fix, and the shortfalls that already have a purpose-
+ * written notice keep it, because those carry ids this generic sentence cannot.
+ */
+interface ShortfallAdvice {
+  readonly said: string;
+  /**
+   * Whether narrowing the run to its verdict's tools would HELP this shortfall.
+   *
+   * False wherever the fix lies outside that set, and an eval caught the case immediately:
+   * the answer to `no-plan-evidence` is to call `inspect_plan`, which is a READING tool and
+   * so not among the tools the optimization verdict accepts. Narrowing there would have
+   * removed the very tool this notice asks for — telling a run to do something and taking
+   * away its means of doing it, which is the shape of mistake this file has already paid
+   * for twice.
+   */
+  readonly narrow: boolean;
+}
+
+function shortfallNotice(
+  shortfall: AgentGoalShortfall,
+  table: string | undefined,
+  plansInspected: number,
+  readingsHeld: number,
+): ShortfallAdvice | null {
+  if (shortfall === "no-table-profile") {
+    const named = table === undefined ? "a table this run's inventory lists" : `"${table}"`;
+    return {
+      said: [
+        "This workflow answers with the counts profile_table takes and no table has been profiled, so the report would be scored as having established nothing about the data.",
+        `Your compose_report call was not run. Call profile_table on ${named} — counts you compose yourself with run_read_query do not satisfy this — and then call compose_report again.`,
+      ].join(" "),
+      // `profile_table` IS what this verdict accepts, so the narrowed set is exactly the two
+      // tools the run now needs — and the ledger argued for narrowing here: told once and
+      // left holding everything, one model called `inspect_schema` four times and
+      // `run_read_query` three without ever profiling.
+      narrow: true,
+    };
+  }
+  if (shortfall === "no-reading") {
+    // Only for a run that read NOTHING. A run holding artifacts and citing the inventory
+    // instead earns the same verdict, but the useful sentence there is
+    // `citeWhatYouReadNotice`, which can name the ids it actually has. Saying "this run has
+    // taken no reading" to a run that took six is the false self-description this file
+    // keeps catching — and three evals caught it here within a minute.
+    if (readingsHeld > 0) return null;
+    /*
+      The hole `citeWhatYouReadNotice` deliberately leaves, and it is worth an entire cell.
+
+      That notice fires only when the run HOLDS a usable artifact, because a run with
+      nothing to cite would be asked for the impossible. Right — and it means a run that
+      took NO reading and reported off the captured inventory holds nothing, hears nothing,
+      and dies of `no-reading` never having been told the bar exists.
+
+      One evaluated model loses `operations` five times out of five, and all five ledgers are four
+      events long: started, context captured, report composed, finished, in five seconds. It
+      answers from the inventory it was handed and never calls `inspect_operations`. It is a
+      24B model that reads competently on other surfaces, so this is not capacity — it is a
+      run answering on turn one because nothing said the answer had to rest on a reading.
+
+      NOT narrowed, and that is load-bearing: `AGENT_NARROWED_EXTRA_TOOLS.operations` is
+      empty, so narrowing here would remove `inspect_operations` — the one tool this
+      sentence asks for. The same trap `no-plan-evidence` documents one branch below.
+    */
+    return {
+      said: [
+        "This workflow is scored on what the ENGINE reports about itself, and this run has taken no reading: the schema inventory in this conversation was captured for you before your first turn and citing it establishes nothing about what the engine is doing.",
+        "Your compose_report call was not run. Call inspect_operations first — sessions, slow-queries, table-stats, index-stats, storage or health — then cite the artifact id it returns in a claim, and then call compose_report.",
+      ].join(" "),
+      narrow: false,
+    };
+  }
+  if (shortfall === "no-plan-comparison") {
+    // Only for a run holding NO plan. With one or two in hand the run is not missing the
+    // idea, it is one call short, and `compareBeforeReportNotice` says that better because
+    // it can name the ids. Saying "this run has inspected none" to a run that inspected two
+    // is worse than saying nothing — caught by the two gate evals that assert exactly that
+    // arc.
+    if (plansInspected > 0) return null;
+    /*
+      The largest shortfall that had no sentence at all. It blocks NINE cells across the
+      measured models, five of them losing to nothing else, and `shortfallNotice` returned
+      null for it — so a run earning it was never told anything.
+
+      The ledgers say what is missing is knowledge rather than diligence. `qwen3:4b` loses
+      this cell four times in five, and each losing run holds exactly four events: started,
+      context captured, report composed, finished. No tool was called. Nothing about the run
+      needs arguing with; it did not know that a report here is scored against plans.
+
+      `compareBeforeReportNotice` cannot cover this case. It names the two plan ids to
+      compare, so it can only speak once a run HOLDS two plans — a model that did the work
+      and stopped one call short. A run with no plans has no ids to be named and has to be
+      sent to the reading instead, which is why this asks for `inspect_plan` first.
+
+      NOT narrowed, for the reason `no-plan-evidence` is not: this verdict accepts
+      `compare_plans` and `recommend_change`, and narrowing would remove `inspect_plan` —
+      the very tool the sentence asks for.
+    */
+    return {
+      said: [
+        "This workflow is judged on plans: a report is scored on whether it shows HOW the engine reaches its rows, and this run has inspected none, so it would be scored as having established nothing.",
+        "Your compose_report call was not run. Call inspect_plan on the statement in question, then either recommend_change citing that plan's artifact id, or inspect_plan on a rewritten form and compare_plans on the two — and then call compose_report.",
+      ].join(" "),
+      narrow: false,
+    };
+  }
+  if (shortfall === "no-plan-evidence") {
+    // Measured on `qwen3:8b` and `qwen3:14b`, same arc both times: `inspect_schema`, a
+    // refused read, then `recommend_change` for an index and no `inspect_plan` anywhere.
+    // The recommendation may well be right; it is simply not established, which is what
+    // this verdict says. There is no plan id to name because the run holds none, so the
+    // sentence asks for the reading rather than for a citation it cannot make.
+    return {
+      said: [
+        "Your index recommendation rests on no plan: this workflow judges a change by HOW the engine reaches its rows, and no plan has been inspected, so the report would be scored as having established nothing.",
+        "Your compose_report call was not run. Call inspect_plan on the slow statement, then call recommend_change again citing that plan's artifact id, and then call compose_report.",
+      ].join(" "),
+      // NOT narrowed: `inspect_plan` is a reading tool, and this verdict accepts only
+      // `compare_plans` and `recommend_change`. Narrowing would take away the tool this very
+      // sentence asks for.
+      narrow: false,
+    };
+  }
+  return null;
+}
+
+/**
+ * The artifact ids a `compose_report` call is CITING, read from the call itself.
+ *
+ * Read from the arguments rather than from the ledger, because at the moment this matters
+ * the report has not been recorded — that is the whole point of intercepting the call
+ * instead of judging the run after it ends. Permissive on purpose: `composeReportTool`
+ * validates the payload properly a moment later, so all this has to do is decide whether
+ * the run is about to cite nothing it read.
+ */
+const citedEvidenceSchema = z.object({
+  claims: z
+    .array(z.object({ evidence: z.array(z.object({ source: z.string(), correlationId: z.string().optional() })) }))
+    .optional(),
+});
+
+function citedArtifactIds(input: unknown): readonly string[] {
+  const parsed = citedEvidenceSchema.safeParse(input);
+  if (!parsed.success) return [];
+  return (parsed.data.claims ?? []).flatMap((claim) =>
+    claim.evidence.flatMap((reference) =>
+      reference.source === "artifact" && reference.correlationId !== undefined ? [reference.correlationId] : [],
+    ),
+  );
+}
+
+/**
+ * What a run is told once when it is about to report on none of what it read.
+ *
+ * Measured: one model called `inspect_operations` SIX times, every call
+ * completed, and then composed a report whose only citation was the schema inventory.
+ * `verifyOperationsGoal` asks for one `source: "artifact"` reference and got none, so the
+ * run scored `no-reading` having done the work. The same misdirection on the other
+ * workflows scores `empty-evidence`: the artifacts cited came back with no rows while the
+ * run held ones that did.
+ *
+ * So the ids are NAMED rather than described, and the call is held back instead of run —
+ * `compose_report` ends the run, so anything said afterwards arrives too late. Offered
+ * once, like every other notice here: a model that will not take it still reports, and
+ * the verdict is still the honest one.
+ *
+ * The #350 guard: this fires only when the run HOLDS something worth citing. A run that
+ * read nothing is told nothing, because asking it to cite a reading it never took is
+ * asking for the impossible — the mistake the reverted `ANSWER_NOT_PRESENTED` refusal
+ * made, which cost those runs their report as well as their answer.
+ */
+function citeWhatYouReadNotice(ids: readonly string[], everythingCitedWasEmpty: boolean): string {
+  const named = ids
+    .slice(0, 4)
+    .map((id) => `"${id}"`)
+    .join(", ");
+  const opening = everythingCitedWasEmpty
+    ? "Every result your report cites came back with NO rows, so it establishes nothing — and this run holds readings that did return rows."
+    : "This run took readings and your report cited none of them: a report that rests only on the schema inventory is scored as having answered nothing about what the engine is doing.";
+  return [
+    opening,
+    `Your compose_report call was not run. Cite at least one of the results this run actually read — ${named} — as {"source":"artifact","correlationId":"<one of those>"}, then call compose_report again.`,
+  ].join(" ");
+}
+
+/**
+ * The same moment, for a run holding exactly ONE plan.
+ *
+ * A comparison needs two, so this asks for what the run CAN do and never for a
+ * comparison. Telling a model to do something impossible is the mistake this workflow
+ * already paid for once — the reverted `ANSWER_NOT_PRESENTED` refusal left runs unable to
+ * either answer or report — so the two routes its verdict actually accepts are named
+ * instead: a second plan to compare against, or an index recommendation resting on the
+ * plan it already holds.
+ *
+ * Measured on the clean sweep, after the stated rule was in place: `granite4.1:30b`
+ * inspected one plan and reported, and a second did the same after a refused read.
+ * Both had risen from `no-report` to a real report and stopped one call short of the bar.
+ * The same rule had already moved other models to three and five plans
+ * (three of them), so what these needed was
+ * the nudge at the moment of reporting rather than a different rule at the start.
+ */
+function secondPlanBeforeReportNotice(plan: string): string {
+  return [
+    "This workflow answers by comparing plans and you have inspected only ONE plan, so nothing is established yet: a report resting on a single plan is scored as having answered nothing.",
+    `Your compose_report call was not run. Either call inspect_plan on your rewritten statement and then compare_plans with the two artifact ids, or — if your answer is an index, which cannot be compared because this run creates nothing — call recommend_change citing artifact "${plan}". Then call compose_report.`,
+  ].join(" ");
+}
 
 /**
  * What an operations run is told about the inventory it was given (#411).
@@ -1031,9 +1421,43 @@ const WORKFLOW_TOOL_RULES: Readonly<Record<AgentRunWorkflowType, string>> = Obje
     "An index cannot be compared that way: its second plan would need the index to already exist, and this run creates nothing. Recommend it instead, citing the inspect_plan artifact whose access path the index is meant to change.",
     "Every plan you can obtain is an ESTIMATE: nothing is executed, and there are no timings. Say so rather than implying a measurement.",
     "Propose changes with recommend_change. They are offered to the user and never applied by this run.",
+    // The verifier's rule, in the model's own terms — the same #350/#356 move the
+    // `operations` rules make, and the one this workflow was missing. Everything above
+    // describes how the two instruments WORK; none of it says the report is judged on
+    // having used one. Measured across 25 local models, 6 failed on
+    // `no-plan-comparison` with the arc the gate in `tests/evals/query-optimization`
+    // scripts: one `inspect_plan`, then a report. Two evaluated models and
+    // `qwen3.5:9b` produced identical ledgers — a correct diagnosis, and no
+    // `recommend_change` call at all. Stopping after the diagnosis is a reasonable
+    // reading of "explain why it is slow" when nothing has said otherwise, so this
+    // says otherwise, and names both routes because naming the tool is what made the
+    // assessment bar land: a bar phrased as an activity gets satisfied by hand.
+    "One plan on its own answers nothing: before you report, either inspect the plan of your rewrite too and call compare_plans with the two artifact ids, or call recommend_change for an index citing the inspect_plan artifact whose access path it would change.",
   ].join(" "),
   "database-assessment": [
     "Profile the tables that matter with profile_table, deepening only where a shallower profile left a question: basic counts rows and missing values, distribution adds distinct counts, pattern tests for personal-data shapes.",
+    // The verifier's rule, in the model's own terms — the same #350/#356 move the
+    // `operations` rules make below, for the same reason and now on the evidence that
+    // it was needed here too. `verifyDatabaseAssessmentGoal` requires a
+    // `table-profiled` event, and the sentence above it states WHERE to look rather
+    // than what the report is judged by: "profile the tables that matter" reads as
+    // advice a run may take or leave. Measured across 25 local models, 18 failed this
+    // workflow on `no-table-profile`, and five of those composed a report having
+    // called no tool at all — not refusing to profile, just never told a profile was
+    // the condition. There is no honest exception to hedge: profiling an empty table
+    // still produces the event, so a run with a table to profile can always clear it.
+    //
+    // The bar NAMES THE TOOL, and that wording was measured rather than chosen. A first
+    // version said "profile at least one table", which reads as an activity: of the
+    // eight models it was measured on, one satisfied those words by writing
+    // eighteen `run_read_query` count statements by hand, and three more went to
+    // `inspect_schema` — none produced the event the verifier reads, so all four still
+    // failed while believing they had complied. The `operations` rule that works names
+    // its instrument the same way ("everything you read, you read with
+    // inspect_operations"). The second clause is here because a model that composes
+    // counts itself is being diligent, not lazy, and deserves to be told why that does
+    // not clear the bar rather than left to discover it in a verdict.
+    "You must call profile_table on at least one table before you report: this workflow answers with the counts that tool takes, and counts you compose yourself with run_read_query do not establish them.",
     "Only COUNTS come back. No value is read out of any column, so do not claim what a column contains — claim what its counts show.",
     "Grade what you find against completeness, uniqueness, consistency and validity, and say which of the four each finding speaks to.",
   ].join(" "),
@@ -1605,12 +2029,158 @@ interface ModelTurn {
   readonly assistantMessages: readonly ModelMessage[];
 }
 
+/*
+  How many tool calls a run may make, with nothing recorded, before it is narrowed, now lives
+  per model in `models/profile.ts` and is read through `ceilingFor`.
+
+  The general value is still 12 and still read off the distribution rather than chosen: across
+  43 answered runs on 25 models the most tool calls any of them made was SIX, while the runs
+  that ended `no-report` without ever stopping ran to 7, 9, 11, 20 and 57 — one still drafting
+  SQL on its last turn. Twelve is double the observed ceiling for a healthy run, so it cannot
+  plausibly interrupt one, and it still catches a loop long before the run's own budget ends.
+
+  It moved because 12 was one call too generous for one model and nobody else should pay to fix
+  that: `gemma4:26b` lost an assessment having profiled eleven tables and stopped at 11, so this
+  guard never fired, and its own file now asks for 9.
+
+  This is the half `notices.reportReminder` cannot reach: that notice fires when a model
+  STOPS talking, and a model reading itself out of budget never stops.
+*/
+
+/**
+ * How many times a report may be held for the verdict it would earn before it is let through.
+ *
+ * Was once, and five repeats on three models say once is not enough. `qwen3:8b`, `qwen3:14b`
+ * and another lose `database-assessment` 5 times out of 5, and every ledger has the same
+ * shape: the notice fires, the run is narrowed to the two tools its verdict accepts, and the
+ * model reports again anyway. Fifteen consecutive losses is not variance.
+ *
+ * TWO, not three, and the difference was measured in the eval scripts rather than reasoned
+ * about: at three, a run that will not comply pays three wasted turns before its report is
+ * allowed through, and the gate evals had to be extended twice to see it. Two changes the
+ * behaviour the ledgers complain about — a model that ignored one ask gets a second — at half
+ * the cost to a model that will never comply.
+ *
+ * The bound is also what separates this from the repeated-ask on SILENCE reverted
+ * earlier today. That one sat on a path every run passes through, and eighteen tests failed
+ * because every run gained two turns. This fires only where a report is being submitted that
+ * its own verdict would reject — a run that is already losing — so a run about to pass cannot
+ * reach it at all. What an uncooperative model pays is two extra turns before the same
+ * verdict it was going to get.
+ */
+const AGENT_VERDICT_HOLD_LIMIT = 2;
+
+/**
+ * What a narrowed run keeps BESIDES `compose_report`: whatever its own verdict requires.
+ *
+ * The narrowing exists for `no-report`, which is 37 of the 66 failing cells measured
+ * across 25 models on six surfaces — more than the other ten shortfalls combined, and
+ * the only one that appears on every surface. Those runs did not run out of room. They
+ * ended `model-stopped` holding every tool they needed, having read and recorded
+ * nothing, and when reminded they went back to reading rather than reporting. So the
+ * reminded turn narrows the choice instead of repeating the instruction.
+ *
+ * The narrowing must not make a run's own bar unreachable, and this record is where that
+ * is guaranteed rather than hoped for. An assessment is scored `no-table-profile` without
+ * a `table-profiled` event and an optimization `no-plan-comparison` without a comparison
+ * or a grounded index recommendation (`goal-verifier.ts`), so leaving those surfaces the
+ * report alone would trade one shortfall for another — a different failure, not a smaller
+ * one. Keeping the instruments the verdict accepts turns the mechanism from a muzzle into
+ * a funnel: a narrowed run can only do the two or three things it is judged on.
+ *
+ * `investigation` and `operations` keep nothing extra because their bars are about the
+ * report itself — claims resting on something read, which by then this run has.
+ * `data-analysis` keeps `present_answer` because its verdict scores the answer
+ * separately from the report, and narrowing it away would turn `no-report` into
+ * `no-answer`.
+ */
+const AGENT_NARROWED_EXTRA_TOOLS: Readonly<Record<AgentRunWorkflowType, readonly AgentToolName[]>> = Object.freeze({
+  investigation: [],
+  "query-optimization": ["compare_plans", "recommend_change"],
+  "database-assessment": ["profile_table"],
+  operations: [],
+  "data-analysis": ["present_answer"],
+} satisfies Record<AgentRunWorkflowType, readonly AgentToolName[]>);
+
+/**
+ * The names a narrowed run may still call — the single source both the declaration and
+ * the dispatch read.
+ *
+ * Found by review on the first version: narrowing only what the model is TOLD about left
+ * `handleCall` reading the full selection, so a model that remembered a tool from an
+ * earlier turn had it executed anyway, and a live run reached 25 calls after the ceiling
+ * fired at 12. Intersected with the run's own selection rather than trusted, so a
+ * workflow whose tool set changes cannot leave a name here that the run does not hold.
+ */
+function narrowedToolNames(record: AgentRunRecord, since = Number.POSITIVE_INFINITY): ReadonlySet<AgentToolName> {
+  const held = new Set(selectAgentTools(record).map((definition) => definition.name));
+  const kept = new Set<AgentToolName>();
+  for (const name of ["compose_report" as const, ...AGENT_NARROWED_EXTRA_TOOLS[record.workflowType]]) {
+    if (held.has(name) && !usedUp(record, name, since)) kept.add(name);
+  }
+  return kept;
+}
+
+/** What an instrument writes when it worked, so a narrowed run can be asked how often it has. */
+const AGENT_INSTRUMENT_RESULT: Readonly<Partial<Record<AgentToolName, AgentRunEvent["kind"]>>> = Object.freeze({
+  recommend_change: "recommendation",
+  compare_plans: "plan-comparison",
+  profile_table: "table-profiled",
+  present_answer: "answer-composed",
+});
+
+/**
+ * Whether a narrowed run has used one of its kept instruments enough times to stop keeping it.
+ *
+ * The loop the narrowing left open, and it only became visible once the tool started working.
+ * One evaluated model on query-optimization was refused `recommend_change` thirty-six times in a
+ * run, on a field the refusal did not name. Once it named it, the same cell recorded
+ * THIRTY-THREE recommendations and still scored `no-report`: the ceiling fired, the run
+ * narrowed, and narrowing keeps this surface's instruments so its own bar stays reachable — so
+ * the model held `recommend_change` and used it until the deadline.
+ *
+ * Counted rather than judged, deliberately. Asking "is the bar met" would mean a second copy of
+ * `goal-verifier.ts`'s rules here, and the copy that drifted would be the one silently taking a
+ * run's last instrument away. A count needs to know nothing about what the verdict wants.
+ *
+ * Three, because a bar can want a particular SHAPE — an optimization's needs a recommendation
+ * citing a plan — and a run that has misjudged that deserves another attempt rather than one.
+ * Past three it is repeating rather than aiming, and `compose_report` is the only thing left,
+ * which is what the narrowing was for.
+ *
+ * Counted from the NARROWING, and that qualifier cost a locked cell to learn. The first version
+ * counted every use in the run, and `gemma4:26b` on database-assessment paid for it inside the
+ * hour: four `profile_table` calls, then five reads, then a refused one — ten calls, so its
+ * ceiling fired — and the count stood at four before anybody had told it to stop. It lost the
+ * instrument its verdict is scored on for having done the assessment, was left holding one
+ * tool, and stopped. That cell was 5/5.
+ *
+ * Those four profiles were the work. This bounds what a run does AFTER being told to finish,
+ * which is the only thing the narrowing was ever about.
+ */
+const AGENT_NARROWED_INSTRUMENT_USES = 3;
+
+function usedUp(record: AgentRunRecord, name: AgentToolName, since: number): boolean {
+  const result = AGENT_INSTRUMENT_RESULT[name];
+  if (result === undefined) return false;
+  return record.events.slice(since).filter((event) => event.kind === result).length >= AGENT_NARROWED_INSTRUMENT_USES;
+}
+
 /** The tool set the SDK is given: the server's selection, declared but never executed by it. */
 function declaredTools(record: AgentRunRecord): ToolSet | undefined {
-  const selected = selectAgentTools(record);
-  if (selected.length === 0) return undefined;
+  return toolSetOf(selectAgentTools(record));
+}
+
+/** The same declaration, restricted to a narrowed run's remaining names. */
+function narrowedTools(record: AgentRunRecord, since?: number): ToolSet | undefined {
+  const kept = narrowedToolNames(record, since);
+  return toolSetOf(selectAgentTools(record).filter((definition) => kept.has(definition.name)));
+}
+
+function toolSetOf(definitions: readonly AgentToolDefinition[]): ToolSet | undefined {
+  if (definitions.length === 0) return undefined;
   return Object.fromEntries(
-    selected.map((definition) => [
+    definitions.map((definition) => [
       definition.name,
       tool({ description: definition.description, inputSchema: definition.inputSchema }),
     ]),
@@ -1629,9 +2199,54 @@ async function takeTurn(
   messages: readonly ModelMessage[],
   tools: ToolSet | undefined,
   remainingMs: number,
+  /*
+    A schema the reply must CONFORM to, for the prompted path only.
+
+    The endpoint enforces it rather than the prompt asking for it: probed directly against
+    Ollama's OpenAI-compatible endpoint, `response_format: json_schema` comes back conforming
+    ("SEMAYA UYUYOR"), which is the industry's answer to the failure class this repository has
+    been reconstructing after the fact. `no-report` is the largest measured loss and is
+    overwhelmingly a FORMAT failure: models that write a correct payload and never call with
+    it, or narrate where a call was due.
+
+    Passed ONLY where the model is already being asked for JSON in prose, and where `tools` is
+    therefore undefined — so there is no interaction with tool calling, and the native path
+    that every locked cell was measured on is not sent a single different byte.
+  */
+  constrainTo: z.ZodType | undefined,
+  /*
+    Which surface this turn belongs to, for `samplingFor` only.
+
+    Passed rather than read off the record because `takeTurn` is handed no record: it is the
+    one function here that talks to a model and nothing else, and widening it to the whole
+    run to reach one field would undo that.
+  */
+  workflow: AgentRunWorkflowType | undefined,
 ): Promise<ModelTurn> {
+  /*
+    Sampling is per MODEL now, not one number for all 25 of them.
+
+    It was unset for a long time, so every run inherited Ollama's 0.8, and pinning it to 0
+    won five cells: a cell locks only at 5/5 consecutive passes, so the bar is a variance
+    test as much as a capability one. Then the same change cost `qwen3:8b` its
+    `query-optimization` cell, 3/5 down to 0/5 — at 0.8 it opened with `inspect_plan` on 3 of
+    5 runs and answered all three; at 0 it opened with `inspect_schema` on 10 of 10 and lost
+    every one. Determinism pinned it to the losing branch rather than letting it wander into
+    the winning one.
+
+    Both measurements are true and no global number holds both, which is what
+    `models/index.ts` exists for. The default is unchanged and is what every locked cell was
+    measured on; a model appears there only when a measurement forced it to.
+  */
+  const sampling = samplingFor(agentModel.modelId, workflow);
   const stream = streamText({
     model: agentModel.model,
+    temperature: sampling.temperature,
+    topP: sampling.topP,
+    // Constrained decoding, where a shape was asked for. `Output.object` is what makes the
+    // SDK send `response_format`, and it composes here precisely because this branch offers
+    // no tools.
+    ...(constrainTo === undefined ? {} : { output: Output.object({ schema: constrainTo }) }),
     // The SDK refuses a system message inside `messages` and takes it here
     // instead — verified against the installed version, which throws
     // `Invalid prompt: System messages are not allowed` otherwise.
@@ -1698,6 +2313,19 @@ function toolResultMessage(call: { toolCallId: string; toolName: string }, value
   };
 }
 
+/**
+ * The same answer, for a run whose model never made a tool call to answer.
+ *
+ * A `role: "tool"` message must reference a `tool_call_id` the assistant turn declared,
+ * and on the prompted path the assistant declared nothing — the call was a JSON object
+ * inside ordinary text. Sending a result for an id that is not in the transcript is what
+ * a real endpoint answers with a 400, which would wedge every later turn of the run
+ * rather than this one. So the server answers in the register the model spoke in.
+ */
+function promptedResultMessage(call: { toolName: string }, value: string): ModelMessage {
+  return { role: "user", content: `The server ran ${call.toolName} and answers: ${value}` };
+}
+
 /** What handling one tool call did. `cancelled` and `reported` both end the run. */
 type CallResult =
   | { readonly kind: "answered"; readonly text: string }
@@ -1722,7 +2350,16 @@ export async function runInvestigation(
   options: AgentInvestigationOptions,
 ): Promise<AgentInvestigationResult> {
   const { service, model, resources } = options;
-  const turnTimeoutMs = options.turnTimeoutMs ?? AGENT_MODEL_TURN_TIMEOUT_MS;
+  // The configured ceiling, not the constant: `AGENT_MODEL_TURN_TIMEOUT_MS` is right for a
+  // hosted API and measurably wrong for a local reasoning model, where nine cells across 25
+  // models ended `model-timeout` with the model still working. An explicit
+  // `options.turnTimeoutMs` still wins — that is the seam the tests drive.
+  //
+  // Between the two sits the MODEL's own, for the one measured case where the shipped limit and
+  // the model disagree: `qwen3.5:9b` clears five surfaces inside 90 seconds and its plan turn
+  // lands at 92 to 94, so the cell is decided by which side of the line one turn falls on. It
+  // asks for its own by name rather than the default moving for everyone; see `turnTimeoutMs`.
+  const turnTimeoutMs = options.turnTimeoutMs ?? turnTimeoutMsFor(model.modelId) ?? agentModelTurnTimeoutMs();
 
   // Refuses a run that has ended, and tells us what the previous process left
   // behind. A queued run is one nothing has driven yet; a running one is a resume.
@@ -1763,6 +2400,7 @@ export async function runInvestigation(
     const context: AgentToolContext = {
       ...resources,
       runId: record.runId,
+      modelId: model.modelId,
       mode: record.mode,
       workflowType: record.workflowType,
       actor: record.actor,
@@ -1770,8 +2408,85 @@ export async function runInvestigation(
     // Read once, from the provider's own declarations, and spent by every sentence that
     // has to name what this engine holds. See `PlanningEngine`.
     const engine = planningEngine(context);
-    const tools = declaredTools(record);
+    /*
+      How this model is asked for a call, decided by the capability gate when the run opened
+      and read here rather than re-derived: a resumed drive must ask the way the drive that
+      died asked.
+
+      `prompted` means the model cannot emit `tool_calls` — measured on a whole family of
+      reasoning distills — so the SDK is handed no tools at all and the contract is stated in prose
+      instead. Everything downstream is unchanged: the action read back out of the reply
+      goes through the same `AGENT_TOOL_DEFINITIONS` schema and the same audited pipeline.
+
+      Native is the default and the branch is computed ONCE, which is what keeps a model
+      that can call tools from being sent a single byte it was not sent before.
+    */
+    const prompted = record.toolProtocol === "prompted";
+    const tools = prompted ? undefined : declaredTools(record);
+    const contract = prompted ? promptedToolContract(selectAgentTools(record)) : null;
+    /**
+     * Whether a name is a tool this run HOLDS, on either protocol.
+     *
+     * Native reads it off the set the SDK was given, which is what excludes a planning run
+     * and an invented name. A prompted run is given no set, so the same question is asked
+     * of the workflow's own selection — the set the contract was written from.
+     */
+    const heldToolNames = new Set(selectAgentTools(record).map((definition) => definition.name));
+    const holdsTool = (name: string): boolean =>
+      prompted ? heldToolNames.has(name as AgentToolName) : tools?.[name] !== undefined;
+    /**
+     * A server notice, in the register this run can act on.
+     *
+     * The notices are written for a model holding tools ("call compose_report now"), which
+     * names the act but not the format for a model that has none. Restating the protocol
+     * costs a sentence and was worth three runs; see `PROMPTED_PROTOCOL_REMINDER`.
+     */
+    const notice = (text: string): string => (prompted ? `${text} ${PROMPTED_PROTOCOL_REMINDER}` : text);
     const messages: ModelMessage[] = [{ role: "user", content: record.objective }];
+    /*
+      The contract is a USER message, not an addition to the instructions, and that is the
+      vendor's own guidance rather than a preference: the model card for the reasoning family
+      that takes this path says "avoid adding a system prompt; all instructions should be
+      contained within the user prompt".
+      Measured, it decided the run — with the contract in the instructions the model
+      produced the action format correctly and ignored the arc, reporting on turn one with
+      no readings. It also keeps `instructions` byte-for-byte what it was for every run.
+    */
+    if (contract !== null) messages.push({ role: "user", content: contract });
+    /**
+     * Whether the smaller tool set has been declared to a PROMPTED run yet.
+     *
+     * The native path re-declares for free: `takeTurn` is handed `narrowedTools(record)` and
+     * the SDK sends the shorter list, so the model simply stops being offered what it may no
+     * longer call. A prompted run has no such channel — its tools are one prose contract
+     * pushed above, built once from the FULL selection — while `handleCall` enforces the
+     * narrowed set regardless of protocol.
+     *
+     * So a narrowed prompted run read a contract listing `run_read_query`, called it, and was
+     * answered "There is no tool called run_read_query in this run." A whole family of
+     * reasoning distills takes this path. Confirmed in code by audit before it was fixed
+     * here.
+     */
+    let narrowingDeclared = false;
+    /**
+     * The run as the LEDGER has it now, for the one question that depends on that.
+     *
+     * `record` was read before this drive did anything, so `record.events` is the run as it
+     * stood at the start and never grows — fine for the workflow, the objective and the
+     * connection, and wrong for asking how many times an instrument has been used. Refreshed
+     * only while narrowed, which is the only state where that question is asked.
+     */
+    let ledger = record;
+    /**
+     * Where the ledger stood when this run was told to finish.
+     *
+     * The instrument bound above counts from HERE, not from the run's beginning: what it is for
+     * is a run that keeps reaching for the same tool after the notice, and everything before the
+     * notice is the work it was asked to do.
+     */
+    let narrowedAtEvent = Number.POSITIVE_INFINITY;
+    /** Whether this drive has already re-asked an empty turn; see `retryEmptyTurn`. */
+    let emptyTurnRetried = false;
     const priorProgress = describePriorProgress(record);
     if (priorProgress !== null) messages.push({ role: "user", content: priorProgress });
 
@@ -2038,6 +2753,7 @@ export async function runInvestigation(
       // inventory that is durably part of some run's own history, not one this process
       // read and failed to write down.
       holdSnapshotForConnection(snapshot, connectionIdentity(context.connection));
+      contextCaptured = true;
       show(snapshot);
     };
 
@@ -2056,16 +2772,37 @@ export async function runInvestigation(
     let reserveAnnounced = false;
     /** Whether a tool this run HOLDS has been called; see `remindToReport`. */
     let anyToolCalled = false;
-    /** The report reminder is a one-shot per drive too; see `AGENT_REPORT_REMINDER_NOTICE`. */
-    let reportReminded = false;
-    /** The present-before-report notice, once per drive; see `AGENT_PRESENT_BEFORE_REPORT_NOTICE`. */
-    let presentReminded = false;
     /**
-     * Whether `present_answer` has been CALLED, which is not the same as answered: a
-     * refused call writes no event, so the ledger cannot tell the two apart and this is
-     * the only place that can.
+     * Whether the inventory capture landed, which is the only evidence a run that called
+     * nothing can hold; see `requireEvidenceBeforeReminder`.
      */
-    let answerAttempted = false;
+    let contextCaptured = false;
+    /**
+     * How many times this drive has told the run to report; see `notices.reportReminder`.
+     *
+     * A count rather than a flag because the limit is the model's, not the drive's:
+     * `reportReminderLimitFor` reads it, and it is 1 for every model but one.
+     */
+    let reportReminders = 0;
+    /** The present-before-report notice, once per drive; see `notices.presentBeforeReport`. */
+    let presentReminders = 0;
+    /** The compare-before-report notice, once per drive; see `compareBeforeReportNotice`. */
+    let compareReminders = 0;
+    /** The cite-what-you-read notice, once per drive; see `citeWhatYouReadNotice`. */
+    let citeReminded = false;
+    /** How many times a report has been held for the verdict it would earn; see `shortfallsIfReported`. */
+    let previewHolds = 0;
+    /** How many times this drive has asked a PLAN run for its statement; see `askForPlanStatement`. */
+    let planStatementAsks = 0;
+    /**
+     * Whether the run has been narrowed to what would finish it; see
+     * `AGENT_NARROWED_EXTRA_TOOLS`. Set once and never cleared — a run narrowed for
+     * looping or for silence stays narrowed, or it spends its remaining turns the same way
+     * it spent the ones that got it here.
+     */
+    let narrowed = false;
+    /** Tool calls made so far, which is what this model's own ceiling is read against. */
+    let toolCallsMade = 0;
 
     /**
      * Tells the run, once, that it has come within the reserve of a ceiling.
@@ -2076,18 +2813,19 @@ export async function runInvestigation(
      * version or the verifier. A planning run is never told: it has no `compose_report`
      * to call, so this would be an instruction the mode cannot follow (#350).
      */
-    const announceReserve = (remainingMs: number): void => {
+    const announceReserve = async (remainingMs: number): Promise<void> => {
       if (reserveAnnounced || record.mode !== "agent") return;
       if (maxTurns - turns > AGENT_REPORT_RESERVE_TURNS && remainingMs > AGENT_REPORT_RESERVE_MS) return;
       reserveAnnounced = true;
-      messages.push({ role: "user", content: AGENT_REPORT_RESERVE_NOTICE });
+      messages.push({ role: "user", content: notice(AGENT_REPORT_RESERVE_NOTICE) });
+      await service.recordEvent(runId, { kind: "guidance-issued", notice: "report-reserve" });
     };
 
     /**
      * Tells the run, once, that it narrated where it should have reported, and says
      * whether it did — which is the caller's "take the turn again".
      *
-     * The three bounds `AGENT_REPORT_REMINDER_NOTICE` documents are applied here and
+     * The three bounds `notices.reportReminder` documents are applied here and
      * nowhere else. `anyToolCalled` carries the first two together: it is set only for a
      * tool THIS RUN HOLDS, so a name the model invented reached nothing and a planning
      * run — handed no tool set at all — can never set it. The ceilings are read rather
@@ -2095,12 +2833,64 @@ export async function runInvestigation(
      * pushed the model into: two turns from the end, told to wrap up, wrapping up in
      * prose.
      */
-    const remindToReport = (assistant: readonly ModelMessage[]): boolean => {
-      if (reportReminded || !anyToolCalled) return false;
+    /**
+     * Records that the server turned a call back, and what it asked for instead.
+     *
+     * Held calls were invisible: a call that is not run settles no step, so nothing reached
+     * the ledger and a reader saw a run that reported once — when what happened is that it
+     * tried, was asked for a profile or a citation, and tried again. On the runs where the
+     * model declines the offer, this entry is the only place the offer exists at all.
+     *
+     * It cost real time to lack: a notice measured as having no effect on two models could
+     * not be told apart from a notice that never fired, because neither leaves a trace.
+     */
+    const holdCall = async (tool: AgentToolName, reason: string, shortfall?: AgentGoalShortfall): Promise<void> => {
+      await service.recordEvent(runId, {
+        kind: "call-held",
+        tool,
+        reason,
+        ...(shortfall === undefined ? {} : { shortfall }),
+      });
+    };
+
+    const remindToReport = async (assistant: readonly ModelMessage[]): Promise<boolean> => {
+      // A run that called nothing has established nothing, so there is no report to ask it
+      // for: telling it would spend a turn to learn it had stopped.
+      if (!anyToolCalled) return false;
+      if (reportReminders >= reportReminderLimitFor(model.modelId)) return false;
       if (turns >= maxTurns || resources.deadline.remainingMs() <= 0) return false;
-      reportReminded = true;
+      reportReminders += 1;
+      // Narrowed as well as told. Reminded runs that kept the whole set went back to
+      // reading; see `AGENT_NARROWED_EXTRA_TOOLS`.
+      narrowed = true;
       messages.push(...assistant);
-      messages.push({ role: "user", content: AGENT_REPORT_REMINDER_NOTICE });
+      messages.push({ role: "user", content: notice(noticesFor(model.modelId).reportReminder) });
+      await service.recordEvent(runId, { kind: "guidance-issued", notice: "report-reminder" });
+      return true;
+    };
+
+    /**
+     * Gives a PLAN run one more turn when its prose named neither statement nor refusal.
+     *
+     * Bounded by the model's own `planStatementRetries`, which is 0 for every model but the one
+     * whose ledgers earned it. The other bounds are the same three `remindToReport` applies and
+     * load-bearing for the same reasons: an agent run has no plan deliverable to miss, an
+     * operations plan is prose by decision (`verifyPlanningGoal` exempts it), and a run with no
+     * turn left cannot act on what it is told.
+     *
+     * The reading is `readPlanStatement`, the same reader `recordPlanStatement` and the verifier
+     * use, so this cannot ask for a statement the run already wrote — a disagreement between the
+     * notice and the verdict would spend a turn telling a passing run it had failed.
+     */
+    const askForPlanStatement = async (assistant: readonly ModelMessage[]): Promise<boolean> => {
+      if (record.mode === "agent" || record.workflowType === "operations") return false;
+      if (planStatementAsks >= planStatementRetriesFor(model.modelId)) return false;
+      if (turns >= maxTurns || resources.deadline.remainingMs() <= 0) return false;
+      if (text.length === 0 || readPlanStatement(text, context.connection.type).kind !== "absent") return false;
+      planStatementAsks += 1;
+      messages.push(...assistant);
+      messages.push({ role: "user", content: notice(noticesFor(model.modelId).planStatement) });
+      await service.recordEvent(runId, { kind: "guidance-issued", notice: "plan-statement" });
       return true;
     };
 
@@ -2191,11 +2981,29 @@ export async function runInvestigation(
       // After the context, so the inventory a first turn is given still arrives before
       // the sentence telling it to finish, and before the turn is counted, because the
       // notice rides on this turn rather than costing one.
-      announceReserve(remainingMs);
+      await announceReserve(remainingMs);
       turns += 1;
       // Whichever bound is smaller applies, and which one it was decides what the user
       // is told: a call that never returned is not a run that used its time.
       const turnBudgetMs = Math.min(remainingMs, turnTimeoutMs);
+      // The prompted path's equivalent of handing the SDK a shorter list. Once, and only
+      // where a contract exists to replace: a run whose narrowed set is empty has nothing to
+      // declare, and `promptedToolContract` answers `null` for that.
+      if (narrowed) ledger = (await service.resume(runId)).record;
+      if (prompted && narrowed && !narrowingDeclared) {
+        const smaller = promptedToolContract(
+          selectAgentTools(ledger).filter((definition) =>
+            narrowedToolNames(ledger, narrowedAtEvent).has(definition.name),
+          ),
+        );
+        if (smaller !== null) {
+          narrowingDeclared = true;
+          messages.push({
+            role: "user",
+            content: `The tools available to this run have been reduced. From now on ONLY these may be called, and any other name will be refused.\n\n${smaller}`,
+          });
+        }
+      }
       // Built after the context, because in planning mode the rules depend on whether
       // there WAS one: a run told to plan against an inventory it was not given is the
       // same defect as a run given one and never told to use it (#350).
@@ -2206,33 +3014,166 @@ export async function runInvestigation(
         // resources are what a statement would actually be run against.
         systemPrompt(record, grounding, engine),
         messages,
-        tools,
+        // Narrowed once the run has been told to finish; see `AGENT_NARROWED_EXTRA_TOOLS`.
+        narrowed && !prompted ? narrowedTools(ledger, narrowedAtEvent) : tools,
         turnBudgetMs,
+        // Constraint measured and REVERTED; see the commit that removes it. Left unset here
+        // rather than deleted from `takeTurn`, because the seam is correct and the cost was in
+        // the model, not the wiring.
+        undefined,
+        record.workflowType,
       );
       text = turn.text;
       if (turn.aborted) return conclude("failed", turnBudgetMs < remainingMs ? "model-timeout" : "deadline-exceeded");
-      if (turn.toolCalls.length === 0) {
+      /*
+        On the prompted path the call arrives as a JSON object inside ordinary text, so it is
+        read out here and from here on the turn is indistinguishable from a native one.
+
+        The id is minted by the server because the model declared none. It correlates this
+        loop's own bookkeeping and is never sent back as a `tool_call_id` — see
+        `promptedResultMessage` for why it cannot be.
+
+        A reply that names nothing stays prose, which is the correct reading: a model told it
+        may answer without acting sometimes does.
+      */
+      /*
+        Read on BOTH protocols, and handed the run's tools.
+
+        The gate used to be `prompted &&`, which left a gap the ledgers show: a NATIVE model
+        that narrates a `{"action": "compose_report", …}` object instead of calling — measured
+        on several — was never read, even though `readPromptedPayload` on the next line has
+        always run for both protocols. There was no reason for the two readers to disagree
+        about which runs they serve.
+
+        The tools are passed so an envelope can be recognised by the tool NAME inside it; see
+        `readEnvelope`. Both readers only run where the turn produced no tool call at all, so
+        neither can change a byte of what a working run does.
+      */
+      const promptedAction =
+        turn.toolCalls.length === 0 ? readPromptedAction(turn.text, selectAgentTools(record)) : null;
+      /*
+        A payload the model wrote instead of calling with it, recovered by schema.
+
+        The largest measured loss: of 36 `no-report` ledgers, SEVEN had written a complete
+        `compose_report` payload into their prose and one said outright that it had "used the
+        compose_report tool". Their work was done; only the channel was wrong. Read on BOTH
+        protocols, because those seven were native tool callers — they emit `tool_calls` for
+        other tools and then hand-write this one.
+
+        Last, after the prompted envelope, so nothing changes for a model that is speaking the
+        protocol it was given. It recovers a name and an unvalidated input and grants no
+        authority: what comes back goes through the same schema and the same audited pipeline
+        as a native call, so a recovered report citing an id this run never produced is refused
+        by the citation contract exactly as it would be.
+      */
+      const writtenPayload =
+        promptedAction === null && turn.toolCalls.length === 0
+          ? readPromptedPayload(turn.text, selectAgentTools(record))
+          : null;
+      const recovered = promptedAction ?? writtenPayload;
+      const calls =
+        recovered === null
+          ? turn.toolCalls
+          : [{ toolCallId: `prompted_${turns}`, toolName: recovered.name, input: recovered.input }];
+
+      if (calls.length === 0) {
         // A run that used its tools and then narrated is one call short of a report;
         // one that established nothing has nothing to be reminded about.
-        if (remindToReport(turn.assistantMessages)) return null;
+        if (await remindToReport(turn.assistantMessages)) return null;
+        // A plan that answered the question and skipped the deliverable, where this model was
+        // measured needing the reminder. Before `conclude`, because conclude is where the prose
+        // becomes the run's closing statement and there is no second reading of it.
+        if (await askForPlanStatement(turn.assistantMessages)) return null;
+        /*
+          What it said as it stopped, recorded before the ending that discards it.
+
+          The largest unexplained group in the measurements: of 277 runs scoring `no-report`, 190
+          ended here and 122 of those had used their tools first — the work done and unfiled. Why
+          was invisible, because a run that ends this way keeps no prose: `conclude` writes a
+          `closing-statement` only when there is text to keep, and on these runs the verdict then
+          throws it away.
+        */
+        /*
+          Agent mode only, and that bound is the whole reason the entry exists rather than a
+          caution. A PLANNING run's prose IS its deliverable: `conclude` keeps it as
+          `closing-statement` and the verdict reads it there. Recording it twice would write the
+          same paragraph into the ledger under two names and teach a reader that the second one
+          means something.
+
+          An agent run is the case where the prose is lost — the verdict wants a report, this is
+          not one, and nothing keeps it.
+        */
+        /*
+          A turn that came back with NOTHING, asked once more.
+
+          `gemma4:26b` lost database-assessment fifteen measured times to this and it was read
+          as a model declining to file: two fixes aimed at that reading were measured and
+          deleted, a second reminder taking the cell from 4/5 to 2/5 and a lower ceiling to 3/5.
+          The stopping-turn record is what finally showed the illness — there is no stopping
+          text on the losing runs, and both entries that would carry it are written whenever
+          there is any. It returns an empty completion, once before the reminder, which the loop
+          already survives, and once after, which ends the run.
+
+          Empty rather than merely short, because that is the whole claim: a turn with prose in
+          it is a model saying something, and this is the absence of an answer. Once per drive,
+          and only for a model whose ledger asked.
+        */
+        if (turn.text.trim().length === 0 && !emptyTurnRetried && retriesEmptyTurn(model.modelId)) {
+          emptyTurnRetried = true;
+          messages.push(...turn.assistantMessages);
+          return null;
+        }
+        if (record.mode === "agent" && turn.text.trim().length > 0) {
+          await service.recordEvent(runId, {
+            kind: "model-stopped-saying",
+            // Bounded, because a stopping turn can carry an essay and this is a diagnostic
+            // rather than a transcript.
+            text: turn.text.trim().slice(0, 2_000),
+          });
+        }
         return conclude("succeeded", "model-stopped");
       }
 
+      toolCallsMade += calls.length;
+      // A run that has read this much and recorded nothing is looping rather than working,
+      // so it is narrowed to what would finish it. Announced once, like every other notice,
+      // because a set that shrinks without a word looks to the model like a broken server.
+      if (!narrowed && toolCallsMade >= ceilingFor(model.modelId)) {
+        narrowed = true;
+        narrowedAtEvent = (await service.resume(runId)).record.events.length;
+        if (reportReminders === 0) {
+          reportReminders += 1;
+          messages.push({ role: "user", content: notice(noticesFor(model.modelId).reportReminder) });
+          await service.recordEvent(runId, { kind: "guidance-issued", notice: "report-reminder" });
+        }
+      }
+
       messages.push(...turn.assistantMessages);
-      for (const call of turn.toolCalls) {
+      for (const call of calls) {
         // A tool this run HOLDS, read from the set the SDK was actually given. A name
         // the model invented reached nothing, and planning mode is handed no set at all
         // — so a run reminded on either would be told to call `compose_report`, which is
         // a tool it has not got (#350).
-        if (tools?.[call.toolName] !== undefined) anyToolCalled = true;
-        if (call.toolName === "present_answer") answerAttempted = true;
+        if (holdsTool(call.toolName)) anyToolCalled = true;
+        /*
+          Whether a report may be held at all right now.
+
+          Every hold below spends a turn: the call is not run, the model is told what to do
+          instead, and it acts on the next turn. That is worth a turn while there is one, and
+          worth nothing inside the reserve — a run held with no turn left to act on the holding
+          files no report at all, which is a worse verdict than the one the hold was avoiding.
+
+          Read once and applied to all three holds, because the reasoning does not distinguish
+          between them and a gate on one site would be a difference nothing justifies.
+        */
+        const noTimeToHold = resources.deadline.remainingMs() <= AGENT_REPORT_RESERVE_MS;
         // A run whose workflow answers by presenting, which read something and is about
         // to report without presenting it, is one call short of an answer. Checked here
         // and not after the call, because `compose_report` ends the run.
         if (
           call.toolName === "compose_report" &&
-          !presentReminded &&
-          !answerAttempted &&
+          !noTimeToHold &&
+          presentReminders < presentReminderLimitFor(model.modelId) &&
           AGENT_WORKFLOW_PRESENTS_ANSWER[record.workflowType]
         ) {
           const { record: sofar } = await service.resume(context.runId);
@@ -2251,21 +3192,207 @@ export async function runInvestigation(
               event.artifact.operationId === "sql.query.read" &&
               drafted.has(event.stepId),
           );
+          /*
+            Whether an answer is RECORDED, which is the whole question and used to be asked
+            twice. A flag also tracked whether `present_answer` had been CALLED, and a refused
+            call set it — which switched this hold off for the rest of the run.
+
+            That cost two models a cell. One presented a table profile, was told
+            correctly to present the result of a `run_read_query` instead, drafted exactly that
+            and ran it, and was then never asked to present it: one run answered by calling
+            `compose_report` five times against a stale citation, the next stopped outright.
+            The other lost the same cell the same way.
+
+            The ledger answers it alone. A successful presentation writes `answer-composed`, a
+            refused one writes `call-declined`, and only the first of those means answered. The
+            bound on how often a run may be held is `presentReminderLimit`, so a run refused
+            repeatedly is still held only as many times as its model allows.
+          */
           const presented = sofar.events.some((event) => event.kind === "answer-composed");
+          /*
+            A run that read and did not present. The other arm — a run that read NOTHING — was
+            given a sentence of its own for a while and it is gone: three models were measured
+            arriving there — one with every statement refused by the database, one reading
+            only the catalog, one calling nothing at all —
+            and not one of them recovered. Their runs lose either way, labelled `no-report`
+            instead of `no-answer`, so the machinery was deleted rather than kept switched off:
+            an unearned behaviour is exactly what `models/profile.ts` refuses to accumulate.
+          */
           if (hasReading && !presented) {
-            presentReminded = true;
-            messages.push(toolResultMessage(call, AGENT_PRESENT_BEFORE_REPORT_NOTICE));
+            // This model's own wording, from its own file.
+            const text = noticesFor(model.modelId).presentBeforeReport;
+            presentReminders += 1;
+            await holdCall(call.toolName, text);
+            messages.push(prompted ? promptedResultMessage(call, notice(text)) : toolResultMessage(call, text));
             continue;
           }
         }
-        const outcome = await handleCall({ service, context, record, call, known, notAttempted });
+        /*
+          The verdict this report would earn, asked of the verifier before it lands. Read
+          first among the report checks: it is the general case, and the purpose-written
+          notices below answer the shortfalls it deliberately declines to speak for.
+
+          A hold spends a turn, so it is worth nothing to a run that has none. One evaluated model
+          is the measured case: it called `compose_report` at 383 seconds of a 450-second run,
+          was held and told to inspect a plan first, and its turns take 100 seconds. The hold
+          converted a report scoring one shortfall into `no-report`. Where a profile says so,
+          a report arriving inside the model's own reserve is let through instead — the notice
+          it would have been given cannot be acted on, and the run has more to show with the
+          report than without it.
+        */
+        if (call.toolName === "compose_report" && previewHolds < AGENT_VERDICT_HOLD_LIMIT && !noTimeToHold) {
+          const { record: sofar } = await service.resume(context.runId);
+          const would = shortfallsIfReported(record, sofar.events, previewClaims(call.input));
+          // A name from the inventory the run was handed, so the notice can point at a real
+          // table instead of asking the model to pick one. The snapshot is optional on the
+          // event, and a run without one is told the generic form rather than nothing.
+          const inventory = sofar.events.flatMap((event) =>
+            event.kind === "context-captured" && event.snapshot !== undefined ? event.snapshot.tables : [],
+          );
+          const spoken = would.flatMap((shortfall) => {
+            const advice = shortfallNotice(
+              shortfall,
+              tableToProfile(inventory, previewClaims(call.input)),
+              // Counted the way `compareBeforeReportNotice` counts them below: a plan is a
+              // completed step under the estimate operation, not an event kind of its own.
+              sofar.events.filter(
+                (event) => event.kind === "tool-completed" && event.artifact.operationId === "sql.explain.estimate",
+              ).length,
+              sofar.events.filter((event) => event.kind === "tool-completed").length,
+            );
+            return advice === null ? [] : [{ shortfall, advice }];
+          })[0];
+          if (spoken !== undefined) {
+            previewHolds += 1;
+            /*
+              Narrowed as well as told, and this is the pairing the ledger argued for.
+
+              Once `call-held` made holds visible, the same three cells were measured again:
+              the notice fires every time. `qwen3.5:9b` took the offer on one run and answered
+              after six `profile_table` calls. On the runs that failed, the model heard it and
+              spent the turn elsewhere — one called `inspect_schema` four times and
+              `run_read_query` three, `qwen3:8b` went back to `inspect_schema`. So the notice
+              is not the missing part; the wandering after it is.
+
+              `AGENT_NARROWED_EXTRA_TOOLS` already holds the answer per workflow, because it is
+              keyed on what each verdict accepts — on this one exactly `profile_table` and
+              `compose_report`. A held run can therefore fix the thing it was asked to fix, or
+              say nothing. It cannot go looking.
+
+              Only where the fix is INSIDE that set, which `advice.narrow` decides. An eval
+              caught the other case at once: `no-plan-evidence` is answered by `inspect_plan`,
+              a reading tool the optimization verdict does not accept, so narrowing there would
+              have removed the tool the notice asks for.
+            */
+            if (spoken.advice.narrow) narrowed = true;
+            const said = spoken.advice.said;
+            await holdCall(call.toolName, said, spoken.shortfall);
+            messages.push(prompted ? promptedResultMessage(call, notice(said)) : toolResultMessage(call, said));
+            continue;
+          }
+        }
+        // A run about to report on none of what it read is one citation short of its bar.
+        // Checked before the plan notices because it is the more basic mistake: a report
+        // resting on nothing the run established fails every workflow, comparison or not.
+        if (call.toolName === "compose_report" && !noTimeToHold && !citeReminded) {
+          const { record: sofar } = await service.resume(context.runId);
+          // Every artifact this run holds, with how many rows it came back with — the same
+          // fold `restsOnlyOnEmptyResults` performs, read here while the report can still
+          // be changed rather than after it has been scored.
+          const held = new Map<string, number>();
+          for (const event of sofar.events) {
+            if (event.kind === "tool-completed")
+              held.set(event.artifact.correlationId, event.artifact.summary.rowCount);
+          }
+          // The RAW citations, unfiltered, and that distinction is load-bearing. An id this
+          // run never produced is a DIFFERENT mistake, and `composeReportTool` already
+          // answers it with a precise refusal naming the invented id. Filtering those out
+          // first made such a call look like one that cited nothing, so this notice
+          // swallowed the citation contract's refusal — caught by the two evals that pin it,
+          // including the one where a hostile row value is the thing being cited. Whenever a
+          // citation is present but unresolvable, this stays out of the way and lets the
+          // tool speak.
+          const citedRaw = citedArtifactIds(call.input);
+          const useful = [...held.entries()].flatMap(([id, rows]) => (rows > 0 ? [id] : []));
+          const allResolve = citedRaw.every((id) => held.has(id));
+          const citedNothing = citedRaw.length === 0 && held.size > 0;
+          const citedOnlyEmpty =
+            citedRaw.length > 0 && allResolve && citedRaw.every((id) => held.get(id) === 0) && useful.length > 0;
+          if (citedNothing || citedOnlyEmpty) {
+            // Prefer the rows-bearing ids; a run whose every reading was empty is still
+            // told to cite one, because an empty reading IS an answer on some surfaces and
+            // the verifier only rejects a report resting ENTIRELY on empties.
+            const offer = useful.length > 0 ? useful : [...held.keys()];
+            citeReminded = true;
+            const text = citeWhatYouReadNotice(offer, citedOnlyEmpty);
+            await holdCall(call.toolName, text);
+            messages.push(prompted ? promptedResultMessage(call, notice(text)) : toolResultMessage(call, text));
+            continue;
+          }
+        }
+        // A run whose verdict wants a comparison, holding the two plans that would make
+        // one, is one call short of it. Checked here for the same reason the present
+        // notice is: `compose_report` ends the run.
+        if (call.toolName === "compose_report" && !noTimeToHold && compareReminders < 1 && holdsTool("compare_plans")) {
+          const { record: sofar } = await service.resume(context.runId);
+          const plans = sofar.events.flatMap((event) =>
+            event.kind === "tool-completed" && event.artifact.operationId === "sql.explain.estimate"
+              ? [event.artifact.correlationId]
+              : [],
+          );
+          // Either route the verdict accepts counts as satisfied, and the index one has to
+          // be read as carefully as the verifier reads it: an index recommendation whose
+          // evidence cites a plan this run inspected IS the answer for a case that cannot be
+          // compared at all, and nudging that run would hold back a report that was already
+          // going to score `answered`. Found by the eval that pins exactly that arc.
+          const planIds = new Set(plans);
+          const compared =
+            sofar.events.some((event) => event.kind === "plan-comparison") ||
+            sofar.events.some(
+              (event) =>
+                event.kind === "recommendation" &&
+                event.change === "index" &&
+                event.evidence.some(
+                  (reference) => reference.source === "artifact" && planIds.has(reference.correlationId),
+                ),
+            );
+          // The LAST two, because a run that inspected five is choosing between its most
+          // recent readings, and the first plan it took is the one it has moved on from.
+          const before = plans.at(-2);
+          const after = plans.at(-1);
+          // Two plans get asked for the comparison; ONE gets asked for the second plan. A
+          // run holding no plan at all is left alone: it is not one call short of the bar,
+          // and a notice there would be a lecture rather than a nudge.
+          const text =
+            compared || after === undefined
+              ? null
+              : before === undefined
+                ? secondPlanBeforeReportNotice(after)
+                : compareBeforeReportNotice(before, after);
+          if (text !== null) {
+            compareReminders += 1;
+            await holdCall(call.toolName, text);
+            messages.push(prompted ? promptedResultMessage(call, notice(text)) : toolResultMessage(call, text));
+            continue;
+          }
+        }
+        const outcome = await handleCall({
+          service,
+          context,
+          record: ledger,
+          call,
+          known,
+          notAttempted,
+          narrowed,
+          narrowedAtEvent,
+        });
         if (outcome.kind === "cancelled") {
           // `runStep` already ended the run at its checkpoint; finishing again would
           // refuse, and rightly.
           return { runId, status: "cancelled", stopReason: "cancelled", turns, text };
         }
         if (outcome.kind === "reported") return conclude("succeeded", "report-composed");
-        messages.push(toolResultMessage(call, outcome.text));
+        messages.push(prompted ? promptedResultMessage(call, outcome.text) : toolResultMessage(call, outcome.text));
       }
       return null;
     };
@@ -2302,9 +3429,21 @@ async function handleCall(input: {
   readonly known: Set<string>;
   /** Steps THIS drive refused before any database reach; see `refusedBeforeDatabaseText`. */
   readonly notAttempted: Set<string>;
+  /**
+   * Whether the run has been narrowed. Declaration and dispatch are ONE decision, and
+   * this is the half a review caught missing: narrowing only what the model was told
+   * about left this function reading the whole selection, so a model that remembered a
+   * tool from an earlier turn had it executed anyway — a live run reached 25 calls after
+   * the ceiling fired at 12.
+   */
+  readonly narrowed: boolean;
+  /** Where the ledger stood at the narrowing; see `AGENT_NARROWED_INSTRUMENT_USES`. */
+  readonly narrowedAtEvent: number;
 }): Promise<CallResult> {
-  const { service, context, record, call, known, notAttempted } = input;
-  const offered = new Set(selectAgentTools(record).map((definition) => definition.name));
+  const { service, context, record, call, known, notAttempted, narrowed, narrowedAtEvent } = input;
+  const offered = narrowed
+    ? narrowedToolNames(record, narrowedAtEvent)
+    : new Set(selectAgentTools(record).map((definition) => definition.name));
   if (!offered.has(call.toolName as AgentToolName)) {
     return { kind: "answered", text: unknownToolText(call.toolName) };
   }
@@ -2472,10 +3611,44 @@ async function profileTable(
  * The record is re-read for the same reason the report re-reads it: the artifacts a
  * comparison may cite are exactly the entries added while the loop was running.
  */
+/**
+ * Records that a ledger-only tool declined, and hands the model the tool's own words.
+ *
+ * The gap this closes is the one `call-held` closed for the drive's own refusals. These five
+ * tools perform no effect, so a refusal from one settles no step and used to write nothing:
+ * a database tool that declines writes `tool-refused`, and a ledger tool that declined wrote
+ * silence. One evaluated model cost an hour to that silence — its data-analysis runs lose
+ * on `no-answer` with no hold and no answer in the ledger, because `present_answer` was
+ * called and refused, which disables the hold that would have asked again and leaves no
+ * trace of having done so. Five different refusals produce that same empty trace and each
+ * implies a different fix.
+ *
+ * The CODE goes in, never the prose and never the model's arguments: the codes are this
+ * server's vocabulary, and they are also what a reader can grep for. Since #4xx the entry
+ * also carries `detail` when the refusal had one, which is the same vocabulary a step
+ * further in — the validator's own field paths. The code by itself proved undiagnosable:
+ * One evaluated model was refused `INVALID_TOOL_INPUT` on `recommend_change` eight times in a
+ * single run, and the record could not say which part of the object it kept getting wrong.
+ */
+async function declined(
+  service: AgentRunService,
+  runId: string,
+  tool: AgentToolName,
+  outcome: { readonly reasonCode: string; readonly modelText: string; readonly detail?: string },
+): Promise<CallResult> {
+  await service.recordEvent(runId, {
+    kind: "call-declined",
+    tool,
+    reasonCode: outcome.reasonCode,
+    ...(outcome.detail === undefined ? {} : { detail: outcome.detail }),
+  });
+  return { kind: "answered", text: outcome.modelText };
+}
+
 async function comparePlans(service: AgentRunService, context: AgentToolContext, input: unknown): Promise<CallResult> {
   const { record } = await service.resume(context.runId);
   const outcome = comparePlansTool(context, record, input);
-  if (outcome.kind === "unavailable") return { kind: "answered", text: outcome.modelText };
+  if (outcome.kind === "unavailable") return await declined(service, context.runId, "compare_plans", outcome);
 
   await service.recordEvent(context.runId, {
     kind: "plan-comparison",
@@ -2493,7 +3666,7 @@ async function recommendChange(
 ): Promise<CallResult> {
   const { record } = await service.resume(context.runId);
   const outcome = recommendChangeTool(context, record, input);
-  if (outcome.kind === "unavailable") return { kind: "answered", text: outcome.modelText };
+  if (outcome.kind === "unavailable") return await declined(service, context.runId, "recommend_change", outcome);
 
   await service.recordEvent(context.runId, { kind: "recommendation", ...outcome.recommendation });
   return { kind: "answered", text: outcome.modelText };
@@ -2514,7 +3687,7 @@ async function recommendChange(
 async function presentAnswer(service: AgentRunService, context: AgentToolContext, input: unknown): Promise<CallResult> {
   const { record } = await service.resume(context.runId);
   const outcome = presentAnswerTool(context, record, input);
-  if (outcome.kind === "unavailable") return { kind: "answered", text: outcome.modelText };
+  if (outcome.kind === "unavailable") return await declined(service, context.runId, "present_answer", outcome);
 
   await service.recordEvent(context.runId, { kind: "answer-composed", ...outcome.answer });
   return { kind: "answered", text: outcome.modelText };
@@ -2527,7 +3700,7 @@ async function composeReport(service: AgentRunService, context: AgentToolContext
   const { record } = await service.resume(context.runId);
 
   const outcome = composeReportTool(context, record, input);
-  if (outcome.kind === "unavailable") return { kind: "answered", text: outcome.modelText };
+  if (outcome.kind === "unavailable") return await declined(service, context.runId, "compose_report", outcome);
 
   await service.recordEvent(context.runId, { kind: "report-composed", claims: outcome.claims });
   return { kind: "reported" };

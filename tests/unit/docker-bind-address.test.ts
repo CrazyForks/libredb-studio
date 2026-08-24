@@ -36,7 +36,7 @@
  *    both the address it chose and the evidence it chose it on.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -494,9 +494,19 @@ describe("isDirectExecution - the module's own on/off switch", () => {
     try {
       const file = join(dir, "bind.mjs");
       writeFileSync(file, "");
-      const url = pathToFileURL(file).href;
+      /*
+        The URL is built from the RESOLVED path, which is what `import.meta.url` would be.
+
+        Both of these tests failed on macOS and passed on Linux, and neither was about the
+        platform: `tmpdir()` is `/tmp` on Linux and `/var/folders/...` on macOS, where `/var`
+        is itself a symlink to `/private/var`. Building the expected URL from the unresolved
+        path therefore compared a real path against a symlinked one and failed for a reason
+        that has nothing to do with what is under test — encoding here, and the argv symlink
+        below, both of which still hold.
+      */
+      const url = pathToFileURL(realpathSync(file)).href;
       expect(url).toContain("%20");
-      expect(url).not.toBe(`file://${file}`);
+      expect(url).not.toBe(`file://${realpathSync(file)}`);
       expect(isDirectExecution(file, url)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -510,7 +520,9 @@ describe("isDirectExecution - the module's own on/off switch", () => {
       const link = join(dir, "link.mjs");
       writeFileSync(target, "");
       symlinkSync(target, link);
-      expect(isDirectExecution(link, pathToFileURL(target).href)).toBe(true);
+      // Resolved for the same reason as above: what is under test is that argv[1] reaching
+      // this through a SYMLINK still matches, not that the temp directory has none.
+      expect(isDirectExecution(link, pathToFileURL(realpathSync(target)).href)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

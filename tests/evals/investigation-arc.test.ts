@@ -400,3 +400,117 @@ describe("the schema's relations reach the model as their own fenced block", () 
     expect(transcript.slice(opened)).toContain("BEGIN UNTRUSTED DATABASE CONTENT");
   });
 });
+
+describe("a catalog read that matched nothing is refused, not answered with an empty artifact", () => {
+  /*
+    The root cause named in this effort's own log and then not fixed for a day, which is why
+    it is written down here as well as fixed.
+
+    The repository's own `query-optimization` eval objective is "Why is the employee listing
+    query slow?". There is no `employee_listing` object in the sample — "employee listing" is
+    the name of a QUERY. Models reasonably called `inspect_schema` for it, the composed
+    `sqlite_master` read matched nothing, and `readCatalog` returned that as a COMPLETED step
+    with `rowCount: 0` and a citable correlation id. The model then cited it, and
+    `restsOnlyOnEmptyResults` scored the run `empty-evidence`: three families produced
+    character-identical ledgers doing this, `gemma4:26b` among them.
+
+    The model was not wrong. The server answered a question about a non-existent object with
+    success. `profile_table` has had the correct behaviour all along — it refuses a table the
+    inventory does not list — and this is the same refusal for the same reason.
+
+    Note what this deliberately does NOT do: it does not refuse an empty RESULT.
+    `run_read_query` returning no rows is an answer about the data. This is about a catalog
+    read matching no OBJECT, which is an answer about the question.
+  */
+  test("sqlite: inspecting a table that does not exist is refused with a closed reason", async () => {
+    const run = await open("sqlite", {
+      // The catalog read is composed by the SERVER, so it is answered through the harness's
+      // catalog seam and not through `answer`. Only the lookup naming the missing object is
+      // emptied; `null` falls through to the preset, which the grounding reads still need.
+      catalogAnswer: (sql) =>
+        sql.includes("employee_listing") ? { rows: [], fields: [], rowCount: 0, executionTime: 1 } : null,
+    });
+
+    const drive = await run.drive([
+      callsTool("inspect_schema", { table: "employee_listing" }, "call_catalog"),
+      answersProse("There is no such table, so I have nothing to report."),
+      // Two more, because narrating after a tool call earns the report reminder and the
+      // drive takes another turn for it.
+      answersProse("Still nothing to report."),
+      answersProse("Still nothing to report."),
+    ]);
+
+    // Refused rather than settled: no artifact exists for the model to cite.
+    expect(drive.transcripts[1]).toContain("no object of that name");
+    expect(drive.kinds).not.toContain("tool-completed");
+  });
+
+  /*
+    The same refusal, told a different question, and getting it wrong the other way.
+
+    An index inventory that comes back empty does not mean the object is missing. It means
+    the tables exist and carry no secondary index — which is an ANSWER to an optimization
+    question, not a failure of one. The sample database declares no `CREATE INDEX` anywhere,
+    so `kind: "indexes"` on it returns zero rows every time, and the model was told "There is
+    no object of that name in this database" and sent looking for a misspelling it had not
+    made.
+
+    That is not a rare corner. `query-optimization`'s first rule ORDERS this call, so it is
+    the opening turn of 79 of the 133 optimization runs measured, and it is answered with a
+    false sentence whose own advice — check the inventory and inspect a name it lists —
+    cannot help, because the inventory lists no indexes either. Since sampling went
+    deterministic the dead opening became a dead CERTAINTY: `qwen3:8b` opened this way in 10
+    of 10 runs and lost every one.
+
+    It stays a refusal rather than becoming a citable empty artifact: that is the
+    `empty-evidence` regression the test above exists for, and nothing here reopens it. What
+    changes is only that the sentence is true.
+  */
+  test("sqlite: an index inventory that is empty says so, rather than denying the object", async () => {
+    const run = await open("sqlite", {
+      catalogAnswer: (sql) =>
+        sql.includes("type='index'") || sql.includes('type="index"')
+          ? { rows: [], fields: [], rowCount: 0, executionTime: 1 }
+          : null,
+    });
+
+    const drive = await run.drive([
+      callsTool("inspect_schema", { kind: "indexes" }, "call_indexes"),
+      answersProse("Nothing is indexed, so there is nothing to read there."),
+      answersProse("Still nothing."),
+      answersProse("Still nothing."),
+    ]);
+
+    const said = drive.transcripts[1] ?? "";
+    expect(said).toContain("no secondary index");
+    expect(said).not.toContain("no object of that name");
+    // Still a refusal, so there is no empty catalog artifact to rest a report on.
+    expect(drive.kinds).not.toContain("tool-completed");
+  });
+
+  test("sqlite: an empty RESULT is still an answer, because that is a fact about the data", async () => {
+    // The distinction the refusal above must not blur. A read that ran and found no rows has
+    // established something; a catalog lookup that matched no object has established nothing.
+    const run = await open("sqlite", {
+      answer: async (sql) =>
+        sql.includes("sqlite_master")
+          ? {
+              rows: [{ name: "employee", sql: "CREATE TABLE employee (id INTEGER)" }],
+              fields: ["name", "sql"],
+              rowCount: 1,
+              executionTime: 1,
+            }
+          : { rows: [], fields: ["id"], rowCount: 0, executionTime: 1 },
+    });
+
+    const drive = await run.drive([
+      callsTool("inspect_schema", { table: "employee" }, "call_catalog"),
+      callsTool("run_read_query", { sql: "SELECT id FROM employee WHERE id < 0", rationale: "look" }, "call_read"),
+      answersProse("Nothing matched that filter."),
+      answersProse("Nothing matched that filter."),
+      answersProse("Nothing matched that filter."),
+    ]);
+
+    expect(drive.kinds.filter((kind) => kind === "tool-completed")).toHaveLength(2);
+  });
+});

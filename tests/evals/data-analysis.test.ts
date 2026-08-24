@@ -115,6 +115,85 @@ const asChart = presents({
   spec: { type: "bar", x: "region", y: ["net_total"], caption: "Revenue by region." },
 });
 
+describe("a run whose present_answer was REFUSED is still asked to present", () => {
+  /*
+    The defect two models died on, and the same one both times.
+
+    `present_answer` sets a flag the moment it is CALLED, refused or not, and that flag
+    disabled the hold which asks a reporting run to present its answer first. So the arc that
+    should recover could not:
+
+        one model       profiled a table · presented the PROFILE · refused, correctly, with
+                        "present the result of a run_read_query you drafted" · drafted exactly
+                        that and ran it · and was never asked to present it. One run then
+                        called compose_report five times against a stale citation, the next
+                        stopped outright. Both scored nothing.
+
+    The model obeyed the refusal. The mechanism that would have closed the loop had already
+    been switched off by the refusal itself.
+
+    Keying the hold on what the LEDGER says — no `answer-composed` entry — rather than on
+    whether a call was attempted is what makes the recovery reachable. The bound stays
+    `presentReminderLimit`, so a run cannot be held more than its model allows, and a run that
+    presented successfully never reaches this branch at all.
+  */
+  test("the refusal is followed, the read is taken, and the report is held until it is presented", async () => {
+    const run = await open({ autoExecute: true });
+
+    const drive = await run.drive([
+      READS,
+      // A refused presentation. The id is not one this run produced, which is one of the five
+      // ways `present_answer` says no — and every one of them used to switch off the hold.
+      (): Response =>
+        chatToolCallStream(
+          "present_answer",
+          JSON.stringify({ artifact: "corr-not-of-this-run", presentation: { kind: "table" } }),
+          "call_answer_refused",
+        ),
+      // The run goes for the report with nothing presented. This is the turn that must be held.
+      reportOn("The north region brought in the most revenue."),
+      asTable,
+      reportOn("The north region brought in the most revenue."),
+    ]);
+
+    expect(drive.kinds).toContain("call-held");
+    expect(drive.kinds).toContain("answer-composed");
+    expect(drive.verdict.outcome).toBe("answered");
+  });
+});
+
+describe("a run that reports having read nothing is left alone", () => {
+  /*
+    The empty arm of the present-before-report check, and the measurement that closed it.
+
+    Sweeping this cell across ten models turned up three that lost `no-answer` without ever
+    reading the data, each arriving differently: one drafted three statements and had all three
+    refused by the database, one read only the catalog, one called nothing at all. A sentence was
+    written for them — "you have read none" —
+    and measured on all three. Not one recovered: their runs lose either way, relabelled
+    `no-report` instead of `no-answer`.
+
+    So the sentence and its switch are gone rather than kept switched off. An unearned behaviour
+    is the thing `models/profile.ts` exists to refuse, and this test is what keeps it from
+    quietly coming back: a run that read nothing is not held, and its report lands.
+  */
+  test("the report is not held, because no measurement earned a hold there", async () => {
+    const run = await open({ autoExecute: true });
+
+    const drive = await run.drive([
+      // The schema is the catalog, not the data: the shape two of the three models hit.
+      callsTool("inspect_schema", {}, "call_schema"),
+      reportOn("The north region brought in the most revenue."),
+    ]);
+
+    expect(drive.kinds).not.toContain("call-held");
+    expect(drive.kinds).toContain("report-composed");
+    // And it scores nothing, which is the honest outcome: an analysis that read no data has no
+    // answer to present, and no sentence this server writes changed that on any of the three.
+    expect(drive.verdict.outcome).toBe("unanswered");
+  });
+});
+
 describe("§4.4 case 1: a chart of a column the result does not have", () => {
   test("is refused, and the refusal names the columns that ARE there", async () => {
     const run = await open();
@@ -130,6 +209,12 @@ describe("§4.4 case 1: a chart of a column the result does not have", () => {
         spec: { type: "bar", x: "territory", y: ["net_total"], caption: "Revenue by territory." },
       }),
       reportOn("The north region brought in the most revenue."),
+      // One turn more than this arc used to need, and it is the fix above: a run whose
+      // presentation was refused is now HELD when it reports with nothing presented, where the
+      // refusal used to switch that hold off. This script declines the offer — it reports again
+      // rather than presenting — which is what keeps the assertion below about the REFUSAL
+      // rather than about a later, valid presentation.
+      reportOn("The north region brought in the most revenue."),
     ]);
 
     // The refusal reached the model, and it carried the real column names — which is
@@ -140,6 +225,26 @@ describe("§4.4 case 1: a chart of a column the result does not have", () => {
     expect(refusal).toContain("net_total");
     // Nothing was recorded: a refused spec is not a quietly-downgraded table.
     expect(drive.kinds).not.toContain("answer-composed");
+    /*
+      And the refusal itself IS on the ledger now, under the code the server used.
+
+      It used to be nowhere. `present_answer` settles no step, so a refusal from it wrote
+      nothing at all, and a reader could not tell a call the tool sent back from a call the
+      model never made. That cost an evening on one evaluated model, whose data-analysis
+      runs lose on `no-answer` with neither a hold nor an answer in the ledger: the refused
+      call sets the flag that disables the hold which would have asked again, and left no
+      trace of having done so. Five different refusals produce that same empty trace, and
+      each one implies a different fix.
+    */
+    expect(drive.kinds).toContain("call-declined");
+    /*
+      This one carries no `detail`, and that is the rule working rather than a gap: the names
+      it refuses with are the ENGINE's, and untrusted text does not enter the ledger under
+      this server's name. Only refusals written in our own vocabulary carry one — see the
+      shape refusal in `report-citation.test.ts`.
+    */
+    const refused = drive.events.find((event) => event.kind === "call-declined");
+    expect(refused?.kind === "call-declined" && refused.detail).toBeUndefined();
   });
 
   test("and the run recovers on the next turn rather than looping to the ceiling", async () => {

@@ -71,6 +71,37 @@ const DATABASE_ERROR: AgentToolRefusal = {
  */
 const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
   "run-started": { kind: "run-started", atMs: 1, mode: "agent" },
+  // A call the server turned back, carrying the verifier's own name for what was missing.
+  // `shortfall` is optional because the purpose-written notices answer conditions the
+  // verifier has no vocabulary for — a run holding two plans and citing neither, say.
+  // A sentence the drive said on a turn it refused nothing. With this one the loop has no
+  // silent decisions left: a hold, a decline, a reminder and a stop each leave a mark, and a
+  // reader can tell a model that ignored an instruction from one that never received it.
+  "guidance-issued": { kind: "guidance-issued", atMs: 3, notice: "report-reminder" },
+  // What the model said on the turn it stopped without filing anything. The three entries here
+  // now cover the three ways a run can produce nothing and each used to look identical from the
+  // ledger: the drive turned a call back, a tool declined one, or the model simply stopped.
+  "model-stopped-saying": {
+    kind: "model-stopped-saying",
+    atMs: 2,
+    text: "I have finished reviewing the schema.",
+  },
+  // A ledger-only tool that declined, carrying the code it declined under and nothing of the
+  // model's. Its sibling above records what the DRIVE turned back; this records what a TOOL
+  // did, which used to be written nowhere at all.
+  "call-declined": {
+    kind: "call-declined",
+    atMs: 2,
+    tool: "present_answer",
+    reasonCode: "ANSWER_ARTIFACT_UNKNOWN",
+  },
+  "call-held": {
+    kind: "call-held",
+    atMs: 2,
+    tool: "compose_report",
+    reason: 'Call profile_table on "engineering" and then call compose_report again.',
+    shortfall: "no-table-profile",
+  },
   // Carries the inventory itself: that is what lets a resumed run re-derive its
   // schema context without reading a catalog again (#329 T8), and it only works
   // because the snapshot is as inert as every other contract here.

@@ -837,17 +837,22 @@ Against a real Ollama at `http://localhost:11434/v1`, driven through this reposi
 
 | Model | Verdict | Elapsed |
 | --- | --- | --- |
-| `qwen3.5:4b` | `supported: true` — tool calling, structured output and streaming all established | 51.5 s first probe with the weights cold on disk; 3.2 s immediately repeated (2026-08-13). Re-measured 2026-08-14: 4.7 s warm, 4.6 s after `ollama stop` with the weights still in the OS page cache |
+| a mid-size Qwen build | `supported: true` — tool calling, structured output and streaming all established | 51.5 s first probe with the weights cold on disk; 3.2 s immediately repeated (2026-08-13). Re-measured 2026-08-14: 4.7 s warm, 4.6 s after `ollama stop` with the weights still in the OS page cache |
 | `gemma3:270m` | `supported: false`, `missing: [toolCalling, structuredOutput, streaming]`, `disproved: []`, detail *"The endpoint refused the tool request with HTTP 400: registry.ollama.ai/library/gemma3:270m does not support tools."* | 128 ms (2026-08-13); 121 ms (2026-08-14) |
 
 The 2026-08-13 figures are from the probe recorded for #331 T6; the 2026-08-14 figures were measured
 again for this page against the same endpoint. Both readings agree on the verdicts.
 
+These two are here as readings of the PROBE, not as a statement about which models this product
+supports. Passing the probe means a model can call a tool; running the agent means clearing six
+surfaces five times each. The models that do the second are listed in
+[`docs/llms/`](llms/), and neither model above is one of them.
+
 Three operator facts follow from that, and each is a reading of the numbers above rather than a
 recommendation copied from a vendor page:
 
 1. **A model with native tool support passes on Ollama today**, despite `tool_choice` being ignored.
-   `qwen3.5:4b` volunteered the call. So pick from the families that advertise tool support, and
+   The model above volunteered the call. So pick from the families that advertise tool support, and
    confirm it with a probe — Ollama's own tag metadata lists `"tools"` among the model's
    capabilities, which is the cheapest thing to check first.
 2. **A model without tool support is refused, and the refusal is cheap and correct.** 121 ms, and

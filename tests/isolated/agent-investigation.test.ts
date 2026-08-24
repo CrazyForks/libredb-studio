@@ -35,6 +35,7 @@ import {
   answersProse,
   callsTool,
   correlationIdIn,
+  correlationIdsIn,
   modelOver,
   promptText,
   reportOn,
@@ -273,6 +274,15 @@ async function startRun(
   mode: "agent" | "planning" = "agent",
   workflowType?: AgentRunWorkflowType,
   autoExecute?: boolean,
+  /*
+    The PROSE protocol, which had no test coverage at all until now.
+
+    `toolProtocol: "prompted"` is the path a whole family of reasoning distills takes, because none of
+    them can emit `tool_calls`. Four of the 25 measured models go through it and between them
+    they lock 2 cells of 24 — and the reason no test ever caught why is that no test ever ran
+    this branch. Adding the parameter is the cheap half of fixing that.
+  */
+  toolProtocol?: "native" | "prompted",
 ): Promise<AgentRunRecord> {
   return boot.service.start({
     mode,
@@ -281,6 +291,7 @@ async function startRun(
     objective: OBJECTIVE,
     ...(workflowType === undefined ? {} : { workflowType }),
     ...(autoExecute === undefined ? {} : { autoExecute }),
+    ...(toolProtocol === undefined ? {} : { toolProtocol }),
   });
 }
 
@@ -415,8 +426,14 @@ describe("a fresh run drives the investigation arc", () => {
       "statement-drafted",
       "tool-invoked",
       "tool-completed",
-      // This run ends on prose rather than a report, and that prose is now the only
-      // thing it leaves behind — which is exactly the case that used to vanish.
+      // This run ends on prose rather than a report, and the prose is now written twice on
+      // purpose, under two names that mean different things. `model-stopped-saying` is the
+      // diagnostic — what the model said as it STOPPED, the shape 190 of 277 measured
+      // `no-report` runs ended in — and `closing-statement` is what the run leaves behind for
+      // a reader. An agent run's stopping prose is discarded by the verdict, so without the
+      // first entry the largest failure group in the measurements had no explanation in it.
+      "guidance-issued",
+      "model-stopped-saying",
       "closing-statement",
       "run-finished",
     ]);
@@ -3863,6 +3880,9 @@ describe("a run that would report an answer it never presented", () => {
     ).toBe(true);
     const sent = script.turns.flatMap((turn) => JSON.stringify(turn.body.messages ?? []));
     expect(sent.some((messages) => messages.includes("This run answers by PRESENTING"))).toBe(false);
+    // Nor anything else. A sentence for exactly this shape was written and measured on the
+    // three models that reach it — a catalog-only read, every statement refused, no call at all
+    // — and none recovered, so it was deleted rather than kept switched off.
     // And the report it did compose was composed, not intercepted.
     expect(events.map((event) => event.kind)).toContain("report-composed");
   });
@@ -4166,5 +4186,450 @@ describe("agent mode is no wider than it was, on an engine grounding now reaches
     // `runtime.ts` is what turns that error into a terminal reason, and the reason it
     // gives an `ExecutionProfileError` is `engine-unsupported` — pinned where the
     // classifier lives, in `tests/isolated/agent-runtime.test.ts`.
+  });
+});
+
+describe("a run that will not record what it read is narrowed to what would finish it", () => {
+  /*
+    The largest single loss in the whole measurement, and the reason this is a mechanism
+    rather than another sentence.
+
+    Across 25 models on six surfaces, 66 cells failed and `no-report` is 37 of them —
+    more than the other ten shortfalls combined, and the only one that appears on every
+    surface. It is not a run that ran out of room: those runs ended `model-stopped`,
+    holding every tool they needed, having taken their readings and recorded nothing.
+    `AGENT_REPORT_REMINDER_NOTICE` already tells them to report, and what they did next
+    is why a notice is not enough — reminded and still holding the whole set, they went
+    back to reading, repeated a refused selector, or wrote strategy about varying one.
+
+    So the reminded turn narrows the choice instead of repeating the instruction.
+
+    WHAT IT NARROWS TO is the part measured today rather than carried over. An earlier
+    version left `compose_report` alone, and this measurement shows what that costs: the
+    assessment verifier requires a `table-profiled` event and the optimization verifier a
+    plan comparison, so a run narrowed to the report alone on those surfaces cannot clear
+    its own bar — it would trade `no-report` for `no-table-profile`, which is a different
+    failure and not a smaller one. The narrowed set is therefore the report PLUS whatever
+    that workflow's verdict requires, which turns the mechanism from a muzzle into a
+    funnel: the run can only do the two or three things it is judged on.
+  */
+  const reads = () => callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "again" });
+
+  const namedIn = (script: { turns: { body: { tools?: unknown } }[] }, turn: number): string[] =>
+    ((script.turns[turn]?.body.tools ?? []) as { function?: { name?: string } }[]).map(
+      (entry) => entry.function?.name ?? "",
+    );
+
+  test("after twelve calls with nothing recorded, an investigation is left the report", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(...Array.from({ length: 13 }, reads), answersProse("still reading"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(namedIn(script, 12)).toEqual(["compose_report"]);
+  });
+
+  test("a run under the threshold keeps every tool, so ordinary work is untouched", async () => {
+    // The threshold is read off the distribution, not chosen: across 43 answered runs
+    // the most tool calls any made was SIX, while the runs that read themselves out went
+    // to 7, 9, 11, 20 and 57. Twelve is double a healthy run's observed ceiling.
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(...Array.from({ length: 6 }, reads), reportOn("Orders were read."));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(namedIn(script, 5)).toContain("run_read_query");
+  });
+
+  test("the turn after the reminder is narrowed too, since silence is the other half", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "the question, in SQL" }),
+      answersProse("Orders look fine to me."),
+      answersProse("still nothing"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(namedIn(script, 2)).toEqual(["compose_report"]);
+    // And the turns before it held everything, so nothing was taken away early.
+    expect(namedIn(script, 0)).toContain("run_read_query");
+  });
+
+  test("a run that took no readings is not narrowed, because it has nothing to report yet", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(answersProse("I will not be reading anything today."));
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(result.stopReason).toBe("model-stopped");
+    expect(namedIn(script, 0)).toContain("run_read_query");
+  });
+
+  test("an assessment keeps profile_table, because its verdict cannot be cleared without one", async () => {
+    // The measured conflict, pinned. `verifyDatabaseAssessmentGoal` requires a
+    // `table-profiled` event, so narrowing this workflow to the report alone would make
+    // its own bar unreachable — and this run has not profiled anything yet.
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "database-assessment");
+    const script = scriptedModel(...Array.from({ length: 13 }, reads), answersProse("still reading"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(namedIn(script, 12).sort()).toEqual(["compose_report", "profile_table"]);
+  });
+
+  test("a prompted run is told the set shrank, so it is not offered tools it may no longer call", async () => {
+    /*
+      The bug this pins, found by audit and confirmed in code.
+
+      A prompted run cannot emit `tool_calls`, so the tools are declared to it as PROSE: one
+      contract message, built once from the full selection and pushed before the loop. When
+      narrowing fires, the native path re-declares the smaller set to the SDK — but the
+      prompted path passes `undefined` and leaves the original contract standing, while
+      `handleCall` enforces the narrowed set regardless of protocol.
+
+      So a narrowed prompted run reads a contract listing `run_read_query`, calls it, and is
+      answered "There is no tool called run_read_query in this run." Every such
+      distill takes this path; between the four of them they lock 2 cells out of 24.
+
+      The fix re-declares the contract at the moment of narrowing, which is the same thing
+      the native path gets for free by handing the SDK a smaller set.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "database-assessment", undefined, "prompted");
+    // Driven in the protocol this run actually speaks: a prompted call is a JSON object in
+    // ordinary text, and a native `tool_calls` reply would leave the SDK waiting for a tool
+    // result this path never writes. Narrowing is tripped by the report reminder rather than
+    // by the twelve-call ceiling, which is the same `narrowed = true` two turns sooner.
+    const promptedCall = (name: string, args: Record<string, unknown>) =>
+      answersProse(JSON.stringify({ action: name, arguments: args }));
+    const script = scriptedModel(
+      promptedCall("profile_table", { table: "orders" }),
+      answersProse("The orders table looks fine to me."),
+      answersProse("Nothing further."),
+      answersProse("Done."),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    // The turn after narrowing must carry a contract that no longer offers the reading tools,
+    // and must still offer the two the verdict accepts.
+    const afterNarrowing = promptText(script.turns[2] as Turn);
+    expect(afterNarrowing).toContain("profile_table");
+    expect(afterNarrowing).toContain("compose_report");
+    expect(afterNarrowing.slice(afterNarrowing.lastIndexOf("profile_table"))).not.toContain("run_read_query");
+  });
+
+  test("an optimization keeps both instruments its verdict accepts", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "query-optimization");
+    const script = scriptedModel(...Array.from({ length: 13 }, reads), answersProse("still reading"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(namedIn(script, 12).sort()).toEqual(["compare_plans", "compose_report", "recommend_change"]);
+  });
+
+  test("an analysis keeps present_answer, which is the half its verdict scores separately", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "data-analysis");
+    const script = scriptedModel(...Array.from({ length: 13 }, reads), answersProse("still reading"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(namedIn(script, 12).sort()).toEqual(["compose_report", "present_answer"]);
+  });
+
+  test("an instrument a narrowed run has already used three times is dropped too", async () => {
+    /*
+      The loop the narrowing did not close, and it only became visible once the tool worked.
+
+      One evaluated model on query-optimization was refused `recommend_change` thirty-six times
+      in a run, on a field the refusal did not name. Once it did, the same cell recorded
+      THIRTY-THREE recommendations and still scored `no-report`: the ceiling fired, the run
+      narrowed, and the narrowed set keeps this surface's instruments so its bar stays
+      reachable — so the model had `recommend_change` and used it until the deadline.
+
+      Three, because a bar can want a particular shape: this one needs a recommendation
+      citing a plan, and a run that has misjudged that deserves another go rather than one
+      chance. Past three it is repeating, not aiming, and only `compose_report` is left. No
+      locked cell records more than two of these, so nothing measured passes through here.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "query-optimization");
+    // Cites a result the run really produced, read out of the transcript the way the
+    // optimization eval's helper does: a refused recommendation records nothing, and what
+    // this test is about is what a RECORDED one costs.
+    const recommends =
+      () =>
+      (turn: Turn): Response =>
+        chatToolCallStream(
+          "recommend_change",
+          JSON.stringify({
+            change: "index",
+            statement: "CREATE INDEX ix ON salary (dept_no)",
+            rationale: "the scan is sequential",
+            evidence: [{ source: "artifact", correlationId: correlationIdsIn(turn.transcript).at(-1) }],
+          }),
+          "call_recommend",
+        );
+    const script = scriptedModel(
+      ...Array.from({ length: 13 }, reads),
+      ...Array.from({ length: 5 }, recommends),
+      answersProse("done"),
+      answersProse("done"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    // Narrowed at the ceiling with the instrument kept, then dropped once it had been used
+    // three times: the fourth call is refused the way an unheld tool is.
+    expect(namedIn(script, 12).sort()).toEqual(["compare_plans", "compose_report", "recommend_change"]);
+    expect(namedIn(script, 16).sort()).toEqual(["compare_plans", "compose_report"]);
+  });
+
+  test("uses BEFORE the run was told to finish do not count against it", async () => {
+    /*
+      The first version of the rule above counted every use in the run, and a locked cell paid
+      for it within the hour. `gemma4:26b` on database-assessment, measured immediately after:
+      four `profile_table` calls, then five reads, then a refused read — ten calls, so its
+      ceiling fired — and at that moment the count was already four. `profile_table` was taken
+      away for work the run had done BEFORE anyone told it to stop, leaving one tool, and it
+      stopped without reporting. That cell was 5/5.
+
+      Those four profiles were not repetition. They were the assessment. What the narrowing is
+      for is a run that keeps reaching for the same instrument AFTER being told to finish, so
+      that is what is counted now: uses from the reminder onward, and every earlier one is the
+      work.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "query-optimization");
+    const recommends =
+      () =>
+      (turn: Turn): Response =>
+        chatToolCallStream(
+          "recommend_change",
+          JSON.stringify({
+            change: "index",
+            statement: "CREATE INDEX ix ON salary (dept_no)",
+            rationale: "the scan is sequential",
+            evidence: [{ source: "artifact", correlationId: correlationIdsIn(turn.transcript).at(-1) }],
+          }),
+          "call_recommend",
+        );
+    const script = scriptedModel(
+      // Reads first, because a recommendation has to cite one of them.
+      ...Array.from({ length: 4 }, reads),
+      ...Array.from({ length: 4 }, recommends),
+      ...Array.from({ length: 4 }, reads),
+      answersProse("done"),
+      answersProse("done"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    // Twelve calls, so the ceiling has fired — with four recommendations already behind it,
+    // and the instrument its verdict is scored on still in its hands.
+    expect(namedIn(script, 12).sort()).toEqual(["compare_plans", "compose_report", "recommend_change"]);
+  });
+
+  test("a narrowed run's other tools are REFUSED, not merely undeclared", async () => {
+    /*
+      Found by review on the first version of this: narrowing only what the model is
+      TOLD about left the dispatch reading the full set, so a model that remembered a
+      tool from an earlier turn had it executed anyway. A live run reached 25 calls after
+      the ceiling fired at 12. Declaration and dispatch are one decision and are read
+      from one place.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(...Array.from({ length: 13 }, reads), reads(), answersProse("done"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    // The fourteenth call is a read the run no longer holds, and what comes back is the
+    // same refusal a model inventing a tool name gets — not an execution.
+    expect(script.turns[13]?.transcript ?? "").toContain("There is no tool called");
+  });
+});
+
+// ─── telling a run to report at a moment it could obey ──────────────────────
+
+/*
+  The reminder is withheld from a run that called nothing, and two models are measured
+  needing it anyway: they answer out of the inventory the run handed them instead of
+  reaching for a tool, which from the drive looks the same as giving up.
+
+  Granting it opened a second hole, and only a model that took the bypass could show it.
+  One evaluated model on database-assessment heard the reminder as the FIRST entry in its
+  ledger — before any read — obeyed, and was declined `UNVERIFIABLE_EVIDENCE` five times
+  running; its first `profile_table` came after the last refusal. A run holding neither
+  artifact nor snapshot cannot cite one, and the refusal that normally lists what to cite
+  had nothing to list.
+
+  So the bypass is split in two, per model: hearing it without tools, and waiting until
+  there is something to cite. These pin both arms, because the value of the first is the
+  run this second one would also stop.
+*/
+describe("a run is told to report only when it holds something to report from", () => {
+  test("a turn that came back with nothing at all is asked once more", async () => {
+    /*
+      What `gemma4:26b` has been losing database-assessment to for fifteen measured runs, read
+      properly for the first time.
+
+      It was read as a model refusing to file: the run profiles its tables, counts things, and
+      then produces a turn with no call and no report. Two fixes were aimed at that reading and
+      both were measured and deleted — a second reminder took it from 4/5 to 2/5, a lower call
+      ceiling to 3/5. Both were the wrong medicine, and its own profile said what was still
+      missing: the text of the stopping turn.
+
+      There is none. No `model-stopped-saying`, no `closing-statement` — both are written only
+      when there is text — and ten seconds between the reminder and the end. The model did not
+      argue and did not keep reading. It returned an EMPTY completion, and an empty turn ends
+      the run as though the model had chosen to stop.
+
+      So it is asked again. A run that has read something and not filed it has the whole job
+      done but the last call, and one more turn is the cheapest thing this loop can spend.
+      Once, per model, and off by default: a model that answers nothing twice is stopping.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    // Two empty turns, which is the measured sequence: the FIRST is already survivable — it
+    // draws the report reminder and the loop goes on. The second is where the run ended,
+    // because the reminder is spent and an empty turn reads as a model that has stopped.
+    const script = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "reading" }),
+      answersProse(),
+      answersProse(),
+      reportOn("the orders table has rows"),
+    );
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, undefined, "gemma4:26b"),
+      resources: b.resources,
+    });
+
+    expect(script.turns).toHaveLength(4);
+    expect(result.stopReason).toBe("report-composed");
+  });
+
+  test("a refusal about the SHAPE of a call records which fields failed", async () => {
+    /*
+      The code alone could not be diagnosed. `INVALID_TOOL_INPUT` is the largest refusal
+      family on record — around a hundred and fifty across every model measured — and
+      One evaluated model produced eight against `recommend_change` in a single run, holding
+      the tool throughout, while the ledger could only say the shape was wrong eight times.
+      Which part of the object it kept getting wrong was unreadable, so no fix could be
+      aimed at it.
+
+      What goes in stays this server's own vocabulary: the validator's field paths and the
+      types it expected. The arguments that failed them do not, which is why the refusal
+      that lists a result's real column names carries no detail at all — those names are the
+      engine's words.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(
+      callsTool("compose_report", { claims: "a sentence" }),
+      answersProse("understood"),
+      answersProse("understood"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const view = await b.store.read(run.runId);
+    const declined = view?.record.events.find((event) => event.kind === "call-declined");
+    expect(declined?.kind === "call-declined" && declined.reasonCode).toBe("INVALID_TOOL_INPUT");
+    expect(declined?.kind === "call-declined" && declined.detail).toContain("claims");
+  });
+
+  test("a field the schema offers a closed set for is refused with that set named", async () => {
+    /*
+      What the first version of this refusal could not distinguish, found by reading it.
+
+      One evaluated model produced thirty-two `recommend_change` refusals in one run reading
+      `change: invalid value` — and that sentence covers two different mistakes, an absent
+      field and a value outside the set, because Zod reports one code for both. Neither the
+      reader nor the MODEL could tell which it was, and the model is the one that had to act
+      on it: it was told its `change` was wrong thirty-two times without ever being told that
+      `index` and `rewrite` are the only two things it could be.
+
+      Naming what would have worked is the move that carried this whole effort — it is what
+      the worked example does, and what the citable-id list does. A closed set is the cheapest
+      case of it: the values are in the schema, and the refusal already had them in hand.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "query-optimization");
+    const script = scriptedModel(
+      callsTool("recommend_change", { statement: "CREATE INDEX ON salary (dept_no)" }),
+      answersProse("understood"),
+      answersProse("understood"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    // The model reads the same sentence the ledger keeps, so one assertion covers both.
+    expect(script.turns[1]?.transcript ?? "").toContain("index, rewrite");
+    const view = await b.store.read(run.runId);
+    const declined = view?.record.events.find((event) => event.kind === "call-declined");
+    expect(declined?.kind === "call-declined" && declined.detail).toContain("one of index, rewrite");
   });
 });

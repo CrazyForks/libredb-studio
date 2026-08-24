@@ -62,6 +62,7 @@ import type {
   AgentRunTerminalStatus,
   AgentRunWorkflowType,
   AgentToolRefusal,
+  AgentToolProtocol,
 } from "./types";
 
 /**
@@ -87,6 +88,25 @@ export type AgentRunNarrativeEvent = Extract<
       | "context-captured"
       | "statement-drafted"
       | "report-composed"
+      // A call the drive turned back, with what it asked for instead. It belongs here
+      // for the same reason the three below do: nothing was executed and no step was
+      // settled — the run is telling the ledger a decision it made, not recording an
+      // effect. Without it a held call is invisible, and a reader sees a run that
+      // reported once where it in fact tried, was asked for something, and tried again.
+      | "call-held"
+      // A ledger-only TOOL that declined, which belongs here for the same reason the hold
+      // above does and closes the same gap one layer down: these tools execute nothing, so
+      // a refusal from one settles no step. A database tool that declines writes
+      // `tool-refused`; before this, a ledger tool that declined wrote nothing at all, and
+      // a reader could not tell a call the tool sent back from a call never made.
+      | "call-declined"
+      // What the model said on the turn it stopped. Narrative for the same reason the two
+      // above are: nothing was executed and no step settled -- the run is recording a fact
+      // about its own ending, which is the largest unexplained group in the measurements.
+      | "model-stopped-saying"
+      // A sentence the drive said on a turn nothing was refused. Narrative like the entries
+      // above: no effect ran and no step settled, and the run is recording a decision it made.
+      | "guidance-issued"
       // Both reach no database and settle no step: they record what the run has
       // ALREADY established, which is exactly what a narrative entry is.
       | "plan-comparison"
@@ -129,6 +149,8 @@ export interface AgentRunStartInput {
   readonly workflowType?: AgentRunWorkflowType;
   /** Whether the run may hand its answer to the editor to run. Defaults to `false`. */
   readonly autoExecute?: boolean;
+  /** Defaults to `native`; see `AgentRunRecord.toolProtocol`. */
+  readonly toolProtocol?: AgentToolProtocol;
   readonly actor: AgentRunActor;
   readonly connectionId: string;
   readonly objective: string;

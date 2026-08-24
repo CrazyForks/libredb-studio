@@ -76,6 +76,8 @@ import type { OperationRegistry } from "@/lib/db/operations/registry";
 import type { DatabaseProvider, ProviderCapabilities, ProviderLabels } from "@/lib/db/types";
 import { asBytes, binaryText } from "@/lib/export/binary";
 import { hasOptimizerHint } from "@/lib/sql/optimizer-hints";
+import { connectionIdentity, heldSnapshotForConnection } from "./context-snapshot";
+import { offersRefusalExamples } from "./models";
 import type { ColumnSchema, DatabaseConnection, QueryResult, TableSchema } from "@/lib/types";
 import {
   type AgentCatalogKind,
@@ -190,6 +192,15 @@ export type AgentProviderAcquirer = (
  */
 export interface AgentToolContext {
   readonly runId: string;
+  /**
+   * Which model is driving, so a tool can decide per model what to say when it refuses.
+   *
+   * Here rather than passed to each refusal because a tool that says no should not need the
+   * drive to tell it who it is saying no to. Every behaviour added from here defaults to what
+   * was measured before it and turns on per model, which is what stopped a change from winning
+   * one cell and quietly costing another.
+   */
+  readonly modelId: string;
   /** The run's PERSISTED mode. The only thing that decides which tools exist. */
   readonly mode: AgentRunMode;
   /**
@@ -246,8 +257,26 @@ export type AgentToolUnavailableCode =
   | "UNVERIFIABLE_EVIDENCE"
   /** A cited plan is not an estimating plan THIS run produced. */
   | "UNVERIFIABLE_PLAN"
+  /**
+   * The named table IS inventoried, but not under the schema the call qualified it with.
+   *
+   * Split from `TABLE_NOT_INVENTORIED` because the two need different sentences: this one
+   * is a caller that has the right table and the wrong qualifier, and can be told the name
+   * to use, while that one has no such table at all.
+   */
+  | "TABLE_QUALIFIER_UNKNOWN"
   /** The named table is not in the inventory this run captured. */
   | "TABLE_NOT_INVENTORIED"
+  /** A catalog read matched no object at all, so there is nothing to inspect or cite. */
+  | "CATALOG_MATCHED_NOTHING"
+  /**
+   * An index or relation inventory that exists and declares nothing.
+   *
+   * Split from `CATALOG_MATCHED_NOTHING` because the two say opposite things: that one denies
+   * the object, and this one confirms it and reports an absence. "No secondary index" is an
+   * answer to an optimization question rather than a failed lookup.
+   */
+  | "CATALOG_INVENTORY_EMPTY"
   /** The profile ran, and its aggregate row could not be read back. */
   | "PROFILE_UNREADABLE"
   /** The requested column offset is past the end of the table. */
@@ -279,10 +308,25 @@ export type AgentToolUnavailableCode =
   | AgentDeadlineDenyCode
   | AgentRepairDenyCode;
 
+/**
+ * A refusal that performed nothing, spelled once because six outcomes carried it identically.
+ *
+ * `detail` is what this server said no ABOUT — the validator's field paths, the codes it can
+ * name — and never what it was sent. It exists because the code alone proved undiagnosable:
+ * eight `INVALID_TOOL_INPUT` refusals in one evaluated model's run said the shape was wrong
+ * eight times and never which part.
+ */
+type AgentToolUnavailable = {
+  readonly kind: "unavailable";
+  readonly reasonCode: AgentToolUnavailableCode;
+  readonly modelText: string;
+  readonly detail?: string;
+};
+
 export type AgentToolOutcome =
   | { readonly kind: "completed"; readonly artifact: AgentArtifactReference; readonly modelText: string }
   | { readonly kind: "refused"; readonly refusal: AgentToolRefusal; readonly modelText: string }
-  | { readonly kind: "unavailable"; readonly reasonCode: AgentToolUnavailableCode; readonly modelText: string };
+  | AgentToolUnavailable;
 
 export type AgentTableProfileOutcome =
   | {
@@ -292,7 +336,7 @@ export type AgentTableProfileOutcome =
       readonly modelText: string;
     }
   | { readonly kind: "refused"; readonly refusal: AgentToolRefusal; readonly modelText: string }
-  | { readonly kind: "unavailable"; readonly reasonCode: AgentToolUnavailableCode; readonly modelText: string };
+  | AgentToolUnavailable;
 
 export type AgentPlanComparisonOutcome =
   | {
@@ -301,14 +345,14 @@ export type AgentPlanComparisonOutcome =
       readonly after: AgentPlanSide;
       readonly modelText: string;
     }
-  | { readonly kind: "unavailable"; readonly reasonCode: AgentToolUnavailableCode; readonly modelText: string };
+  | AgentToolUnavailable;
 
 /** Everything a `recommendation` event carries except when it happened. */
 export type AgentRecommendation = Omit<Extract<AgentRunEvent, { kind: "recommendation" }>, "kind" | "atMs">;
 
 export type AgentRecommendationOutcome =
   | { readonly kind: "recommended"; readonly recommendation: AgentRecommendation; readonly modelText: string }
-  | { readonly kind: "unavailable"; readonly reasonCode: AgentToolUnavailableCode; readonly modelText: string };
+  | AgentToolUnavailable;
 
 /** Everything an `answer-composed` event carries except when it happened. */
 export type AgentComposedAnswer = Omit<Extract<AgentRunEvent, { kind: "answer-composed" }>, "kind" | "atMs">;
@@ -318,11 +362,11 @@ type AgentAnswerPresentation = AgentComposedAnswer["presentation"];
 
 export type AgentAnswerOutcome =
   | { readonly kind: "answered"; readonly answer: AgentComposedAnswer; readonly modelText: string }
-  | { readonly kind: "unavailable"; readonly reasonCode: AgentToolUnavailableCode; readonly modelText: string };
+  | AgentToolUnavailable;
 
 export type AgentReportOutcome =
   | { readonly kind: "composed"; readonly claims: readonly AgentReportClaim[]; readonly modelText: string }
-  | { readonly kind: "unavailable"; readonly reasonCode: AgentToolUnavailableCode; readonly modelText: string };
+  | AgentToolUnavailable;
 
 export interface AgentOperationRequest {
   readonly operationId: AgentOperationId;
@@ -466,7 +510,19 @@ const reportSchema = z.strictObject({
  * never established exists — the same rule `compare_plans` follows about plans.
  */
 const profileSelectorSchema = z.strictObject({
-  schema: z.string().optional(),
+  /*
+    Described, because an undescribed optional string next to a fingerprint-heavy set of
+    rules is an invitation. `qwen3:8b` filled it with the snapshot fingerprint
+    (`ctx_3b6b…`), which resolved to nothing and cost it the run. Omitting the field
+    entirely is the right answer whenever the inventory names a table bare, so the
+    description leads with that rather than with what a schema is.
+  */
+  schema: z
+    .string()
+    .describe(
+      "Omit this unless the inventory qualifies the table as schema.table. It is a database schema name — never an artifact id or a snapshot fingerprint.",
+    )
+    .optional(),
   table: z.string().min(1),
   depth: z.enum(["basic", "distribution", "pattern"]).optional(),
   /** Where in the table's column list to start. The server bounds how many follow. */
@@ -814,11 +870,47 @@ const UNAVAILABLE_TEXT: Readonly<Record<AgentToolUnavailableCode, string>> = Obj
   // evidence object wrong was answered with a sentence about statements.
   INVALID_TOOL_INPUT:
     "The arguments did not match the shape this tool declares, so nothing was done. Correct them and call the tool again.",
+  /*
+    The true sentence for an inventory that exists and is empty.
+
+    Split from `CATALOG_MATCHED_NOTHING` because that one denies the OBJECT, and here the
+    objects are present and simply carry nothing. "No secondary index" answers an optimization
+    question; it is not a missing name. The old sentence sent 79 of 133 measured optimization
+    runs looking for a misspelling on their opening turn.
+
+    It also closes the door rather than leaving it ajar: the run is told the inventory it was
+    already handed carries the same fact, so there is nothing further to read and no reason to
+    ask again with a different spelling.
+  */
+  CATALOG_INVENTORY_EMPTY:
+    "That inventory is empty: the objects exist and declare none of these, so nothing was inspected. This database has no secondary index and no declared foreign key beyond what the schema inventory in this conversation already shows — reading it again with another spelling will return the same nothing. Treat the absence as a finding: it is an answer about how this database is built, and you may state it in a claim citing that inventory.",
+  CATALOG_MATCHED_NOTHING:
+    "There is no object of that name in this database, so nothing was inspected. Check the inventory this run was given and inspect a name it lists — a name from the objective may be the name of a query or a report rather than of a table.",
   UNVERIFIABLE_EVIDENCE: `At least one evidence reference does not match anything this run produced. Cite an artifact this run actually read, or the schema snapshot it captured. ${AGENT_EVIDENCE_CONTRACT}`,
   UNVERIFIABLE_PLAN:
     "At least one of those references is not an estimated plan this run produced. Inspect the plan of each statement first, then compare the two artifacts those inspections returned.",
+  /*
+    Offers names instead of a tool, and the tool it used to offer is the reason.
+
+    This said "Call inspect_schema for it first" — and the comment just below, written for
+    the sibling refusal, already states why that is wrong: the `no-table-profile` hold
+    narrows a run to `profile_table` and `compose_report`, so `inspect_schema` is gone. The
+    measured sequence was two dead refusals in a row: held and narrowed, asked for a
+    profile, names a table slightly wrong, told to call a tool it no longer holds, calls
+    it, told there is no such tool.
+
+    The inventory is in hand at the refusal site, so the call site appends names from it.
+    Not gated on whether the run was narrowed: a run that cannot spell a table is helped by
+    seeing the spellings either way.
+  */
   TABLE_NOT_INVENTORIED:
-    "That table is not in the schema inventory this run captured. Call inspect_schema for it first, then profile it by the name the inventory uses.",
+    "That table is not in the schema inventory this run captured, so nothing was profiled. Profile one the inventory lists, spelled the way it spells it.",
+  // Says what to change, which is the whole of it: the call this replaces was repeated
+  // verbatim three times because the sentence it got named nothing that could be edited.
+  // It also may not send the model to `inspect_schema` — a held run has been narrowed out
+  // of holding it, and the fix does not need it, since the table is already inventoried.
+  TABLE_QUALIFIER_UNKNOWN:
+    "The table is in this run's inventory, but not under the schema you named — this run's inventory has no such schema, so nothing was profiled. Call profile_table again with the same table and NO schema field at all: the inventory's own name for it is what this tool matches. The schema field takes a database schema name, never an artifact id or a snapshot fingerprint.",
   NO_COLUMNS_AT_OFFSET:
     "That column offset is past the end of the table, so there is nothing there to profile. Start from an earlier column, or profile a different table.",
   PROFILE_UNREADABLE:
@@ -855,10 +947,23 @@ const UNAVAILABLE_TEXT: Readonly<Record<AgentToolUnavailableCode, string>> = Obj
     "A chart needs at least two rows and this result has fewer, so a chart of it would render an empty state. Present the answer as a table: one row is a complete answer, not a lesser one.",
   CHART_SHAPE_MISMATCH:
     "That chart type does not fit the columns named: a pie takes exactly one y column, and a scatter needs a numeric x as well as a numeric y. Choose a type that fits the columns, or present the answer as a table.",
+  /*
+    Both of these name `compose_report`, and that is the whole correction.
+
+    They used to end "Stop calling tools and finish with what has already been established"
+    and "Ask for something cheaper, or finish now." Finishing IS a tool call: `compose_report`
+    is ledger-only, reaches no database, and is short-circuited before the deadline gate is
+    consulted, so it is still available to a run with nothing left. A model that reads those
+    sentences literally answers in prose instead, and prose is scored `no-report` — the
+    largest single shortfall measured, blocking 28 of the cells that do not lock.
+
+    So each says which call still works, and why it works, rather than telling a run to stop
+    doing the only thing that can still end it well.
+  */
   RUN_DEADLINE_EXCEEDED:
-    "The run has spent its whole time budget. Stop calling tools and finish with what has already been established.",
+    "The run has spent its whole time budget, so no further reading is possible. Call compose_report now with what has already been established: it needs no time budget, because it reaches no database. A run that ends without a report answers nothing at all.",
   INSUFFICIENT_TIME_REMAINING:
-    "Too little time is left in the run for a call of this size. Ask for something cheaper, or finish now.",
+    "Too little time is left in the run for a call of this size. Ask for something cheaper, or call compose_report now with what you have — it needs no time budget, because it reaches no database.",
   STATEMENT_ALREADY_FAILED:
     "This exact statement has already failed in this run. Draft a different statement rather than sending the same one again.",
   REPAIR_BUDGET_EXHAUSTED:
@@ -970,7 +1075,12 @@ function unavailable(
   detail?: string,
 ): AgentToolOutcome & { kind: "unavailable" } {
   const base = UNAVAILABLE_TEXT[reasonCode];
-  return { kind: "unavailable", reasonCode, modelText: detail === undefined ? base : `${base} (${detail})` };
+  return {
+    kind: "unavailable",
+    reasonCode,
+    modelText: detail === undefined ? base : `${base} (${detail})`,
+    ...(detail === undefined ? {} : { detail }),
+  };
 }
 
 /**
@@ -987,12 +1097,123 @@ function unavailable(
  * `UNVERIFIABLE_EVIDENCE` carries the contract in `UNAVAILABLE_TEXT` itself, because
  * only these same two tools can produce it.
  */
-function invalidEvidenceInput(): AgentToolOutcome & { kind: "unavailable" } {
+function invalidEvidenceInput(problems: string, example?: string): AgentToolOutcome & { kind: "unavailable" } {
   return {
     kind: "unavailable",
     reasonCode: "INVALID_TOOL_INPUT",
-    modelText: `${UNAVAILABLE_TEXT.INVALID_TOOL_INPUT} ${AGENT_EVIDENCE_CONTRACT}`,
+    // The paths alone, without the contract and without the worked call: the ledger wants to
+    // be countable, and the two long blocks below are the same text on every refusal.
+    detail: problems,
+    // The failing paths come FIRST, before the contract. This is the refusal a
+    // `qwen3:8b` run received thirty-seven times in a row without changing its call, and
+    // the contract was already in it every one of those times: restating a rule the model
+    // has read and misapplied is not what it is missing. The field that failed is.
+    /*
+      And a literal call the model can copy, when the run holds an id to build one from.
+
+      Naming the failing field was the previous step and it was not enough: one model was
+      refused here TWENTY-EIGHT times in a row on one data-analysis run, each time with the
+      paths named, and never changed the shape it sent. `qwen3:8b` did the same thirty-seven
+      times before that. A model that has misread a schema description twice does not need it
+      restated a third time; what it has never been given is an instance.
+
+      Built from this run's own ledger, so the example is not only well-shaped but valid: the
+      id in it is a result this run actually produced, which means a model that copies it
+      verbatim and edits the prose gets a call that passes.
+    */
+    modelText: [
+      `${UNAVAILABLE_TEXT.INVALID_TOOL_INPUT} (${problems})`,
+      AGENT_EVIDENCE_CONTRACT,
+      ...(example === undefined ? [] : [`A call this run could make right now: ${example}`]),
+    ].join(" "),
   };
+}
+
+/**
+ * A minimal, VALID `compare_plans` call for this run, or nothing when it holds fewer than two.
+ *
+ * The two most recent plans, in the order the drive's own notice names them: a run that took
+ * five is choosing between its latest readings, and the first plan it took is the one it has
+ * moved on from.
+ *
+ * Nothing when there is only one plan, deliberately. There is no valid call to show, and what
+ * such a run needs is the hold's sentence rather than a shape it cannot fill.
+ */
+function exampleCompareCall(events: readonly AgentRunEvent[]): string | undefined {
+  const plans: string[] = [];
+  for (const event of events) {
+    if (event.kind === "tool-completed" && event.artifact.operationId === "sql.explain.estimate")
+      plans.push(event.artifact.correlationId);
+  }
+  if (plans.length < 2) return undefined;
+  return JSON.stringify({ before: plans.at(-2), after: plans.at(-1) });
+}
+
+/**
+ * A minimal, VALID `recommend_change` call for this run, or nothing when it holds no plan.
+ *
+ * The index arm, because that is the one an optimization verdict accepts without a comparison:
+ * a run holding ONE plan satisfies its bar by recommending an index that cites that plan, and
+ * that is exactly the call one evaluated model failed on the shape of four times in a single run
+ * while its prose showed it knew what to say.
+ *
+ * The statement is a placeholder naming no table on purpose. This layer knows which plan the
+ * run holds; it does not know which column the model thinks should be indexed, and inventing
+ * one would be this server writing a recommendation and attributing it to the model.
+ */
+function exampleRecommendCall(events: readonly AgentRunEvent[]): string | undefined {
+  let plan: string | undefined;
+  for (const event of events) {
+    if (event.kind === "tool-completed" && event.artifact.operationId === "sql.explain.estimate")
+      plan = event.artifact.correlationId;
+  }
+  if (plan === undefined) return undefined;
+  return JSON.stringify({
+    change: "index",
+    statement: "CREATE INDEX <name> ON <table> (<column>)",
+    rationale: "<why this index answers the objective>",
+    evidence: [{ source: "artifact", correlationId: plan }],
+  });
+}
+
+/**
+ * A minimal, VALID `present_answer` call for this run, or nothing when it holds no result the
+ * answer tool would accept.
+ *
+ * The id has to be one the tool will TAKE, not merely one the run produced: `present_answer`
+ * refuses a plan, a profile and a catalog read, so an example built from the newest artifact
+ * would hand a run that just profiled a table the very id it is about to be refused for. So
+ * this looks for a completed data read with a statement of the model's behind it, which is
+ * exactly what the tool accepts, and offers nothing when there is none.
+ */
+function exampleAnswerCall(events: readonly AgentRunEvent[]): string | undefined {
+  const drafted = new Set(events.flatMap((event) => (event.kind === "statement-drafted" ? [event.stepId] : [])));
+  let latest: string | undefined;
+  for (const event of events) {
+    if (event.kind === "tool-completed" && event.artifact.operationId === ANSWER_OPERATION && drafted.has(event.stepId))
+      latest = event.artifact.correlationId;
+  }
+  if (latest === undefined) return undefined;
+  return JSON.stringify({ artifact: latest, presentation: { kind: "table" } });
+}
+
+/**
+ * A minimal, VALID `compose_report` call for this run, or nothing when it has read nothing.
+ *
+ * The claim text is deliberately a placeholder and says so: the shape is what the refusal
+ * could not teach, and a sentence that looked like a finding would invite a model to file it
+ * as one. The id is real, because an example citing a made-up id would fail the citation check
+ * a turn later and teach the wrong lesson twice.
+ */
+function exampleReportCall(events: readonly AgentRunEvent[]): string | undefined {
+  let latest: string | undefined;
+  for (const event of events) {
+    if (event.kind === "tool-completed") latest = event.artifact.correlationId;
+  }
+  if (latest === undefined) return undefined;
+  return JSON.stringify({
+    claims: [{ claim: "<what you found, in one sentence>", evidence: [{ source: "artifact", correlationId: latest }] }],
+  });
 }
 
 /**
@@ -1266,6 +1487,74 @@ class AgentCuratedReadError extends Error {
   }
 }
 
+/**
+ * The columns a table actually has, for the largest family of database refusal there is.
+ *
+ * Roughly eighty of 368 `database-error` refusals are a column that is not there — `no such
+ * column: salary.dept_no`, `employee.dept_no`, `d.dept_name`. The engine says which name failed
+ * and never which names would have worked, and this process is holding exactly that:
+ * `heldSnapshotForConnection` keeps the inventory for the connection the statement ran against.
+ *
+ * The identifier is extracted from the untrusted message and used ONLY as a lookup key. What
+ * goes back is column names read out of our own snapshot, so no fragment of the engine's text
+ * returns as though this server had verified it.
+ *
+ * A qualifier that matches no table produces nothing rather than a guess. It is usually the
+ * table and sometimes an alias, and resolving an alias would need the statement's FROM clause;
+ * inventing a mapping is worse than saying nothing.
+ */
+function columnsThatExist(message: string, connection: DatabaseConnection): string | undefined {
+  // The LAST two segments, because the engine names the column as the statement wrote it and a
+  // statement usually writes an alias in front: `e.dept_emp.dept_no` is alias, table, column, and
+  // taking the first two would look up "e" and find nothing. Measured — the only database error
+  // this fix could have answered in a whole sweep had that shape, and the first version missed it.
+  const qualified = /no such column:\s*(?:\w+\.)*?(\w+)\.(\w+)\s*$/i.exec(message.trim());
+  if (qualified === null) return undefined;
+  const [, qualifier, missing] = qualified;
+  const snapshot = heldSnapshotForConnection(connectionIdentity(connection));
+  if (snapshot === null) return undefined;
+  // The inventory names a table as the engine qualifies it — `public.engineering` on
+  // PostgreSQL — while the error names it as the statement wrote it, usually bare. So the last
+  // segment is compared as well, which is what makes the two spellings meet.
+  const wanted = qualifier.toLowerCase();
+  const table = snapshot.tables.find((entry) => {
+    const name = entry.name.toLowerCase();
+    return name === wanted || name.split(".").at(-1) === wanted;
+  });
+  if (table === undefined || table.columns.length === 0) return undefined;
+  // Bounded: a wide table's whole column list would bury the sentence that carries it.
+  const named = table.columns.slice(0, 12).map((column) => column.name);
+  /*
+    And WHERE the column it wanted actually lives, when the inventory has it elsewhere.
+    Measured: one model asked for `department.emp_no` twice in one run, having been told after
+    the first that department has dept_no and dept_name. Naming what a table holds does not
+    answer a model looking for a join key — `emp_no` exists, in dept_emp, employee, salary and
+    title — and the whole inventory is already in hand.
+  */
+  const elsewhere = snapshot.tables
+    .filter(
+      (entry) => entry !== table && entry.columns.some((column) => column.name.toLowerCase() === missing.toLowerCase()),
+    )
+    .slice(0, 6)
+    .map((entry) => entry.name);
+  const found = elsewhere.length === 0 ? "" : ` ${missing} is in ${elsewhere.join(", ")} — join through one of those.`;
+  return `"${table.name}" has no ${missing}. Its columns are ${named.join(", ")}.${found}`;
+}
+
+function statementAdvice(message: string, engine: string, connection: DatabaseConnection): string | undefined {
+  // First, because it is the largest family and the most specific thing this layer can say.
+  const columns = columnsThatExist(message, connection);
+  if (columns !== undefined) return columns;
+  const overBudget = /row budget: \d+ rows > (\d+) allowed/.exec(message);
+  if (overBudget !== null) {
+    return `Ask for fewer rows: add LIMIT ${overBudget[1]} (or an aggregate that returns one row) and run it again.`;
+  }
+  if (/information_schema|pg_catalog/i.test(message) || /no such table: \w+\./i.test(message)) {
+    return `That catalog belongs to another engine — this connection is ${engine}. Call inspect_schema for this database's tables and columns rather than querying a catalog directly.`;
+  }
+  return undefined;
+}
+
 async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgentCall): Promise<AgentToolOutcome> {
   // Outside agent mode only a grounding read passes, and the flag is set by nothing
   // the model can reach: `selectAgentTools` still hands a planning run an empty tool
@@ -1363,11 +1652,21 @@ async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgent
       refusal: { class: "database-error", statementFingerprint: fingerprint, message: error.message },
       // The engine's own words: untrusted, so fenced. The fingerprint stands in for
       // a correlation id, which a failed execution never produced.
-      modelText: fenceUntrustedContent(error.message, {
-        label: "database error",
-        operationId: call.operationId,
-        reference: fingerprint,
-      }),
+      //
+      // The advice follows OUTSIDE the fence, because it is this server's sentence and not the
+      // engine's: putting it inside would attribute our instruction to the database.
+      modelText: [
+        fenceUntrustedContent(error.message, {
+          label: "database error",
+          operationId: call.operationId,
+          reference: fingerprint,
+        }),
+        ...(offersRefusalExamples(context.modelId)
+          ? [statementAdvice(error.message, context.connection.type, context.connection) ?? ""]
+          : []),
+      ]
+        .filter((part) => part.length > 0)
+        .join("\n"),
     };
   }
 
@@ -1480,9 +1779,61 @@ function normalizeDeclaredSchema(context: AgentToolContext, schema: string): str
  * failure returns the same `INVALID_TOOL_INPUT` as a composition refusal: from the
  * model's side both mean "these arguments cannot become a statement".
  */
-function parseToolInput<T>(schema: z.ZodType<T>, input: unknown): { ok: true; value: T } | { ok: false } {
+function parseToolInput<T>(
+  schema: z.ZodType<T>,
+  input: unknown,
+): { ok: true; value: T } | { ok: false; problems: string } {
   const parsed = schema.safeParse(input);
-  return parsed.success ? { ok: true, value: parsed.data } : { ok: false };
+  return parsed.success
+    ? { ok: true, value: parsed.data }
+    : { ok: false, problems: describeIssues(parsed.error.issues) };
+}
+
+/**
+ * The failing fields of a refused call, in this layer's own words.
+ *
+ * The largest measured shortfall on this project is `no-report` — 51 runs, about half of
+ * every loss — and the wire recording of a `qwen3:8b` run shows it from the inside. The
+ * model called `compose_report`, was told "The arguments did not match the shape this tool
+ * declares", called it again unchanged, was told the same sentence, and did that for
+ * THIRTY-SEVEN turns until the run ended having reported nothing. Another model's
+ * `data-analysis` run spent 14 of its 42 turns the same way.
+ *
+ * The sentence is true and unusable: it names no field, so there is nothing in it to act
+ * on. Zod knows the path that failed and what was expected there, and this layer was
+ * throwing that away.
+ *
+ * What crosses over is server-authored — the path, and the type or rule that was expected —
+ * and never the VALUE the model sent, which is the rule `composedSqlOutcome` states for the
+ * same reason: a refusal quoting model text back inside a server sentence makes the
+ * ledger's provenance unreadable. Field names are structural, not content, and naming them
+ * is the whole point.
+ *
+ * Three at most, because a model that got the shape wrong is not helped by a fourth, and a
+ * long list read as prose is how a refusal becomes another wall.
+ */
+function describeIssues(issues: readonly z.core.$ZodIssue[]): string {
+  const named = issues.slice(0, 3).map((issue) => {
+    const where = issue.path.length === 0 ? "the arguments object" : issue.path.join(".");
+    if (issue.code === "invalid_type") return `${where}: expected ${issue.expected}`;
+    if (issue.code === "unrecognized_keys") return `${where}: remove ${issue.keys.join(", ")}`;
+    /*
+      A closed set is named, because "invalid value" was not something a model could act on.
+
+      One evaluated model was refused `recommend_change` thirty-two times in one run on this
+      issue alone — one field, the same sentence every time, until the deadline. Zod reports
+      one code here for two different mistakes, an absent field and a value outside the set,
+      so neither the model nor a reader of the ledger could tell which; and the two words it
+      did get back never included the only two words that would have worked.
+
+      Naming what WOULD have worked is the move this whole effort turns on — the worked
+      example does it, the citable-id list does it — and a closed set is its cheapest case:
+      the permitted values are in the schema, already in hand at the point of refusal.
+    */
+    if (issue.code === "invalid_value") return `${where}: expected one of ${issue.values.join(", ")}`;
+    return `${where}: ${issue.code.replaceAll("_", " ")}`;
+  });
+  return `the fields that did not match — ${named.join("; ")}`;
 }
 
 /**
@@ -1703,7 +2054,7 @@ async function readCatalog(
   grounding: boolean,
 ): Promise<AgentToolOutcome> {
   const parsed = parseToolInput(selectorSchema, input);
-  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT");
+  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT", parsed.problems);
   const selector = normalizeSelector(parsed.value);
   let sql: string;
   try {
@@ -1711,7 +2062,7 @@ async function readCatalog(
   } catch (error) {
     return composedSqlOutcome(error);
   }
-  return executeAgentOperation(context, {
+  const outcome = await executeAgentOperation(context, {
     operationId: "sql.query.read",
     sql,
     grounding,
@@ -1732,6 +2083,58 @@ async function readCatalog(
     // denied against a `["main"]` allowlist.
     ...(selector.schema === undefined ? {} : { target: { schema: normalizeDeclaredSchema(context, selector.schema) } }),
   });
+  /*
+    A catalog read that matched NO OBJECT is a refusal, not a result.
+
+    Measured, and it is the server answering wrongly rather than the model asking wrongly.
+    This repository's own `query-optimization` eval objective is "Why is the employee listing
+    query slow?" — and there is no `employee_listing` object in the sample, because "employee
+    listing" names a QUERY. Models called `inspect_schema` for it, the composed `sqlite_master`
+    read matched nothing, and this function returned a COMPLETED step with `rowCount: 0` and a
+    citable correlation id. The model then cited it, as it should be able to cite anything the
+    server called a success, and `restsOnlyOnEmptyResults` scored the run `empty-evidence`.
+    Three families produced character-identical ledgers doing exactly this: `gemma4:26b`,
+    two models measured during evaluation.
+
+    `profile_table` has had the right behaviour all along — it refuses a table the inventory
+    does not list (`TABLE_NOT_INVENTORIED`) — and this is the same refusal for the same reason.
+
+    What this deliberately does NOT refuse is an empty RESULT. `run_read_query` returning no
+    rows has established something about the data, and this workflow family has a whole eval
+    file about not treating that as a failure. The distinction is between a question about the
+    data, which zero rows answers, and a question about the CATALOG, which zero objects does
+    not: nothing was inspected, so there is nothing to cite.
+
+    Only the model's own calls. A grounding read is the server asking, and an empty answer
+    there is the honest state of a database with no tables — the drive reads that itself and
+    says so in the opening note rather than being refused.
+  */
+  if (!grounding && outcome.kind === "completed" && outcome.artifact.summary.rowCount === 0) {
+    /*
+      Which empty answer this is, because the two mean opposite things.
+
+      Zero rows from a COLUMN read means the object was not found — the case above. Zero rows
+      from an index or relation read means the objects were found and carry none, which is an
+      ANSWER to an optimization question rather than a failure of one. Telling a run "there is
+      no object of that name" when it asked which indexes exist is false, and it sends the
+      model hunting a misspelling it did not make.
+
+      That is not a corner. `query-optimization`'s first rule ORDERS an index read, the sample
+      database declares no `CREATE INDEX` anywhere, so the call returns zero rows every time:
+      it is the opening turn of 79 of the 133 optimization runs measured, answered with a
+      false sentence whose own advice cannot help, because the inventory it points at lists no
+      indexes either. Since sampling went deterministic the dead opening became a dead
+      certainty — `qwen3:8b` opened this way in 10 of 10 runs and lost all ten.
+
+      Both stay refusals rather than becoming citable empty artifacts: that is the
+      `empty-evidence` regression this function's docblock records, and nothing here reopens
+      it. What changes is that the sentence is true.
+    */
+    const kind = (parsed.value as { kind?: string }).kind;
+    if (kind === "indexes" || kind === "relations") return unavailable("CATALOG_INVENTORY_EMPTY", kind);
+    return unavailable("CATALOG_MATCHED_NOTHING");
+  }
+  return outcome;
 }
 
 /** One bounded read the model drafted. The statement guard is what bounds it. */
@@ -1740,7 +2143,7 @@ export async function runReadQueryTool(
   input: { readonly sql: string; readonly rationale?: string },
 ): Promise<AgentToolOutcome> {
   const parsed = parseToolInput(readStatementSchema, input);
-  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT");
+  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT", parsed.problems);
   return executeAgentOperation(context, { operationId: "sql.query.read", sql: parsed.value.sql, label: "read result" });
 }
 
@@ -2043,7 +2446,7 @@ function asReadingFailure(error: unknown, provider: DatabaseConnection["type"]):
  */
 export async function inspectOperationsTool(context: AgentToolContext, input: unknown): Promise<AgentToolOutcome> {
   const parsed = parseToolInput(agentCuratedReadInput, input);
-  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT");
+  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT", parsed.problems);
   const selector = parsed.value;
   return runAuditedAgentCall(context, {
     operationId: "db.operations.read",
@@ -2066,7 +2469,7 @@ export async function inspectPlanTool(
   input: { readonly sql: string },
 ): Promise<AgentToolOutcome> {
   const parsed = parseToolInput(planStatementSchema, input);
-  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT");
+  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT", parsed.problems);
   let sql: string;
   try {
     sql = composeEstimatingExplain(context.connection.type, parsed.value.sql);
@@ -2247,7 +2650,7 @@ export interface AgentProfilePlan {
 
 export type AgentProfilePlanOutcome =
   | { readonly kind: "planned"; readonly plan: AgentProfilePlan }
-  | { readonly kind: "unavailable"; readonly reasonCode: AgentToolUnavailableCode; readonly modelText: string };
+  | AgentToolUnavailable;
 
 /** Resolves and composes, and reaches nothing. */
 export function planTableProfile(
@@ -2261,11 +2664,39 @@ export function planTableProfile(
   }
 
   const parsed = parseToolInput(profileSelectorSchema, input);
-  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT");
+  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT", parsed.problems);
 
   const snapshot = capturedSnapshot(run.events);
   const target = snapshot === null ? null : inventoriedTable(snapshot, parsed.value.schema, parsed.value.table);
-  if (target === null) return unavailable("TABLE_NOT_INVENTORIED");
+  if (target === null) {
+    /*
+      Two different failures used to share one sentence, and the wire recording of a
+      `qwen3:8b` run shows what the merged one costs. It called
+
+        profile_table {schema: "ctx_3b6ba24865a80f993576ee1f566c5238", table: "current_dept_emp"}
+
+      putting the SNAPSHOT FINGERPRINT in the schema field — a fair guess from a model
+      whose surrounding rules all speak of fingerprints and whose schema field is
+      described nowhere. `current_dept_emp` was in the inventory; the qualifier was not.
+      It was answered "That table is not in the schema inventory this run captured. Call
+      inspect_schema for it first", which is untrue of the table and names a tool the run
+      had just been narrowed out of holding. It repeated the identical call three times —
+      nothing in the sentence identified anything to change — and then spent the rest of
+      its budget failing to report.
+
+      The RESOLUTION is untouched: #345 is why a named schema is never matched against a
+      bare entry, and profiling a table the caller did not ask for is worse than refusing.
+      This only asks the second question once the first has failed — would this table have
+      resolved unqualified? — and, when it would, says so and gives the name to use.
+    */
+    const unqualified = snapshot !== null && inventoriedTable(snapshot, undefined, parsed.value.table) !== null;
+    if (unqualified) return unavailable("TABLE_QUALIFIER_UNKNOWN");
+    // The first few names, not all of them: the inventory can hold hundreds, and a refusal
+    // that turns into a catalog dump is a wall of its own. Enough to show the spelling
+    // convention this database uses, which is what a misspelling needs.
+    const offer = (snapshot?.tables ?? []).slice(0, 6).map((entry) => entry.name);
+    return unavailable("TABLE_NOT_INVENTORIED", offer.length === 0 ? undefined : `it lists ${offer.join(", ")}`);
+  }
 
   const depth = parsed.value.depth ?? "basic";
   const from = parsed.value.fromColumn ?? 0;
@@ -2357,7 +2788,16 @@ export function comparePlansTool(
   }
 
   const parsed = parseToolInput(planComparisonSchema, input);
-  if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT");
+  if (!parsed.ok) {
+    // The last id-bearing tool to get a worked call. One model failed the shape of this one
+    // three times in a single run while also failing `recommend_change` four times -- both
+    // routes through the plan bar, neither buildable.
+    const example = offersRefusalExamples(context.modelId) ? exampleCompareCall(run.events) : undefined;
+    return unavailable(
+      "INVALID_TOOL_INPUT",
+      example === undefined ? parsed.problems : `${parsed.problems}. A call this run could make right now: ${example}`,
+    );
+  }
   // One plan cited as both sides is not a before and an after. Without this, a
   // comparison of a plan with itself records a valid `plan-comparison` and the goal
   // verifier marks the run answered on a single inspected plan — which defeats the
@@ -2399,12 +2839,28 @@ export function recommendChangeTool(
   }
 
   const parsed = parseToolInput(recommendationSchema, input);
-  if (!parsed.ok) return invalidEvidenceInput();
+  if (!parsed.ok) {
+    return invalidEvidenceInput(
+      parsed.problems,
+      offersRefusalExamples(context.modelId) ? exampleRecommendCall(run.events) : undefined,
+    );
+  }
   if (!matchesCard(parsed.value.change, parsed.value.statement)) {
-    return unavailable("RECOMMENDATION_SHAPE_MISMATCH");
+    /*
+      With a worked call where the model has earned one. One model hit this refusal five times
+      in a single optimization run — the card said `index` and the statement was not a CREATE
+      INDEX, or the reverse — and the sentence above names the rule without showing either
+      shape. It is the one evidence-bearing refusal that carried no example.
+    */
+    return unavailable(
+      "RECOMMENDATION_SHAPE_MISMATCH",
+      offersRefusalExamples(context.modelId) ? exampleRecommendCall(run.events) : undefined,
+    );
   }
   if (!parsed.value.evidence.every((reference) => verifiedAgainst(run.events, reference))) {
-    return unavailable("UNVERIFIABLE_EVIDENCE");
+    // Both evidence-bearing tools name what is citable, because a model that guessed an id
+    // here will guess the same one at `compose_report` a turn later.
+    return unavailable("UNVERIFIABLE_EVIDENCE", citableEvidence(run.events));
   }
 
   return {
@@ -2503,6 +2959,35 @@ function producedArtifact(events: readonly AgentRunEvent[], correlationId: strin
 const ANSWER_OPERATION: AgentOperationId = "sql.query.read";
 
 /** Does this reference name something the run actually produced? */
+/**
+ * The evidence this run CAN cite, named, for a refusal that would otherwise only say no.
+ *
+ * Measured on one model's data-analysis runs, and it is the clearest instance of a failure
+ * class this repository has already paid for three times: a refusal that states the rule and
+ * not the fix. That run did the analysis correctly — it profiled a table, drafted
+ * `SELECT emp_no, amount FROM salary ORDER BY amount DESC LIMIT 1`, and ran it — then called
+ * `compose_report` FIVE times, was refused `UNVERIFIABLE_EVIDENCE` five times with the same
+ * sentence, and stopped. It was never told which ids existed, so each retry was a fresh guess.
+ *
+ * Newest first, because the id a run wants is almost always the read it just took, and the
+ * bound is there because a long run holds more ids than a refusal can usefully carry.
+ *
+ * Only the run's OWN ids and its own snapshot fingerprint: this is the server quoting its
+ * ledger back, never the model's arguments, so a refusal cannot become a channel for a model
+ * to see anything it did not produce. And it is only ever read by a run that has already
+ * failed the citation check, so no passing run's behaviour can change.
+ */
+function citableEvidence(events: readonly AgentRunEvent[]): string | undefined {
+  const ids: string[] = [];
+  for (const event of events) {
+    if (event.kind === "tool-completed") ids.unshift(event.artifact.correlationId);
+  }
+  const snapshot = events.find((event) => event.kind === "context-captured");
+  const offer = ids.slice(0, 5);
+  if (snapshot !== undefined) offer.push(`the schema snapshot ${snapshot.fingerprint}`);
+  return offer.length === 0 ? undefined : `this run produced ${offer.join(", ")}`;
+}
+
 function verifiedAgainst(events: readonly AgentRunEvent[], reference: AgentEvidenceReference): boolean {
   if (reference.source === "artifact") return producedArtifact(events, reference.correlationId) !== null;
   return events.some((event) => event.kind === "context-captured" && event.fingerprint === reference.fingerprint);
@@ -2781,10 +3266,26 @@ export function presentAnswerTool(
 
   const parsed = parseToolInput(presentAnswerSchema, readSerializedPresentation(input));
   if (!parsed.ok) {
+    /*
+      The same worked example the report refusal carries, for the same measured reason and one
+      call earlier in the arc.
+
+      One model showed both halves in a single run. Refused on `compose_report`,
+      it took the example and got the report right on its next turn — the loop of twenty-eight
+      identical refusals was gone. It was then refused on `present_answer`, which had no
+      example, and it never tried again: the run scored `no-answer` having done every piece of
+      the work. A contract restated is what a model has already failed to apply; an instance is
+      what it can copy.
+    */
+    const example = offersRefusalExamples(context.modelId) ? exampleAnswerCall(run.events) : undefined;
     return {
       kind: "unavailable",
       reasonCode: "INVALID_TOOL_INPUT",
-      modelText: `${UNAVAILABLE_TEXT.INVALID_TOOL_INPUT} ${AGENT_ANSWER_CONTRACT}`,
+      modelText: [
+        UNAVAILABLE_TEXT.INVALID_TOOL_INPUT,
+        AGENT_ANSWER_CONTRACT,
+        ...(example === undefined ? [] : [`A call this run could make right now: ${example}`]),
+      ].join(" "),
     };
   }
 
@@ -2849,7 +3350,11 @@ export function composeReportTool(
   }
 
   const parsed = parseToolInput(reportSchema, input);
-  if (!parsed.ok) return invalidEvidenceInput();
+  if (!parsed.ok)
+    return invalidEvidenceInput(
+      parsed.problems,
+      offersRefusalExamples(context.modelId) ? exampleReportCall(run.events) : undefined,
+    );
 
   const claims: AgentReportClaim[] = [];
   for (const claim of parsed.value.claims) {
@@ -2857,7 +3362,7 @@ export function composeReportTool(
     // shared with `recommend_change`: two would be two things to keep equal, and the
     // one that drifted would be the one letting an uncited claim through.
     if (!claim.evidence.every((reference) => verifiedAgainst(run.events, reference))) {
-      return unavailable("UNVERIFIABLE_EVIDENCE");
+      return unavailable("UNVERIFIABLE_EVIDENCE", citableEvidence(run.events));
     }
     claims.push({
       claim: claim.claim,

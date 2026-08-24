@@ -130,6 +130,9 @@ function harness(
 
   const context: AgentToolContext = {
     runId: "run-1",
+    // A model with no profile, so these tests read the DEFAULTS. A named model here would
+    // quietly test one model's settings and call the result the tool's behaviour.
+    modelId: "unmeasured-model-for-tests",
     mode: "agent",
     workflowType: "investigation",
     actor: { sessionId: "session-1", role: "user" },
@@ -500,6 +503,40 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
       expect(answer.reasonCode).toBe("INVALID_TOOL_INPUT");
     });
 
+    test("and names the field that did not match, so there is something to correct", async () => {
+      /*
+        The largest measured shortfall on this project is `no-report` -- 51 runs, about half
+        of every loss -- and the wire recording of a `qwen3:8b` run shows what it looks like
+        from the inside. The model called `compose_report`, was told "The arguments did not
+        match the shape this tool declares", called it again with the same shape, was told
+        the same sentence, and did that for THIRTY-SEVEN turns until the run ran out of
+        budget and ended having reported nothing.
+
+        The sentence is true and it is unusable: it names no field, so there is nothing in
+        it to act on. Zod knows exactly which path failed and what was expected there, and
+        this layer was discarding that.
+
+        What is passed on is server-authored -- the path and the expected type -- and never
+        the value the model sent, which is the rule `composedSqlOutcome` states for the same
+        reason: a refusal that quotes model text back inside a server sentence makes the
+        ledger's provenance unreadable. Field NAMES are structural rather than content, and
+        naming them is the entire point of the message.
+      */
+      const h = analysis();
+      const { artifact, events } = await readWithLedger(h.context);
+
+      const answer = presentAnswerTool(
+        h.context,
+        { runId: h.context.runId, events, autoExecute: false },
+        { artifact: artifact.correlationId, presentation: { kind: "spreadsheet" } },
+      );
+
+      expect(answer.kind).toBe("unavailable");
+      if (answer.kind !== "unavailable") return;
+      expect(answer.reasonCode).toBe("INVALID_TOOL_INPUT");
+      expect(answer.modelText).toContain("presentation");
+    });
+
     test("refuses a string that is not JSON at all, in the contract's own words", async () => {
       const h = analysis();
       const { artifact, events } = await readWithLedger(h.context);
@@ -581,10 +618,11 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
     `UNVERIFIABLE_EVIDENCE` named the two SOURCES without ever showing the object.
   */
   describe("a refusal restates the contract, because that is who reads it", () => {
+    // Which SOURCES the refusal shows, deduplicated. The refusal now also carries a worked
+    // example, which is a second `artifact` object in the same text — and this assertion is
+    // about both arms being offered, not about how many objects appear.
     const bothArms = (text: string): string[] =>
-      offeredObjects(text)
-        .map((object) => (object as { source: string }).source)
-        .sort();
+      [...new Set(offeredObjects(text).map((object) => (object as { source: string }).source))].sort();
 
     const artifactEvent: AgentRunEvent = {
       kind: "tool-completed",
@@ -613,6 +651,207 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
       if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
       expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
       expect(bothArms(outcome.modelText)).toEqual(["artifact", "context-snapshot"]);
+    });
+
+    test("and it hands over a call this run could make, built from its own ledger", () => {
+      /*
+        Naming the failing field was the previous step, and it was measured as not enough:
+        One evaluated model was refused here twenty-eight times in a row on one data-analysis run, with
+        the paths named every time, and never changed the shape it sent. `qwen3:8b` did the
+        same thirty-seven times before that.
+
+        A model that has misread the description twice does not need it a third time. It has
+        never been given an INSTANCE — and the instance is built from this run's ledger, so a
+        model that copies it and edits the prose gets a call that passes the citation check
+        rather than one that fails it a turn later.
+      */
+      // Driven as the model whose ledger earned it. The behaviour is per model — off until a
+      // measurement turns it on — so the fixture has to name which model is being refused.
+      const h = harness();
+
+      const outcome = composeReportTool(
+        { ...h.context, modelId: "granite4.1:8b" },
+        { runId: h.context.runId, events: [artifactEvent] },
+        { claims: [{ claim: "Engineering is largest.", evidence: ["corr-real"] }] },
+      );
+
+      if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+      expect(outcome.modelText).toContain("A call this run could make right now");
+      // The id is this run's, not an invented one, and the claim is marked as a placeholder
+      // so a copied example cannot be filed as a finding.
+      expect(outcome.modelText).toContain("corr-real");
+      expect(outcome.modelText).toContain("<what you found, in one sentence>");
+    });
+
+    test("present_answer offers the same example, one call earlier in the arc", () => {
+      /*
+        One model showed both halves in a single run. Refused on `compose_report` it took the
+        example and got the report right on its next turn — the loop of twenty-eight identical
+        refusals was gone. It was then refused on `present_answer`, which carried no example,
+        and never tried again: the run scored `no-answer` having done every piece of the work.
+
+        The id offered here is one this tool will ACCEPT — a completed data read with a
+        statement of the model's behind it — and not merely the newest artifact, which for a
+        run that has just profiled a table would be the very id it is about to be refused for.
+      */
+      const h = harness();
+      const events: AgentRunEvent[] = [
+        { kind: "statement-drafted", atMs: 1, stepId: "step_1", sql: "SELECT 1", rationale: "read" },
+        artifactEvent,
+      ] as unknown as AgentRunEvent[];
+
+      const outcome = presentAnswerTool(
+        { ...h.context, modelId: "granite4.1:8b" },
+        { runId: h.context.runId, autoExecute: false, events },
+        { artifact: "corr-real" },
+      );
+
+      if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+      expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+      expect(outcome.modelText).toContain("A call this run could make right now");
+      expect(outcome.modelText).toContain("corr-real");
+    });
+
+    test("a run holding no result yet is given no example, rather than one it cannot use", () => {
+      // An example citing an id this run never produced would fail the citation check on the
+      // very next turn, which teaches the wrong lesson twice.
+      const h = harness();
+
+      const outcome = composeReportTool(
+        { ...h.context, modelId: "granite4.1:8b" },
+        { runId: h.context.runId, events: [] },
+        { claims: [{ claim: "Nothing read.", evidence: ["corr-real"] }] },
+      );
+
+      if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+      expect(outcome.modelText).not.toContain("A call this run could make right now");
+    });
+
+    test("a model that has not earned the example is not given one", () => {
+      /*
+        The rule every behaviour added from here obeys: it arrives OFF, carrying whatever was
+        measured before it, and turns on for the model a measurement earned it for.
+
+        Two changes landed today without that switch. One of them then looked like it had cost a
+        cell that had been won hours earlier, and there was no way to keep the win and spare the
+        loss — which is the whole reason these files exist.
+      */
+      const h = harness();
+
+      const outcome = composeReportTool(
+        h.context,
+        { runId: h.context.runId, events: [artifactEvent] },
+        { claims: [{ claim: "Engineering is largest.", evidence: ["corr-real"] }] },
+      );
+
+      if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+      expect(outcome.modelText).not.toContain("A call this run could make right now");
+    });
+
+    test("compare_plans offers the two ids a run holding two plans can compare", () => {
+      /*
+        The last id-bearing tool to carry a worked call. One model failed the shape of this one
+        three times in a single run while also failing `recommend_change` four times — both
+        routes through the plan bar, neither buildable — and by then it had been held twice and
+        tried after each hold. It is not declining to answer.
+
+        A run holding fewer than two plans is given nothing, which the test below pins: there is
+        no valid call to show, and what that run needs is the hold's own sentence.
+      */
+      const h = harness();
+      const plan = (id: string) =>
+        ({
+          kind: "tool-completed",
+          atMs: 2,
+          stepId: `step_${id}`,
+          artifact: {
+            correlationId: id,
+            operationId: "sql.explain.estimate",
+            connectionId: "conn-1",
+            createdAtMs: 2,
+            summary: { rowCount: 1, columns: ["detail"], truncated: false },
+          },
+        }) as unknown as AgentRunEvent;
+
+      const outcome = comparePlansTool(
+        { ...h.context, modelId: "granite4.1:8b" },
+        { runId: h.context.runId, events: [plan("corr-before"), plan("corr-after")] },
+        { before: "corr-before" },
+      );
+
+      if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+      expect(outcome.modelText).toContain("A call this run could make right now");
+      expect(outcome.modelText).toContain("corr-before");
+      expect(outcome.modelText).toContain("corr-after");
+    });
+
+    test("a run holding one plan is offered no comparison to copy", () => {
+      // With one plan there is no valid call to show. The sentence such a run needs is the
+      // hold's — inspect a second plan, or recommend an index citing the one it has.
+      const h = harness();
+      const onePlan = {
+        kind: "tool-completed",
+        atMs: 2,
+        stepId: "step_only",
+        artifact: {
+          correlationId: "corr-only",
+          operationId: "sql.explain.estimate",
+          connectionId: "conn-1",
+          createdAtMs: 2,
+          summary: { rowCount: 1, columns: ["detail"], truncated: false },
+        },
+      } as unknown as AgentRunEvent;
+
+      const outcome = comparePlansTool(
+        { ...h.context, modelId: "granite4.1:8b" },
+        { runId: h.context.runId, events: [onePlan] },
+        { before: "corr-only" },
+      );
+
+      if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+      expect(outcome.modelText).not.toContain("A call this run could make right now");
+    });
+
+    test("recommend_change offers the index call a one-plan run can actually make", () => {
+      /*
+        The arm an optimization verdict accepts without a comparison: a run holding ONE plan
+        satisfies its bar by recommending an index that cites that plan.
+
+        Another failed the shape of that call four times in a single run — while its
+        closing prose showed it knew exactly what to recommend — and the example had been given
+        to `compose_report` and `present_answer` but not to this tool. With the report example
+        alone, the next measurement got its report through and still lost the cell here.
+
+        The statement in the example names no table, deliberately: this layer knows which plan
+        the run holds and not which column the model wants indexed, and filling that in would be
+        the server writing the recommendation and filing it under the model's name.
+      */
+      const h = harness();
+      const planEvent = {
+        kind: "tool-completed",
+        atMs: 2,
+        stepId: "step_plan",
+        artifact: {
+          correlationId: "corr-plan",
+          operationId: "sql.explain.estimate",
+          connectionId: "conn-1",
+          createdAtMs: 2,
+          summary: { rowCount: 1, columns: ["detail"], truncated: false },
+        },
+      } as unknown as AgentRunEvent;
+
+      const outcome = recommendChangeTool(
+        { ...h.context, modelId: "granite4.1:8b" },
+        { runId: h.context.runId, events: [planEvent] },
+        { change: "index", statement: "CREATE INDEX i ON orders (id)", rationale: "scan", evidence: ["corr-plan"] },
+      );
+
+      if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+      expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+      expect(outcome.modelText).toContain("A call this run could make right now");
+      expect(outcome.modelText).toContain("corr-plan");
+      // The plan's id, and no invented table name.
+      expect(outcome.modelText).toContain("<table>");
     });
 
     test("recommend_change tells a wrong-shaped citation what the shape is", () => {
@@ -788,6 +1027,38 @@ describe("runReadQueryTool — the allowed path", () => {
     );
     expect(budget.maxResultRows).toBe(AGENT_WORKFLOW_BUDGETS.investigation.policy.budgets.maxResultRows);
     expect(budget.maxResultBytes).toBe(AGENT_WORKFLOW_BUDGETS.investigation.policy.budgets.maxResultBytes);
+  });
+
+  test("a run out of time is told to report, not to stop calling tools", async () => {
+    /*
+      The two deadline refusals used to end "Stop calling tools and finish with what has
+      already been established" and "Ask for something cheaper, or finish now."
+
+      Finishing IS a tool call. `compose_report` is ledger-only — it reaches no database, and
+      the drive short-circuits it before the deadline gate is consulted — so it is available
+      to a run with nothing left in its budget. A model that takes those sentences literally
+      writes prose instead, and prose is scored `no-report`, which is the largest single
+      shortfall in the corpus: 28 of the cells that do not lock are blocked by it.
+
+      So the sentence now names the one call that still works and says why it works. Same
+      refusal, same code, same budget: only the way out is spelled.
+    */
+    // A budget of 1ms and a clock that has already moved past it: exhausted, without
+    // asking the constructor for a zero it refuses.
+    let now = 0;
+    const h = harness({
+      deadline: new AgentRunDeadline(1, () => {
+        now += 1_000;
+        return now;
+      }),
+    });
+
+    const outcome = await runReadQueryTool(h.context, { sql: "SELECT 1" });
+
+    if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+    expect(outcome.reasonCode).toBe("RUN_DEADLINE_EXCEEDED");
+    expect(outcome.modelText).toContain("compose_report");
+    expect(outcome.modelText).not.toContain("Stop calling tools");
   });
 
   test("returns an artifact reference summarising the result, never the rows", async () => {
@@ -1164,6 +1435,54 @@ describe("runReadQueryTool — a database error is repairable, bounded, and neve
     }
     expect(outcome.refusal.message).toContain("ordr_id");
     expect(outcome.refusal.statementFingerprint).toBe(fingerprintStatement("SELECT ordr_id FROM orders"));
+  });
+
+  test("the row budget refusal names the LIMIT to use, for a model that earned the advice", async () => {
+    /*
+      `database-error` is the largest refusal in the system by nearly four to one — 368 against
+      100 for the next — and reading them grouped is what makes them tractable. They are not 368
+      problems: 63 are this one, the model asking for every row of a table.
+
+      The engine's sentence states the overrun and stops there. The number it would take to
+      succeed is in that same sentence, so this says it.
+    */
+    const h = harness({}, async () => {
+      throw new QueryError("Read-only execution exceeded the row budget: 1000 rows > 200 allowed", "postgres");
+    });
+
+    const outcome = await runReadQueryTool({ ...h.context, modelId: "granite4.1:8b" }, { sql: "SELECT * FROM orders" });
+
+    expect(outcome.modelText).toContain("LIMIT 200");
+    // Outside the fence: the advice is this server's sentence, and putting it inside would
+    // attribute our instruction to the database.
+    expect(outcome.modelText.split(UNTRUSTED_CONTENT_END)[1]).toContain("LIMIT 200");
+  });
+
+  test("a catalog from another engine is answered with the engine this connection actually is", async () => {
+    // 31 refusals of this shape: information_schema and schema-qualified names sent to SQLite.
+    const h = harness({}, async () => {
+      throw new QueryError("no such table: information_schema.columns", "sqlite");
+    });
+
+    const outcome = await runReadQueryTool(
+      { ...h.context, modelId: "granite4.1:8b" },
+      { sql: "SELECT * FROM information_schema.columns" },
+    );
+
+    expect(outcome.modelText).toContain("inspect_schema");
+  });
+
+  test("a model that has not earned the advice gets the engine's message and nothing else", async () => {
+    // The rule every behaviour added since today obeys: off by default, on where a ledger
+    // earned it. The engine's own words still go back either way.
+    const h = harness({}, async () => {
+      throw new QueryError("Read-only execution exceeded the row budget: 1000 rows > 200 allowed", "postgres");
+    });
+
+    const outcome = await runReadQueryTool(h.context, { sql: "SELECT * FROM orders" });
+
+    expect(outcome.modelText).toContain("row budget");
+    expect(outcome.modelText).not.toContain("LIMIT 200");
   });
 
   test("the engine's message is fenced as untrusted content on its way to the model", async () => {
@@ -1881,6 +2200,29 @@ describe("composeReportTool — a claim must cite something the run actually pro
     expect(outcome.reasonCode).toBe("UNVERIFIABLE_EVIDENCE");
   });
 
+  test("and the refusal names the ids this run CAN cite, so the retry is not another guess", () => {
+    /*
+      Measured on one model's data-analysis run. It did the analysis correctly — profiled
+      a table, drafted `SELECT emp_no, amount FROM salary ORDER BY amount DESC LIMIT 1`, ran it
+      — then called `compose_report` five times, was refused with the same sentence five times,
+      and stopped. Nothing in that sentence said which ids existed, so every retry was a fresh
+      guess at a string.
+
+      The server quotes its own ledger back: the run's artifact ids and its snapshot
+      fingerprint, newest first because the id a run wants is usually the read it just took.
+      Only a run that has already failed this check ever sees it, so no passing run changes.
+    */
+    const h = harness();
+
+    const outcome = composeReportTool(h.context, run, {
+      claims: [{ claim: "Invented", evidence: [{ source: "artifact", correlationId: "corr-does-not-exist" }] }],
+    });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.modelText).toContain("corr-1");
+    expect(outcome.modelText).toContain("schema snapshot");
+  });
+
   /**
    * The evidence check is only worth something if the event log belongs to the run
    * being reported on. Every correlation id below is real — it is just real for a
@@ -2376,14 +2718,73 @@ describe("profileTableTool — the model names a table, the server decides the r
     expect(outcome.reasonCode).toBe("TABLE_NOT_INVENTORIED");
   });
 
+  test("a table the inventory does not list is answered with names it does list", () => {
+    /*
+      The sibling of the qualifier bug, and the comment one line below it in
+      `UNAVAILABLE_TEXT` already stated the rule this one broke: a refusal may not send a
+      held run to `inspect_schema`, because the `no-table-profile` hold narrows the run to
+      `profile_table` and `compose_report` and takes that tool away.
+
+      `TABLE_NOT_INVENTORIED` kept saying "Call inspect_schema for it first". So the sequence
+      a measured assessment run walks is: held and narrowed, asked for a profile, names a
+      table slightly wrong, told to call a tool it no longer holds, calls it, and is told
+      there is no such tool. Two refusals in a row, neither of them actionable.
+
+      The inventory is right there, so the refusal now offers from it. Naming real tables is
+      also the more useful answer in an un-narrowed run, which is why this is not gated on
+      whether the run was narrowed — a run that cannot spell a table is helped by seeing the
+      spellings either way.
+    */
+    const outcome = plan(harness(), { table: "secrets" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("TABLE_NOT_INVENTORIED");
+    expect(outcome.modelText).not.toContain("inspect_schema");
+    // The fixture's inventory, offered back so there is something to act on.
+    expect(outcome.modelText).toContain("orders");
+  });
+
+  test("a qualifier the inventory has never heard of is refused by naming the entry that exists", () => {
+    /*
+      Read off the wire, from the run this refusal was costing.
+
+      `qwen3:8b` called profile_table with
+      `{schema: "ctx_3b6ba24865a80f993576ee1f566c5238", table: "current_dept_emp"}` — the
+      SNAPSHOT FINGERPRINT in the schema field, which is a fair guess from a model whose
+      every surrounding rule talks about fingerprints and whose tool schema describes that
+      field not at all. `current_dept_emp` is in the inventory. The qualifier is not.
+
+      What came back was "That table is not in the schema inventory this run captured. Call
+      inspect_schema for it first" — untrue of the table, and pointing at a tool the run had
+      just been narrowed out of holding. The model made the identical call three times,
+      because nothing in the sentence identified anything to change, and then spent the rest
+      of its budget failing to report.
+
+      The lookup stays exactly as strict: #345 is why a named schema is never matched against
+      a bare entry, and profiling a table the caller did not ask for is worse than refusing.
+      What changes is that the refusal now distinguishes the two cases it had been merging —
+      a table that is absent, and a table that is present under a name the caller qualified
+      wrongly — and in the second it says the name the inventory uses.
+    */
+    const outcome = plan(harness(), { schema: "ctx_3b6ba24865a80f993576ee1f566c5238", table: "orders" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("TABLE_QUALIFIER_UNKNOWN");
+  });
+
   test("a named schema is part of the answer, never ignored", () => {
     // Found by review on #345: matching a BARE inventory entry while a schema was
     // named accepted {schema: "other", table: "orders"} against an unqualified
     // `orders`, and then targeted `other.orders` — a table never inventoried.
+    //
+    // The protection is unchanged and this test still holds it: nothing is profiled,
+    // and the answer is a refusal. Only the refusal got more specific — this run named
+    // a qualifier the inventory does not have, which is the case above, so it is told
+    // the name the inventory does use rather than that its table is missing.
     const outcome = plan(harness(), { schema: "other", table: "orders" });
 
     if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
-    expect(outcome.reasonCode).toBe("TABLE_NOT_INVENTORIED");
+    expect(outcome.reasonCode).toBe("TABLE_QUALIFIER_UNKNOWN");
   });
 
   test("the composed statement targets what was RESOLVED, not what was asked for", () => {
@@ -2538,6 +2939,9 @@ function curatedHarness(
   let tick = 1_000;
   const context: AgentToolContext = {
     runId: "run-1",
+    // A model with no profile, so these tests read the DEFAULTS. A named model here would
+    // quietly test one model's settings and call the result the tool's behaviour.
+    modelId: "unmeasured-model-for-tests",
     mode: "agent",
     workflowType: "operations",
     actor: { sessionId: "session-1", role: "user" },
