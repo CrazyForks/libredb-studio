@@ -126,6 +126,49 @@ describe("AgentRunStore — opening a run", () => {
     });
   });
 
+  test("persists the conversation in the header, so a resumed drive is told the same thing", async () => {
+    const { store } = storeAt();
+    const thread = {
+      threadId: "arun_prev",
+      steps: [{ runId: "arun_prev", objective: "Compare salaries" }],
+      text: "Step 1: Compare salaries\nClaim 1: 41k",
+    };
+
+    const record = await store.openRun({ ...OPEN_INPUT, thread });
+
+    expect(record.thread).toEqual(thread);
+    expect((await store.read(record.runId))?.record.thread).toEqual(thread);
+  });
+
+  test("a declined conversation round-trips, and is named after THIS run rather than the one refused", async () => {
+    /*
+      The route writes no `threadId` for a refused continuation, and the fold supplies
+      this run's own — the same rule that lets a header with no thread at all fold to a
+      thread of one. It matters one link later: naming the thread after the run it was
+      refused would hand a follow-up of THIS run a root that was never in the
+      conversation, and the derivation would carry it forward as the thread id.
+    */
+    const { store } = storeAt();
+    const thread = { steps: [], text: "", declined: "unavailable" as const };
+
+    const record = await store.openRun({ ...OPEN_INPUT, thread });
+
+    const folded = (await store.read(record.runId))?.record.thread;
+    expect(folded?.declined).toBe("unavailable");
+    expect(folded?.threadId).toBe(record.runId);
+  });
+
+  test("a run that continues nothing folds to a thread of one named after itself", async () => {
+    const { store } = storeAt();
+
+    const record = await store.openRun(OPEN_INPUT);
+
+    // The same answer a header written before the field existed folds to, which is
+    // what makes the compatibility story and the ordinary case one code path.
+    expect(record.thread).toEqual({ threadId: record.runId, steps: [], text: "" });
+    expect((await store.read(record.runId))?.record.thread.threadId).toBe(record.runId);
+  });
+
   test("accepts a caller-supplied run id, so a workflow run and its ledger can share one identity", async () => {
     const { store } = storeAt();
 

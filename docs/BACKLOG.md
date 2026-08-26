@@ -2090,34 +2090,6 @@ a run resumed often enough passes any constant.
 per-drive constant — most likely as part of B6 — with a test that drives one run twice past the cap and
 shows the first drive's cited results still readable, or the surface stating that they are not.
 
-### B36. A follow-up question is answered as if it were the first one
-
-Driven live on 2026-08-15. An analysis run answered "compare the average salary of employees hired
-before 1990 with those hired after" correctly. The next question typed into the same box — "and how many
-of those employees are there in each group?" — was answered about DEPARTMENTS: nine of them, 289 in
-Development.
-
-"Those groups" had no referent, because a run carries none. `start()` clears the entries and opens a
-fresh ledger, and the model is handed the objective and the schema and nothing else.
-
-The defect is not that runs are independent. It is that the surface does not say so, and the model does
-not either — it silently picks a plausible referent and answers a question nobody asked, with the same
-confident citations a correct answer carries. A user reading the report cannot tell the difference
-without re-reading their own question.
-
-Two shapes would close it, and they are not the same feature:
-
-- **Smaller:** let a run be TOLD about the run before it — its objective and its report — as fenced
-  context, so "those groups" resolves or is honestly refused.
-- **Larger:** run history, so a user can see and return to earlier runs. (Emptying the objective box
-  after a run, which landed with that PR, at least stops the surface reading as a conversation.)
-
-Neither should be built by threading the browser's memory into the prompt: a resumed drive would not
-have it, and the context a run reasons from has to live where the run does.
-
-**Done when:** a follow-up either resolves against the previous run or is refused for lack of a
-referent, with an eval that drives two runs and asserts the second does not answer a different question.
-
 ### B37. A malformed seed config disables the agent everywhere, and blames the connection
 
 Driven live on 2026-08-15. A `seed-connections.yaml` missing a required field made
@@ -2548,3 +2520,98 @@ and this one has simply not been tried.
 
 **Done when:** a sweep at a raised per-model turn limit either closes the cell or is recorded in
 the entry as having failed to.
+
+---
+
+### B67. There is no run history across conversations
+
+A run now belongs to a conversation, the rail names the one it continues and offers to leave it,
+and the steps of THAT conversation are listed from the run's own header. What is left of B36's
+"larger shape" is everything outside it: a user cannot see the conversations they had yesterday,
+cannot return to one, and cannot open an earlier step's report.
+
+The reason it is a separate entry rather than more of the same work is a measurement. Listing the
+current conversation needs no new infrastructure — each run's header carries its own prefix, so the
+chain is self-describing and `GET /api/agent/runs/{runId}` already serves any step. Listing ALL of a
+user's runs has nothing behind it at all: `run-store.ts` has no enumeration, there is no list route,
+and the two questions that follow immediately — pagination and retention — have not been asked. It
+is a persistence surface, not a rail change.
+
+**Done when:** a user can see their earlier conversations and open one, with the store's
+enumeration, the route and the retention rule each decided rather than inherited.
+
+### B68. A repointed connection carries a conversation across two databases
+
+A conversation is single-connection by induction: every link checks `connectionId` at its own open.
+That is an identity check on the RECORD, not on the database behind it — so a user who edits a
+connection to address another server keeps the id, and a follow-up asked afterwards is handed the
+earlier steps' reports about the old database while it reads the new one.
+
+The same class as B23 and as the `seed:<id>` comparison `docs/AGENT.md` describes, and it fails the
+same way: nothing is refused, nothing looks wrong, and the run reports on one database using claims
+established against another.
+
+Closing it means a database identity on the thread — something like `connectionIdentity`, which
+`context-snapshot.ts` already computes for its own hold and which fingerprints engine, host, port,
+database, service and role without the password. A follow-up whose identity does not match the
+conversation's would decline rather than carry it, joining `declined: "unavailable"`.
+
+**Done when:** a conversation carried onto a repointed connection declines, with a test that
+repoints between two runs and asserts the second carries no steps.
+
+### B69. A reload ends a conversation, and nothing says it will
+
+A reload clears the browser's `runId`, so the next question starts a new thread. The rail is honest
+about the RESULT — with no thread there is no strip, which is the correct signal — but it is silent
+about the transition: a user mid-conversation who reloads is not told that what they were doing has
+ended, and their next question is answered as a fresh one.
+
+Accepted deliberately when the conversation model landed, because the alternative opens two
+questions this work did not want to answer: where a thread id lives client-side (`localStorage`, the
+same write-through cache every other preference uses), and what "resume this conversation?" should
+do when the runs behind it may have been evicted. Worth doing; not worth bundling.
+
+**Done when:** either a reload resumes the conversation it interrupted, or the rail says the
+conversation ended before the next question is asked.
+
+### B70. A run writes no summary for the step after it
+
+The conversation a run is handed carries the previous step's report as its CLAIMS — what the model
+actually asserted, verbatim — and truncates at a claim boundary when the budget runs out. The
+alternative considered and declined was a `carryForward` sentence: one extra field on
+`compose_report`, written by the run for its successor, so the chain would be N short summaries
+rather than N full reports, bounded by construction rather than by truncation.
+
+It is the AI SDK's own idiom for this (`toModelOutput`, in its subagent guidance: the user sees the
+whole execution, the next context sees a summary), and it is cheap — no extra turn, one field on a
+call that already happens.
+
+Declined for a reason specific to this product rather than to the technique. Claims are EVIDENCE:
+they are what the model asserted and what its citations are tied to. A summary is the model's own
+lossy compression of that, and a compression can drop exactly the qualification that mattered — in a
+product whose demo script says half of what makes an agent worth putting near a production database
+is what it declines to do, a lossy model-written bridge between runs is the wrong default. Recorded
+rather than forgotten because the trade may look different once thread budgets have been measured
+against a small-context model.
+
+**Done when:** either a measurement shows truncation costing more than compression would, and a
+carried summary lands with the fallback stated; or this entry is deleted with the measurement that
+settled it.
+
+### B71. The workflow runtime's own durable agent is not used, and the reason is a deployment one
+
+`@ai-sdk/workflow`'s `WorkflowAgent` offers durable, resumable agents with automatic state
+persistence across restarts — which is what `run-store.ts`, `run-service.ts` and the resume rule in
+`investigation.ts` implement by hand. Anybody reading those three modules will eventually ask why.
+
+Because it requires the workflow runtime's programming model: `'use workflow'`, `'use step'`,
+`getWritable()`. This product's positioning is that it deploys next to the data — Docker, Helm,
+Kubernetes, air-gapped — so binding the agent's durability to a hosting runtime would cut the
+deployment story the rest of the product is built on. The hand-written ledger is also what makes the
+run auditable in this repository's own terms: append-only, one file per run, foldable by anything.
+
+Recorded so the question is answered once rather than reopened. It is not a defect and there is
+nothing to do; if the packaging ever separates the durability primitives from the hosting runtime,
+this is the entry to revisit.
+
+**Done when:** the packaging separates them, or this entry is deleted as permanently declined.

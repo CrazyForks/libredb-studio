@@ -53,6 +53,7 @@ import type { AgentLedgerEntry, AgentRunLedgerView, AgentRunStore, AgentSettledS
 import type { AgentOperationId, AgentToolName } from "./tools";
 import type {
   AgentArtifactReference,
+  AgentThreadHeader,
   AgentRunActor,
   AgentRunEvent,
   AgentRunMode,
@@ -160,6 +161,8 @@ export interface AgentRunStartInput {
   readonly autoExecute?: boolean;
   /** Defaults to `native`; see `AgentRunRecord.toolProtocol`. */
   readonly toolProtocol?: AgentToolProtocol;
+  /** The conversation this run continues; the route derives it, the store persists it. */
+  readonly thread?: AgentThreadHeader;
   readonly actor: AgentRunActor;
   readonly connectionId: string;
   readonly objective: string;

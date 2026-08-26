@@ -1903,6 +1903,38 @@ function describePriorProgress(record: AgentRunRecord): string | null {
   return `${preamble}\n${lines.join("\n")}`;
 }
 
+/**
+ * What a run is told about the conversation it continues.
+ *
+ * The content is prose a user and a model wrote, across more than one run, so
+ * the whole block is fenced rather than narrated in the server's voice — the
+ * same rule the database-error and profile summaries follow.
+ *
+ * The instruction half states three things, and the third is REQUIRED by the way
+ * the context is built rather than being a caution. The conversation carries
+ * every step's objective but only the most recent step's report, so a model told
+ * about step 1 knows what was asked there and not what was found. Left unsaid,
+ * this design would create its own false impression: a listed step reads as a
+ * step whose findings are in hand.
+ *
+ * `null` when the run starts a conversation rather than continuing one, which is
+ * the ordinary case.
+ */
+function describeThreadContext(record: AgentRunRecord): string | null {
+  if (record.thread.text.length === 0) return null;
+  const fenced = fenceUntrustedContent(record.thread.text, {
+    label: "earlier steps",
+    operationId: "agent/thread",
+    reference: record.thread.threadId,
+  });
+  return [
+    "This run continues a conversation. Its earlier steps are listed below, oldest first, with the most recent step's report.",
+    'When this objective refers to something an earlier step established — "those groups", "it", "that result", "those rows" — resolve the referent against the conversation below.',
+    "Earlier steps may list only what was ASKED, not what was found. If the conversation gives no referent for the words in this objective, say so plainly and refuse to guess: answering a different question is worse than not answering.",
+    fenced,
+  ].join("\n");
+}
+
 const indeterminateText = (stepId: string, toolName: string): string =>
   `Step ${stepId} (${toolName}) was started before this run was interrupted and its outcome was never recorded, so whether it reached the database cannot be known. It will not be repeated. Draft a different call if you still need what it would have produced.`;
 
@@ -2493,6 +2525,13 @@ export async function runInvestigation(
      */
     const notice = (text: string): string => (prompted ? `${text} ${PROMPTED_PROTOCOL_REMINDER}` : text);
     const messages: ModelMessage[] = [{ role: "user", content: record.objective }];
+    // The conversation this run continues, stated before anything the model does. A
+    // USER message rather than part of `systemPrompt` for the same reason the prompted
+    // contract is: the context carries prose a user and a model wrote, and the prose
+    // path's own guidance keeps every instruction in user messages. It is also fenced
+    // inside `describeThreadContext`, because none of it is the server's voice.
+    const threadContext = describeThreadContext(record);
+    if (threadContext !== null) messages.push({ role: "user", content: threadContext });
     /*
       The contract is a USER message, not an addition to the instructions, and that is the
       vendor's own guidance rather than a preference: the model card for the reasoning family

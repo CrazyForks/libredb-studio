@@ -1,17 +1,24 @@
 import { NextResponse } from "next/server";
 import { admitAgentModel } from "@/lib/agent/capability-gate";
-import { isAgentRuntimeEnabled } from "@/lib/agent/config";
+import { isAgentRuntimeEnabled, isThreadContextEnabled } from "@/lib/agent/config";
 import { AGENT_MAX_OBJECTIVE_LENGTH } from "@/lib/agent/execution-policy";
+import { threadContextMaxCharsFor } from "@/lib/agent/models";
+import type { AgentRunStatusReport } from "@/lib/agent/run-service";
+import { AgentRunStoreError } from "@/lib/agent/run-store";
 import { driveAgentRun, getAgentRunService } from "@/lib/agent/runtime";
+import { deriveThreadContext } from "@/lib/agent/thread-context";
 import {
+  AGENT_TERMINAL_STATUSES,
   AGENT_WORKFLOW_PRESENTS_ANSWER,
   DEFAULT_AGENT_WORKFLOW_TYPE,
   type AgentRunMode,
   type AgentRunWorkflowReading,
   type AgentRunWorkflowSource,
   type AgentRunWorkflowType,
+  type AgentThreadHeader,
 } from "@/lib/agent/types";
 import { createErrorResponse } from "@/lib/api/errors";
+import { resolveConfig } from "@/lib/llm/utils/config";
 import { guardRoute } from "@/lib/api/require-session";
 import { logger } from "@/lib/logger";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
@@ -109,7 +116,8 @@ export async function POST(req: Request) {
       return badRequest("Request body must be JSON");
     }
 
-    const { mode, workflowType, workflowSource, workflowReading, autoExecute, objective, connectionId } = body;
+    const { mode, workflowType, workflowSource, workflowReading, autoExecute, objective, connectionId, previousRunId } =
+      body;
     if (typeof mode !== "string" || !MODES.has(mode)) {
       return badRequest('mode must be "planning" or "agent"');
     }
@@ -182,6 +190,13 @@ export async function POST(req: Request) {
     if (typeof connectionId !== "string" || connectionId.trim().length === 0) {
       return badRequest("connectionId must be a non-empty string");
     }
+    // Absent means the run is opened on its own, which is the ordinary case. A
+    // supplied id is REFUSED rather than coerced when it is not a string: it names
+    // a run, and guessing at a run id is how one session could hand another's report
+    // into its own prompt.
+    if (previousRunId !== undefined && (typeof previousRunId !== "string" || previousRunId.trim().length === 0)) {
+      return badRequest("previousRunId must be a non-empty string when provided");
+    }
 
     const connection = await resolveConnection({ connectionId }, guard.session);
 
@@ -207,6 +222,63 @@ export async function POST(req: Request) {
     }
 
     const service = await getAgentRunService();
+
+    /*
+      A run may CONTINUE a conversation. The context is DERIVED on the server from the
+      predecessor's own ledger, never trusted from the request body, and a caller may
+      only continue a run its own session opened, on this connection, that has ended.
+
+      The rule that governs the failures is: a SHAPE error refuses, a RUNTIME condition
+      DEGRADES. `previousRunId` is attached by the rail on its own — the user never
+      typed it — so a predecessor that cannot be reached must not take down the question
+      they DID type. Continuing a conversation is an enhancement, never a precondition
+      for asking. The run opens, carries no conversation, and says so.
+
+      Nothing is leaked by degrading that refusing did not leak: the same five reasons
+      collapsed into one refusal before and collapse into one `declined` now, so a caller
+      guessing ids learns exactly what it could learn already.
+    */
+    let thread: AgentThreadHeader | undefined;
+    if (previousRunId !== undefined) {
+      if (!isThreadContextEnabled()) {
+        // No `threadId`: a refused continuation starts a conversation of its OWN, and
+        // the fold names it after this run. Naming it after the run it was refused
+        // would hand a later follow-up a root that was never part of the conversation.
+        thread = { steps: [], text: "", declined: "disabled" };
+      } else {
+        let previous: AgentRunStatusReport | null = null;
+        let failed: "unavailable" | "error" | null = null;
+        try {
+          previous = await service.status(previousRunId);
+        } catch (error) {
+          // Two KINDS of failure, recorded apart because they say different things: a
+          // malformed id is about what the caller sent, an unreadable ledger is about
+          // this server and says nothing about the id at all. Neither reaches the caller
+          // as a distinction, and neither stops the run. Recorded rather than logged
+          // because a fail-open decision has to carry its reason as data.
+          failed =
+            error instanceof AgentRunStoreError && error.reasonCode === "INVALID_RUN_ID" ? "unavailable" : "error";
+        }
+        if (
+          failed === null &&
+          (previous === null ||
+            previous.record.actor.sessionId !== guard.session.username ||
+            previous.record.connectionId !== connection.id ||
+            !AGENT_TERMINAL_STATUSES.has(previous.record.status))
+        ) {
+          failed = "unavailable";
+        }
+        thread =
+          failed === null && previous !== null
+            ? // Sized for the model that will actually read it. The budget is resolved
+              // HERE rather than at drive time because the context is derived and
+              // persisted at open, and a resumed drive must reason from what its first
+              // drive was handed. `resolveConfig` is synchronous and reaches nothing.
+              deriveThreadContext(previous.record, threadContextMaxCharsFor(resolveConfig().model))
+            : { steps: [], text: "", declined: failed ?? "unavailable" };
+      }
+    }
+
     const record = await service.start({
       mode: mode as AgentRunMode,
       // Spread rather than passed as `undefined`, so a body that named no workflow
@@ -226,6 +298,10 @@ export async function POST(req: Request) {
       // resumed drive must ask this model the way the first drive asked, and only the
       // start path is in a position to have probed.
       ...(gate.protocol === "native" ? {} : { toolProtocol: gate.protocol }),
+      // Spread for the same reason as the fields above: absent reaches the store as
+      // the request that predates the field, so a run that starts its own conversation
+      // writes the same bytes a run opened before conversations existed did.
+      ...(thread === undefined ? {} : { thread }),
       actor: { sessionId: guard.session.username, role: guard.session.role },
       connectionId: connection.id,
       objective,
@@ -253,6 +329,11 @@ export async function POST(req: Request) {
         workflowSource: record.workflowSource,
         workflowReading: record.workflowReading,
         autoExecute: record.autoExecute,
+        // The conversation this run actually belongs to, which is how the rail learns
+        // both what it may render and — through `declined` — that continuing one was
+        // asked for and did not happen. Echoed from the RECORD, so a run that started
+        // its own conversation reports the thread of one the fold gave it.
+        thread: record.thread,
       },
       { status: 202 },
     );

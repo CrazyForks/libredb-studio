@@ -24,7 +24,12 @@ import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { AGENT_ENABLED_ENV, AGENT_MODEL_TUNING_ENV, AGENT_WORLD_TARGET_ENV } from "@/lib/agent/config";
+import {
+  AGENT_ENABLED_ENV,
+  AGENT_MODEL_TUNING_ENV,
+  AGENT_THREAD_CONTEXT_ENV,
+  AGENT_WORLD_TARGET_ENV,
+} from "@/lib/agent/config";
 import { resetTuning } from "@/lib/agent/model-tuning";
 import * as realAuth from "@/lib/auth";
 import { parseResponseJSON } from "../../helpers/mock-next";
@@ -50,6 +55,7 @@ const ENV_KEYS = [
   AGENT_ENABLED_ENV,
   AGENT_WORLD_TARGET_ENV,
   AGENT_MODEL_TUNING_ENV,
+  AGENT_THREAD_CONTEXT_ENV,
   "WORKFLOW_LOCAL_DATA_DIR",
   "LLM_PROVIDER",
   "LLM_API_KEY",
@@ -106,7 +112,11 @@ describe("GET /api/agent/config", () => {
     const res = await GET();
 
     expect(res.status).toBe(200);
-    expect(await parseResponseJSON<Record<string, unknown>>(res)).toEqual({ enabled: true, ledgerVerified: true });
+    // An ordinary session's whole answer: no operator state at all.
+    expect(await parseResponseJSON<Record<string, unknown>>(res)).toEqual({
+      enabled: true,
+      ledgerVerified: true,
+    });
   });
 
   test("says a postgres ledger was not verified here, instead of letting it read as a checked one (B31)", async () => {
@@ -120,6 +130,40 @@ describe("GET /api/agent/config", () => {
     const body = await parseResponseJSON<Record<string, unknown>>(await GET());
 
     expect(body).toEqual({ enabled: true, ledgerVerified: false });
+  });
+
+  test("tells an ADMIN that conversation context is switched off, so the switch can be confirmed", async () => {
+    // The operator is the only reader this field has, and confirming the switch took is
+    // the whole reason it exists — the same reason `modelTuning` reports itself.
+    asAdmin();
+    configureModel();
+    process.env[AGENT_THREAD_CONTEXT_ENV] = "false";
+
+    const body = await parseResponseJSON<Record<string, unknown>>(await GET());
+
+    expect(body.enabled).toBe(true);
+    expect(body.threadContext).toBe(false);
+  });
+
+  test("does not report the conversation switch to an ordinary session, which has no reader for it", async () => {
+    /*
+      Nothing in the browser consumes it: `use-agent-capability.ts` reads `enabled` and
+      nothing else, and the rail's "switched off on this server" sentence comes from the
+      RUN's own `thread.declined` rather than from this probe. An earlier version sent it
+      to every session justified by a rail consumer that did not exist.
+
+      It is also the wrong moment for a user: what they need is said when a follow-up was
+      not read as one, not on page load.
+    */
+    configureModel();
+    process.env[AGENT_THREAD_CONTEXT_ENV] = "false";
+
+    const body = await parseResponseJSON<Record<string, unknown>>(await GET());
+
+    // Non-vacuous: the probe DID answer, and answered enabled, so the absence below is
+    // about this field rather than about a refused request.
+    expect(body.enabled).toBe(true);
+    expect(body).not.toHaveProperty("threadContext");
   });
 
   test("reports it disabled and names the missing model, so the operator is told why", async () => {

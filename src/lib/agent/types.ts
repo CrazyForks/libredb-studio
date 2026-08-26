@@ -245,6 +245,29 @@ export type AgentToolProtocol = "native" | "prompted";
 export type AgentRunStatus = "queued" | "running" | AgentRunTerminalStatus;
 
 /**
+ * The terminal statuses as a set, EXHAUSTIVE by construction.
+ *
+ * `satisfies Record<AgentRunTerminalStatus, true>` is the whole point: adding a member
+ * to that union stops this file compiling until it is named here. A hand-written
+ * `Set<string>` keeps compiling and silently answers "not terminal" for the new one,
+ * and on the follow-up path that is a legitimate conversation refused with a message
+ * that names nothing — the caller is told only that the run may not be continued.
+ *
+ * `LIVE_STATUSES` in the rail is deliberately NOT derived from this: `queued | running`
+ * is drift-safe on its own, since a new terminal status correctly reads as not live.
+ * This one is the direction that needed pinning.
+ */
+const TERMINAL_STATUS_MEMBERS = {
+  succeeded: true,
+  failed: true,
+  cancelled: true,
+} satisfies Record<AgentRunTerminalStatus, true>;
+
+export const AGENT_TERMINAL_STATUSES: ReadonlySet<AgentRunStatus> = new Set(
+  Object.keys(TERMINAL_STATUS_MEMBERS) as AgentRunTerminalStatus[],
+);
+
+/**
  * Why a drive could not carry a run, in terms a user can act on.
  *
  * A closed union rather than the error's own message, and that is the point: the
@@ -942,6 +965,68 @@ export type AgentRunEvent =
     });
 
 /**
+ * One step of the conversation a run belongs to, as the SURFACE needs it.
+ *
+ * The objective is capped for carrying. A thread of twenty steps would otherwise
+ * put twenty full objectives on every header after it, and the full text is one
+ * `GET /api/agent/runs/{runId}` away on the run that owns it.
+ */
+export interface AgentThreadStep {
+  readonly runId: string;
+  readonly objective: string;
+}
+
+/**
+ * What a run is told about the conversation it belongs to.
+ *
+ * Two consumers, two fields. `steps` serves the RAIL, which renders the
+ * conversation from the header with no additional request. `text` serves the
+ * MODEL, and holds inert content only: the instruction lines and the fence are
+ * added when the prompt is built, so improving that wording never requires
+ * rewriting a stored ledger, and the server's own voice never enters one.
+ *
+ * `text` is derived once, at open, rather than re-derived at drive time. A resumed
+ * drive must reason from byte-identical context to the first drive, and a
+ * predecessor's ledger going unreadable in between must not silently shrink what
+ * the run was told — the same instinct the held context snapshot follows by
+ * having no TTL.
+ *
+ * `declined` is set only when continuing a conversation was ASKED for and did not
+ * happen. It is persisted rather than answered once, so a reload still shows the
+ * notice rather than leaving the user to wonder.
+ *
+ * Inert by construction, like every other contract here: strings and ids. The
+ * state guard therefore admits it exactly as it admits the objective.
+ */
+export interface AgentThreadContext {
+  readonly threadId: string;
+  /** Prior steps, oldest first. Empty for a thread's first run. */
+  readonly steps: readonly AgentThreadStep[];
+  readonly text: string;
+  /**
+   * How many steps have fallen off the FRONT of this conversation, across its whole
+   * length rather than at this link.
+   *
+   * Cumulative because each header carries at most `AGENT_THREAD_MAX_STEPS`, so the
+   * per-derivation figure is 1 forever once the cap is reached: a thirty-step
+   * conversation would keep reporting that one step was dropped. Absent means none.
+   */
+  readonly droppedSteps?: number;
+  readonly declined?: "unavailable" | "disabled" | "error";
+}
+
+/**
+ * The thread as a LEDGER HEADER carries it.
+ *
+ * `threadId` is absent when the run starts a conversation of its own, and the fold
+ * supplies the run's own id — the same rule that lets a header with no thread at all
+ * fold to a thread of one. It matters for a DECLINED continuation: naming that thread
+ * after the run it was refused would make a later follow-up inherit a root that was
+ * never part of the conversation.
+ */
+export type AgentThreadHeader = Omit<AgentThreadContext, "threadId"> & { readonly threadId?: string };
+
+/**
  * One run, whole. Everything a restarted process needs to continue, and nothing
  * a restarted process could not read: no client, no credential, no result set.
  */
@@ -1008,6 +1093,20 @@ export interface AgentRunRecord {
    * the prose path existed, and of every model that can call a tool.
    */
   readonly toolProtocol?: AgentToolProtocol;
+  /**
+   * The conversation this run belongs to.
+   *
+   * Required HERE and optional on the ledger header, which is the whole
+   * compatibility story in one sentence: the fold always produces a thread. A run
+   * whose thread was not recorded is a thread of ONE, named after itself — which
+   * is what was true of it, since no run belonged to a conversation then, and it
+   * is equally true of a run that starts a conversation today.
+   *
+   * It is on the record for the reason every other header field is: a resumed
+   * drive must be told the same thing the drive that died was told, so the context
+   * has to live in the ledger rather than in a request body only the opener saw.
+   */
+  readonly thread: AgentThreadContext;
   readonly status: AgentRunStatus;
   readonly actor: AgentRunActor;
   /** The single connection this run may reach; the server builds the scope from it. */

@@ -45,9 +45,11 @@ import { AgentRepairLedger } from "@/lib/agent/repair-ledger";
 import { AgentRunService } from "@/lib/agent/run-service";
 import { AgentRunStore } from "@/lib/agent/run-store";
 import type {
+  AgentThreadContext,
   AgentRunActor,
   AgentRunEvent,
   AgentRunMode,
+  AgentRunRecord,
   AgentRunStopReason,
   AgentRunWorkflowType,
   AgentRunTerminalStatus,
@@ -395,6 +397,8 @@ export interface EvalRunOptions {
    * PRODUCED and the hand-over is only where that answer was delivered.
    */
   readonly autoExecute?: boolean;
+  /** The conversation this run continues, for the multi-run follow-up scenarios. */
+  readonly thread?: AgentThreadContext;
   /** What the scripted engine answers a MODEL statement with. Catalog reads are served by the preset. */
   readonly answer?: (sql: string) => Promise<QueryResult>;
   /**
@@ -450,6 +454,8 @@ export interface EvalRun {
   /** Records a stop request against the durable ledger, as the HTTP surface would. */
   requestCancellation(): Promise<void>;
   events(): Promise<readonly AgentRunEvent[]>;
+  /** The whole folded record, so a follow-up can be derived from it the way the route does. */
+  record(): Promise<AgentRunRecord>;
   dispose(): void;
 }
 
@@ -476,6 +482,7 @@ export async function openEvalRun(options: EvalRunOptions = {}): Promise<EvalRun
     mode,
     ...(options.workflowType === undefined ? {} : { workflowType: options.workflowType }),
     ...(options.autoExecute === undefined ? {} : { autoExecute: options.autoExecute }),
+    ...(options.thread === undefined ? {} : { thread: options.thread }),
     actor,
     connectionId: engine.connection.id,
     objective,
@@ -608,6 +615,11 @@ export async function openEvalRun(options: EvalRunOptions = {}): Promise<EvalRun
       const view = await boot().store.read(record.runId);
       if (!view) throw new Error(`run ${record.runId} has no ledger`);
       return view.record.events;
+    },
+    async record() {
+      const view = await boot().store.read(record.runId);
+      if (!view) throw new Error(`run ${record.runId} has no ledger`);
+      return view.record;
     },
     dispose() {
       fs.rmSync(dataDir, { recursive: true, force: true });

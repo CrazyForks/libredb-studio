@@ -171,6 +171,20 @@ describe("AgentRunService — starting and reporting a run", () => {
     expect((await h.reader().read(runId))?.record.workflowType).toBe("database-assessment");
   });
 
+  test("a run opened inside a conversation keeps it on the record", async () => {
+    const h = harness();
+    const thread = {
+      threadId: "arun_prev",
+      steps: [{ runId: "arun_prev", objective: "Compare salaries" }],
+      text: "Step 1: Compare salaries\nClaim 1: 41k",
+    };
+
+    const record = await h.service.start({ ...START_INPUT, thread });
+
+    expect(record.thread).toEqual(thread);
+    expect((await h.reader().read(record.runId))?.record.thread).toEqual(thread);
+  });
+
   test("reports nothing for a run that does not exist", async () => {
     const h = harness();
     expect(await h.service.status("arun_00000000000000000000000000000000")).toBeNull();
