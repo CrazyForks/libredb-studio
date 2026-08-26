@@ -325,6 +325,12 @@ connection-change effect clears it only in the `else` branch, when the active co
 null - never when the fetch for a new one fails. Storage is not involved: `/api/storage/config`
 answers `serverMode: false`, `libredb_schema_snapshots` was empty, and the tree is React state.
 
+**Reproduced a second time on a different engine, 2026-08-27.** Selecting the Databend connection
+after an OrioleDB one showed OrioleDB's `probe_customers 3` / `probe_orders 2.0k` under Databend's
+name, with `500 POST /api/db/schema/list :: Prepare is not support in Databend` in the network log -
+same shape, different cause for the failing read, which is the point: any failing schema read does
+this.
+
 **Why this is worse than an empty tree, and why it is not a QuestDB problem.** An empty object
 browser is the honest reading the absence rule (#477) asks for. This one attributes real objects,
 with real row counts, to a database that does not contain them - and the tables are clickable, so
@@ -364,48 +370,39 @@ returns or is absent, and the "not available" wording appears only on a server w
 
 ---
 
-### D32. A pinned SSH host key has no way to be set, so the protection resets on restart
+### D33. Every parameterised read still prepares, so an engine without PREPARE loses all of them
 
-Giving the tunnel a `hostVerifier` created two sources for the expected fingerprint: a durable
-`sshTunnel.hostKeyFingerprint` on the connection, which wins, and otherwise a first-contact memory
-keyed by the bastion's `host:port`. Only the second one is reachable today, and it lives in the server
-process. Measured 2026-08-26 when the verifier landed: **nothing writes `hostKeyFingerprint`.** There is no
-input for it (`ConnectionModal` renders from `use-connection-form`, which does not carry the field),
-seed configs do not model `sshTunnel` at all, and there is no server-to-client write-back for a
-fingerprint the tunnel just accepted.
+Measured 2026-08-27 against `datafuselabs/databend:v1.2.925-patch-11` (issue #424, Phase 0).
+Databend replies `Prepare is not support in Databend` to mysql2's prepared protocol, and that one
+answer takes `getTables()`, `getSchema()`, `getActiveSessions()`, `getTableStats()`,
+`getIndexStats()` and `getStorageStats()` - the whole object browser and every statistics panel -
+while the editor keeps working.
 
-So the shipped behaviour is: a key that changes WITHIN a server's lifetime is refused, naming both
-fingerprints; a restart re-enters first contact and accepts whatever answers. That is strictly better
-than the previous behaviour, which verified nothing ever, and it is not the durable pin the code is
-already able to honour.
+**The catalogs are there.** Asked with literal SQL on the same connection,
+`information_schema.tables` returns the true 3 and 2000 rows with `data_length` 124 and 49000, and
+`information_schema.columns` answers in full. So the engine has the data and we cannot read it.
 
-There is also a latent drop waiting for whoever adds the writer: `use-connection-form.ts` rebuilds
-`SSHTunnelConfig` from form state on every save and does not spread `hostKeyFingerprint` through, so
-editing and re-saving a connection would silently clear its pin. Inert today — the field has no writer
-— and a one-line spread when it gets one.
+This is **D8 one step further in**, and the remaining step is the harder half. D8 moved every
+*parameterless* statement onto MySQL's text protocol; these six reads carry placeholders
+(`WHERE table_schema = ?`) and therefore still prepare. Moving them means either interpolating the
+schema name into the statement - which is where a placeholder was the safe choice, so it needs an
+identifier-quoting decision rather than a string concat - or asking mysql2 for the text protocol
+with the parameters bound client-side. Neither is a one-line change, which is why this is filed
+rather than done inside a labelling PR, and why Databend's registry row reads `query-only` today.
 
-**Done when:** an accepted fingerprint can be persisted onto the connection it belongs to, surviving a
-restart and a round trip through the connection dialog, and the accept/reject decision for a key that
-legitimately changed has an answer in the product rather than only in a doc.
+**A second, smaller defect surfaced on the same engine, and it is a crash rather than a failure.**
+`runMaintenance('analyze')` throws `TypeError: rows.filter is not a function`: Databend answers
+`ANALYZE TABLE` with an object where the reader expects an array of `Msg_type` rows. A provider
+that cannot run a maintenance action should report that, not throw a type error out of the route -
+and this is the same shape already recorded once, a mysql2 reply whose type depends on the
+statement.
 
-### D33. The live SSH arm was driven once by hand, and no fixture keeps it true
+**Done when:** the six reads above answer on Databend, with the identifier path decided rather
+than concatenated, and `runMaintenance` on an engine that answers `ANALYZE` with a non-array
+reports a result instead of throwing - both verified against the container, and the reading
+unchanged on MySQL, MariaDB and one analytics relative.
 
-The mismatch arm HAS been measured against a real server. 2026-08-26, `openssh-server` on port 2226,
-through the real `createSSHTunnel`, three arms: no pin accepted and reported
-`SHA256:JWLQciyX8RYEeuK+bwRLW/YSpStz0/L7BlbVcejL1/U`, byte-identical to
-`ssh-keyscan -p 2226 127.0.0.1 | ssh-keygen -lf -`; the correct pin connected; a wrong pin was refused
-with both fingerprints in the message. So the fingerprint format and the refusal are confirmed
-end-to-end against a live sshd, not only against generated key files and a mocked handshake, and
-`docs/providers/README.md` records that measurement.
-
-What does not exist is a STANDING fixture. `tests/unit/ssh-tunnel.test.ts` still drives a mocked `ssh2`,
-which is what runs in CI, so the live result is a one-time observation rather than a property the suite
-holds. A regression in the verifier would be caught by the mock only to the extent the mock is faithful
-to ssh2 - and the mock was written from reading ssh2's source, which is the thing most likely to drift.
-
-**Done when:** an sshd service exists alongside the other container fixtures and the three arms above
-run against it, or a note beside the mock records that its fidelity to ssh2 is the assumption CI rests
-on and names the source it was derived from.
+---
 
 ## Value interpolation
 
