@@ -1181,6 +1181,91 @@ describe("generateMigrationSQL: dialects that cannot modify a column", () => {
   }
 });
 
+/**
+ * Exhaustive by construction, same spirit as `MODIFIED_COLUMN_COVERAGE` above: a new
+ * `DatabaseType` fails typecheck here until it is classified, so it cannot silently
+ * inherit the wrapper meant for PostgreSQL and MySQL (#284).
+ *
+ * `"wrapped"` — the dialect's DDL is bracketed in `BEGIN;` / `COMMIT;`.
+ * `"unwrapped"` — no wrapper reaches the migration text. mssql and oracle are
+ * deliberately absent from this table's classification of "unwrapped" — they still
+ * read `"wrapped"` here, UNCHANGED from today's behaviour, because the module
+ * docstring and the issue itself say their real wrapper forms (`BEGIN TRANSACTION;`
+ * for MSSQL; whether Oracle needs one at all, given DDL there auto-commits) want
+ * checking against a live server before they are settled, the way #264/#265 were -
+ * and this PR does not have one available. Tracked as the named follow-up rather than
+ * guessed here.
+ */
+const TRANSACTION_WRAPPER_COVERAGE: Record<DatabaseType, "wrapped" | "unwrapped"> = {
+  postgres: "wrapped",
+  mysql: "wrapped",
+  // Measured live via @duckdb/node-api 1.5.5-r.4 (DuckDB v1.5.5, in-process, no server
+  // needed): `BEGIN;` / `BEGIN TRANSACTION;` both open a real transaction around DDL,
+  // and a `CREATE TABLE` issued inside one is undone by `ROLLBACK;` — pinned further in
+  // the "generateMigrationSQL: duckdb" describe block above.
+  duckdb: "wrapped",
+  // UNCHANGED — see this table's own doc comment above.
+  mssql: "wrapped",
+  oracle: "wrapped",
+  sqlite: "unwrapped", // runs its own transaction (module docstring)
+  libsql: "unwrapped", // SQLite fork, same reasoning, plus its own Hrana-stream note (module docstring)
+  cassandra: "unwrapped", // CQL has no BEGIN/COMMIT — measured on 5.0.9 (module docstring)
+  // The remaining nine each have a recorded reason for having no `BEGIN;` to emit, in this
+  // same module (`NO_COLUMN_MODIFICATION`), in `src/lib/sql/grammar.ts` (`NON_SQL_DIALECTS`)
+  // or in the provider doc named on the line — this table applies those established facts to
+  // the wrapper fallback rather than asserting fresh ones, so none of the nine needs a new
+  // live probe. What none of them means is "the wrapper bracketed nothing": see the
+  // added-table fixture below.
+  mongodb: "unwrapped", // not SQL text at all (`NON_SQL_DIALECTS`); wrapping non-SQL in SQL statements is wrong regardless of Mongo's own transaction API
+  redis: "unwrapped", // same: command-line grammar, not SQL (`NON_SQL_DIALECTS`)
+  libredb: "unwrapped", // "a JSON command grammar, not SQL DDL" (NO_COLUMN_MODIFICATION's own words)
+  couchbase: "unwrapped", // has transactions, but spells them `BEGIN TRANSACTION` + a txid every later statement must carry — not something a flat file expresses (docs/providers/couchbase.md §13)
+  druid: "unwrapped", // "Druid SQL has no ALTER TABLE" and no transaction concept at all (NO_COLUMN_MODIFICATION)
+  clickhouse: "unwrapped", // ClickHouse's transaction support is experimental and setting-gated, not a safe default; today's code wraps it anyway, which this fixes
+  elasticsearch: "unwrapped", // `BEGIN` is not in the grammar (NO_COLUMN_MODIFICATION's measured statement list; docs/providers/elasticsearch.md §9)
+  opensearch: "unwrapped", // same, measured separately on OpenSearch 3.8.0 (docs/providers/opensearch.md §9)
+  trino: "unwrapped", // connector-dependent at best; no portable BEGIN/COMMIT (NO_COLUMN_MODIFICATION)
+};
+
+/**
+ * Two fixtures, because one of them alone cannot see the thing that matters here.
+ *
+ * `generateMigrationSQL` reads NO provider capability — not `supportsCreateTable`, not
+ * anything else — so its added-table branch emits a real `CREATE TABLE` for every id
+ * except `cassandra`, which is the one the generator refuses outright
+ * (`CASSANDRA_NO_CREATE_TABLE`). A modified-table diff on an id in
+ * `NO_COLUMN_MODIFICATION` really does reduce to comments, so a table driven only by
+ * that fixture would let "this dialect never gets DDL, so the wrapper bracketed nothing"
+ * stand unchallenged. It is false: the wrapper this set removes was bracketing runnable
+ * DDL for those ids too, which is why removing it is a fix rather than a tidy-up.
+ */
+const WRAPPER_FIXTURES = [
+  { label: "a modified table", makeDiff: makeModifiedTableDiff, emitsCreateTable: false },
+  { label: "an added table", makeDiff: makeAddedTableDiff, emitsCreateTable: true },
+] as const;
+
+describe("generateMigrationSQL: transaction wrapper by dialect", () => {
+  for (const [dialect, expected] of Object.entries(TRANSACTION_WRAPPER_COVERAGE)) {
+    for (const fixture of WRAPPER_FIXTURES) {
+      test(`${dialect}: ${expected === "wrapped" ? "wraps DDL in BEGIN;/COMMIT;" : "emits no transaction wrapper"} for ${fixture.label}`, () => {
+        const sql = generateMigrationSQL(fixture.makeDiff(), dialect as DatabaseType);
+        // Non-vacuity guard: on the added-table fixture the wrapper assertion below is
+        // about text that brackets a real statement, not an empty run of comments.
+        if (fixture.emitsCreateTable && dialect !== "cassandra") {
+          expect(sql).toMatch(/^CREATE TABLE /m);
+        }
+        if (expected === "wrapped") {
+          expect(sql).toContain("BEGIN;");
+          expect(sql).toContain("COMMIT;");
+        } else {
+          expect(sql).not.toContain("BEGIN;");
+          expect(sql).not.toContain("COMMIT;");
+        }
+      });
+    }
+  }
+});
+
 // ============================================================================
 // Multi-table diff
 // ============================================================================
