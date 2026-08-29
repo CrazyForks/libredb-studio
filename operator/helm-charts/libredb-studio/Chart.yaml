@@ -2,8 +2,8 @@ apiVersion: v2
 name: libredb-studio
 description: Web-based SQL IDE for cloud-native teams supporting sixteen engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra and libSQL
 type: application
-version: 0.1.54
-appVersion: "0.13.4"
+version: 0.1.55
+appVersion: "0.13.5"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
 icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
@@ -46,6 +46,16 @@ annotations:
   artifacthub.io/category: database
   artifacthub.io/license: MIT
   artifacthub.io/prerelease: "false"
+  # True: 0.1.55 tracks app release 0.13.5, which carries three fixes an operator should
+  # weigh. The SSH tunnel passed no `hostVerifier` to ssh2 and the library has no default,
+  # so the tunnel completed its handshake with whatever answered on the bastion's address
+  # and everything it carried - the database password among it - was readable to anything
+  # that could occupy that address; it is now trust-on-first-use pinned per connection. The
+  # destructive-command confirmation gate spoke SQL only, so FLUSHALL and a deleteMany with
+  # an empty filter ran unconfirmed while DELETE FROM asked. And POST /api/db/maintenance
+  # validated that an operation exists rather than that it could take the given target, so
+  # a direct request could vacuum a whole SQLite file while naming one table. No chart
+  # template or value moves for any of them - the fixes are in the application image.
   # False: 0.1.54 changes no packaged template and no value - it names one more engine in
   # the README, the description and the keywords, DuckDB, which is a new provider in the
   # app rather than a chart change. The README is a packaged file, so #167 costs it a
@@ -59,22 +69,14 @@ annotations:
   # every existing install renders exactly as before. It makes an already-supported setting
   # discoverable from values.yaml instead of reachable only through extraEnv; `false` is a
   # deliberate weakening an operator asks for, not one this version applies.
-  # False: 0.1.50 changes no packaged template and no value - it corrects the README's own
-  # copy-paste recipes, which rendered an unquoted YAML boolean into `core/v1.EnvVar.value`
-  # and left bracket arguments a zsh user's shell globs away. The README is a packaged file,
-  # so #167 costs it a chart version even though nothing an operator deploys moves.
-  # 0.1.49 carried only the appVersion move to 0.13.4, whose fixes are correctness rather
-  # than security: a MySQL protocol choice, the monitoring dashboard's all-or-nothing
-  # aggregate, a ScyllaDB connection and an Oracle LOB read. Its dependency moves are routine patch bumps with no advisory behind them.
-  # 0.13.3's transport fixes (a rediss:// or couchbases:// URL landing on SSL mode disable,
-  # and Couchbase posting plain HTTP to the TLS management port) stay recorded on 0.1.47
-  # with this flag set, which is where an operator looking for them will find them. The
-  # app-level security fixes of earlier releases remain recorded on 0.1.37, the chart
-  # version that first shipped them; the adm-zip pin note belongs to 0.1.44, unchanged.
-  artifacthub.io/containsSecurityUpdates: "false"
+  # 0.13.3's transport fixes stay recorded on 0.1.47 with this flag set, which is where an
+  # operator looking for them will find them. The app-level security fixes of earlier
+  # releases remain recorded on 0.1.37, the chart version that first shipped them; the
+  # adm-zip pin note belongs to 0.1.44, unchanged.
+  artifacthub.io/containsSecurityUpdates: "true"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.13.4
+      image: ghcr.io/libredb/libredb-studio:0.13.5
       platforms:
         - linux/amd64
         - linux/arm64
@@ -86,12 +88,19 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "config.authCookieSecure is now a first-class value: it writes AUTH_COOKIE_SECURE, the setting a browser reaching Studio over plain HTTP on a LAN or home-server address needs, which previously had to go through extraEnv. Three-state - leave it unset and nothing is written, so the app decides exactly as before"
-    - "MySQL: reads no longer go through the prepared protocol unconditionally, which had broken statements MySQL itself only answers on the text protocol - CHECK TABLE and its relatives returned an error instead of a result"
-    - "Monitoring: one refused read no longer costs the whole dashboard - the seven panels degrade individually, so a permission the user lacks hides that panel rather than blanking the page, and two panels stop reporting a fabricated zero"
-    - "ScyllaDB connections could not be created at all, and an Oracle query touching a LOB column failed in full rather than returning its rows"
-    - "The query agent carries measured settings for ten models rather than one default, records which model drove a run and where its settings came from, and no longer scores a plan run as answered while handing back prose glued to its SQL"
-    - "Track app release 0.13.4 (appVersion bump; default image tag follows)"
+    - "Security: the SSH tunnel verified no host key at all - ssh2 was given no hostVerifier and has no default, so the tunnel completed its handshake with whatever answered on the bastion's address. Host keys are now trust-on-first-use, pinned per connection, and a changed key is refused naming both fingerprints"
+    - "Security: the destructive-command confirmation gate spoke SQL only, so Redis FLUSHALL and a MongoDB deleteMany with an empty filter ran with no confirmation while DELETE FROM on every SQL engine asked. The vocabulary is now per engine type, and a payload the reader cannot parse asks rather than staying silent"
+    - "Security: POST /api/db/maintenance validated that an operation exists rather than that it could take the target it was given, so a direct request naming one table could vacuum a whole SQLite file. The route now derives the placement from the same per-provider declaration both UI surfaces already gate on"
+    - "New engine - DuckDB, as an embedded file engine with the read-only boundary the engine itself enforces rather than a name denylist"
+    - "New engine - libSQL over the Hrana protocol, one connection type for a self-hosted sqld and for Turso Cloud alike, with no added runtime dependency"
+    - "An unknown reading is now absent rather than zero, across the Overview, Monitoring, Queries and Storage tabs. A denied DMV, an unprivileged V$SESSION or a serverStatus with no connections section drew a confident zero on a busy server; a capped list drew its own ceiling as the database's query count; and the Storage tab divided three figures by a total it did not have, rendering negative percentages"
+    - "Schema diff no longer wraps generated migrations in BEGIN;/COMMIT; for dialects that cannot run DDL in a transaction, which had made the script fail on the engines it was generated for"
+    - "Redis connections carry their ACL username through to the driver, and the active session's user is read from the CLIENT LIST user field rather than inferred"
+    - "The query agent carries measured settings for more models, binds each run to the conversation it belongs to, and declines a follow-up whose connection now addresses a different database instead of answering from the earlier run's snapshot"
+    - "The row limiter no longer reads a bound mentioned inside a comment or a string literal as a bound the statement already carries, which had let an unlimited statement return every row of a table"
+    - "Four defects at 390px, starting with a light-theme toggle that could not be reached on a phone"
+    - "Compatibility registry: Apache Doris, Garnet, both Percona distributions, ParadeDB and OrioleDB are recorded as measured relatives; Databend is query-only and QuestDB is refused a row, each for a measured reason"
+    - "Track app release 0.13.5 (appVersion bump; default image tag follows)"
 dependencies:
   - name: postgresql
     version: "16.x.x"

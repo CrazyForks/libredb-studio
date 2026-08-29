@@ -169,9 +169,9 @@ partner contact rather than sending them one at a time.
 
 | Field on the page | Published value | Should be |
 |---|---|---|
-| Version | LibreDB Studio 0.9.44 | 0.13.4, with the release link pointing at <https://github.com/libredb/libredb-studio/releases/tag/0.13.4> — the sixteen-engine wording in this file needs the DuckDB release or later |
-| Key features | "Seven database engines" | sixteen — the accuracy gate above is satisfied as of the DuckDB release |
-| Short and long description | the pre-0.11.0 revision, which names seven engines and an AI that writes SQL from natural language | the text in this file — fourteen engines, and no natural-language-to-SQL claim: that feature was removed from the product |
+| Version | LibreDB Studio 0.9.44 | 0.13.5, with the release link pointing at <https://github.com/libredb/libredb-studio/releases/tag/0.13.5> — the sixteen-engine wording in this file is accurate as of that release, which is the one DuckDB ships in |
+| Key features | "Seven database engines" | sixteen — the accuracy gate above is satisfied as of 0.13.5, the release DuckDB ships in |
+| Short and long description | the pre-0.11.0 revision, which names seven engines and an AI that writes SQL from natural language | the text in this file — sixteen engines, and no natural-language-to-SQL claim: that feature was removed from the product |
 | Hardware Architecture | x86-64 | x86-64 and Arm64 (`ghcr.io/libredb/libredb-studio` is linux/amd64 + linux/arm64) |
 
 Two open questions for the same mail: whether the version field can track the latest
