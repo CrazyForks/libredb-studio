@@ -2,8 +2,8 @@ apiVersion: v2
 name: libredb-studio
 description: Web-based SQL IDE for cloud-native teams supporting sixteen engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra and libSQL
 type: application
-version: 0.1.55
-appVersion: "0.13.5"
+version: 0.1.56
+appVersion: "0.13.6"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
 icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
@@ -46,6 +46,12 @@ annotations:
   artifacthub.io/category: database
   artifacthub.io/license: MIT
   artifacthub.io/prerelease: "false"
+  # False: 0.1.56 tracks app release 0.13.6, which removes a claim rather than fixing a
+  # weakness. The sign-in page carried an "Encrypted" badge that named no subject; on the
+  # default STORAGE_PROVIDER=local it had no referent beyond the TLS the browser already
+  # indicates, since credentials stay in the browser's localStorage in plaintext by design.
+  # Nothing an operator deploys moves, and no behaviour changes - the at-rest AES-256-GCM
+  # over the sqlite and postgres store is exactly what it was.
   # True: 0.1.55 tracks app release 0.13.5, which carries three fixes an operator should
   # weigh. The SSH tunnel passed no `hostVerifier` to ssh2 and the library has no default,
   # so the tunnel completed its handshake with whatever answered on the bastion's address
@@ -73,10 +79,10 @@ annotations:
   # operator looking for them will find them. The app-level security fixes of earlier
   # releases remain recorded on 0.1.37, the chart version that first shipped them; the
   # adm-zip pin note belongs to 0.1.44, unchanged.
-  artifacthub.io/containsSecurityUpdates: "true"
+  artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.13.5
+      image: ghcr.io/libredb/libredb-studio:0.13.6
       platforms:
         - linux/amd64
         - linux/arm64
@@ -88,19 +94,8 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "Security: the SSH tunnel verified no host key at all - ssh2 was given no hostVerifier and has no default, so the tunnel completed its handshake with whatever answered on the bastion's address. Host keys are now trust-on-first-use, pinned per connection, and a changed key is refused naming both fingerprints"
-    - "Security: the destructive-command confirmation gate spoke SQL only, so Redis FLUSHALL and a MongoDB deleteMany with an empty filter ran with no confirmation while DELETE FROM on every SQL engine asked. The vocabulary is now per engine type, and a payload the reader cannot parse asks rather than staying silent"
-    - "Security: POST /api/db/maintenance validated that an operation exists rather than that it could take the target it was given, so a direct request naming one table could vacuum a whole SQLite file. The route now derives the placement from the same per-provider declaration both UI surfaces already gate on"
-    - "New engine - DuckDB, as an embedded file engine with the read-only boundary the engine itself enforces rather than a name denylist"
-    - "New engine - libSQL over the Hrana protocol, one connection type for a self-hosted sqld and for Turso Cloud alike, with no added runtime dependency"
-    - "An unknown reading is now absent rather than zero, across the Overview, Monitoring, Queries and Storage tabs. A denied DMV, an unprivileged V$SESSION or a serverStatus with no connections section drew a confident zero on a busy server; a capped list drew its own ceiling as the database's query count; and the Storage tab divided three figures by a total it did not have, rendering negative percentages"
-    - "Schema diff no longer wraps generated migrations in BEGIN;/COMMIT; for dialects that cannot run DDL in a transaction, which had made the script fail on the engines it was generated for"
-    - "Redis connections carry their ACL username through to the driver, and the active session's user is read from the CLIENT LIST user field rather than inferred"
-    - "The query agent carries measured settings for more models, binds each run to the conversation it belongs to, and declines a follow-up whose connection now addresses a different database instead of answering from the earlier run's snapshot"
-    - "The row limiter no longer reads a bound mentioned inside a comment or a string literal as a bound the statement already carries, which had let an unlimited statement return every row of a table"
-    - "Four defects at 390px, starting with a light-theme toggle that could not be reached on a phone"
-    - "Compatibility registry: Apache Doris, Garnet, both Percona distributions, ParadeDB and OrioleDB are recorded as measured relatives; Databend is query-only and QuestDB is refused a row, each for a measured reason"
-    - "Track app release 0.13.5 (appVersion bump; default image tag follows)"
+    - "The sign-in page no longer shows a bare Encrypted badge beside the SSO button. It named no subject, and on the default local storage provider it had no referent beyond the TLS the browser already indicates - saved connections live in the browser localStorage in plaintext by design, and the at-rest AES-256-GCM covers the sqlite and postgres server store only"
+    - "Track app release 0.13.6 (appVersion bump; default image tag follows)"
 dependencies:
   - name: postgresql
     version: "16.x.x"

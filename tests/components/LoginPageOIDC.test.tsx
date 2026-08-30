@@ -99,4 +99,16 @@ describe("LoginPage (OIDC mode)", () => {
       expect(claim.textContent).toMatch(/agent mode/i);
     }
   });
+
+  test("makes no bare encryption claim under the SSO button", () => {
+    // Reported externally (Reddit, 2026-08-30): a lone "Encrypted" badge names no subject, and on
+    // the default STORAGE_PROVIDER=local deployment - which is what the public demo runs - it has
+    // no referent beyond TLS: credentials stay in the browser's localStorage in plaintext by
+    // design (src/lib/storage/encryption.ts covers the sqlite/postgres store only).
+    // The surviving sibling is asserted in the same test on purpose: without it, a later rename of
+    // the badge row would leave this negative assertion passing forever while proving nothing.
+    const { queryByText, getByText } = render(<LoginForm authProvider="oidc" />);
+    expect(getByText("OIDC Protected")).not.toBeNull();
+    expect(queryByText("Encrypted")).toBeNull();
+  });
 });

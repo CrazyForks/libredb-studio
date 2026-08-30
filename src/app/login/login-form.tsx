@@ -244,11 +244,15 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
                     {isLoading ? "Redirecting..." : "Login with SSO"}
                   </Button>
 
+                  {/*
+                    One badge, not two. A lone "Encrypted" used to sit beside this one and named no
+                    subject - and on the default STORAGE_PROVIDER=local deployment it had no
+                    referent beyond the TLS the browser already indicates: credentials live in the
+                    browser's localStorage in plaintext by design, and the at-rest AES-256-GCM in
+                    src/lib/storage/encryption.ts covers the sqlite/postgres server store only.
+                    "OIDC Protected" survives because it states something this branch actually does.
+                  */}
                   <div className="flex items-center justify-center gap-4 pt-2">
-                    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                      <Lock className="h-3 w-3" />
-                      <span>Encrypted</span>
-                    </div>
                     <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                       <Shield className="h-3 w-3" />
                       <span>OIDC Protected</span>
