@@ -19,7 +19,7 @@ MODELS=("$@")
 if [ ${#MODELS[@]} -eq 0 ]; then
   # Fastest first, so the run reports something early, and the hosted model last because it needs
   # its own environment file swapped in rather than a line rewritten.
-  MODELS=(granite4.1:8b granite4.1:30b ornith:9b qwen3.5:9b qwen3:8b gemma4:26b qwen3:14b nemotron3:33b qwen3.8:latest qwen3:4b gemini-3.5-flash-lite)
+  MODELS=(granite4.1:8b granite4.2:8b granite4.1:30b ornith:9b qwen3.5:9b qwen3:8b gemma4:12b gemma4:26b qwen3:14b nemotron3:33b nemotron-3.5-lightning:30b nemotron-3-nano:30b qwen3.6:27b qwen3.8:latest muse-glimmer:latest qwen3:4b gemini-3.5-flash-lite)
 fi
 
 # Watchable by default: the browser opens on screen and every click is visible, and a video of
@@ -29,6 +29,41 @@ HEADED="${HEADED:---headed}"
 # window opens and closes before anything is readable; this puts a beat between actions so the
 # login, the connection, the objective and the run itself are all visible.
 export PWSLOWMO="${PWSLOWMO:-350}"
+
+# The hosted model's key lives outside the repo and is NOT copied into a worktree by git. A sweep
+# run from a worktree silently lost it once: the swap step stripped the LLM lines from .env.local,
+# the second grep found no file, and the server came up with no model at all — measuring an empty
+# configuration while looking like it measured Gemini. Fetch it from the main checkout instead of
+# assuming it is here.
+#
+# The checkout is DERIVED, not named. This guard first shipped with one machine's absolute home
+# path in it, which meant the `-f` test simply failed everywhere else — reinstating, for every
+# environment but its author's, the exact silent-empty-configuration bug the guard exists to
+# prevent. `--git-common-dir` resolves to the primary checkout's `.git` from inside a worktree, so
+# its parent is the checkout git itself considers primary; `LIBREDB_MAIN_CHECKOUT` overrides it for
+# a layout git cannot derive.
+MAIN_CHECKOUT="${LIBREDB_MAIN_CHECKOUT:-$(cd "$(dirname "$(git rev-parse --git-common-dir)")" && pwd)}"
+if [ ! -f .env.gemini.local ] && [ -f "$MAIN_CHECKOUT/.env.gemini.local" ]; then
+  cp "$MAIN_CHECKOUT/.env.gemini.local" .env.gemini.local
+fi
+
+# The settings a model was MEASURED with, when an operator document is holding them.
+#
+# Without this the sweep drives every model naked, and a model whose lock depends on a per-model
+# setting fails here while passing everywhere else. `qwen3.5:4b` is the case that found it: 30/30
+# through the API with `suppressPlanReasoning`, and its plan test failed in the browser because
+# this script never loaded the document that setting lives in. The failure looked like the model's
+# and was the harness's.
+#
+# Deliberately only when the caller set it. A sweep of what SHIPS should see the shipped document
+# and nothing else, which is what an unset variable gives; exporting a default here would quietly
+# measure somebody's working notes and call it a release check.
+if [ -n "${AGENT_MODEL_TUNING_PATH:-}" ]; then
+  export AGENT_MODEL_TUNING_PATH
+  echo "@@@@ operator tuning: $AGENT_MODEL_TUNING_PATH"
+else
+  echo "@@@@ operator tuning: none — measuring the shipped document"
+fi
 
 BACKUP=$(mktemp)
 cp .env.local "$BACKUP"
@@ -50,6 +85,15 @@ do
   [ -n "$PREVIOUS" ] && ollama stop "$PREVIOUS" >/dev/null 2>&1
 
   if [ "$MODEL" = "gemini-3.5-flash-lite" ]; then
+    # Loud rather than silent. With no file the append below contributes nothing, the server boots
+    # with no model configured, and the sweep reports a measurement of an empty configuration — the
+    # failure the fetch above exists to prevent. A sweep that cannot configure a model has to stop.
+    if [ ! -f .env.gemini.local ]; then
+      echo "!!!! .env.gemini.local not found here or in $MAIN_CHECKOUT." >&2
+      echo "!!!! Put the file in the checkout, or set LIBREDB_MAIN_CHECKOUT to where it lives." >&2
+      echo "!!!! Refusing to measure a server with no model configured." >&2
+      exit 1
+    fi
     # The hosted one: provider, key and model all change together, so its own file is swapped in
     # whole rather than one line being rewritten.
     grep -vE '^(LLM_PROVIDER|LLM_MODEL|LLM_API_KEY|LLM_API_URL)=' "$BACKUP" > .env.local

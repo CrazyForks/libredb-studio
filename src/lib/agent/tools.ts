@@ -1186,13 +1186,18 @@ function exampleRecommendCall(events: readonly AgentRunEvent[]): string | undefi
  * this looks for a completed data read with a statement of the model's behind it, which is
  * exactly what the tool accepts, and offers nothing when there is none.
  */
-function exampleAnswerCall(events: readonly AgentRunEvent[]): string | undefined {
+function presentableArtifact(events: readonly AgentRunEvent[]): string | undefined {
   const drafted = new Set(events.flatMap((event) => (event.kind === "statement-drafted" ? [event.stepId] : [])));
   let latest: string | undefined;
   for (const event of events) {
     if (event.kind === "tool-completed" && event.artifact.operationId === ANSWER_OPERATION && drafted.has(event.stepId))
       latest = event.artifact.correlationId;
   }
+  return latest;
+}
+
+function exampleAnswerCall(events: readonly AgentRunEvent[]): string | undefined {
+  const latest = presentableArtifact(events);
   if (latest === undefined) return undefined;
   return JSON.stringify({ artifact: latest, presentation: { kind: "table" } });
 }
@@ -1541,10 +1546,18 @@ function columnsThatExist(message: string, connection: DatabaseConnection): stri
   return `"${table.name}" has no ${missing}. Its columns are ${named.join(", ")}.${found}`;
 }
 
-function statementAdvice(message: string, engine: string, connection: DatabaseConnection): string | undefined {
-  // First, because it is the largest family and the most specific thing this layer can say.
-  const columns = columnsThatExist(message, connection);
-  if (columns !== undefined) return columns;
+/**
+ * The other two things this layer can say about a failed statement.
+ *
+ * Split from `columnsThatExist` because the CLASS is decided separately from the sentence, and
+ * only that one earns the free class — see the call site. Both branches here are a rewrite the
+ * model has to author: a narrower query, or a different way of asking for the catalog. The
+ * inventory branch is not, which is the whole distinction.
+ *
+ * Takes no connection: neither branch reads our own state. They are derived from the shape of the
+ * engine's message and from the engine this connection IS, which is why neither can be free.
+ */
+function otherStatementAdvice(message: string, engine: string): string | undefined {
   const overBudget = /row budget: \d+ rows > (\d+) allowed/.exec(message);
   if (overBudget !== null) {
     return `Ask for fewer rows: add LIMIT ${overBudget[1]} (or an aggregate that returns one row) and run it again.`;
@@ -1694,7 +1707,33 @@ async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgent
     // execution profile, or anything the pipeline itself threw — is the environment's,
     // so it propagates whatever class it carries and costs no repair attempt.
     if (!phase.statementSent || !isStatementFailure(error)) throw error;
-    context.repairs.recordFailure(fingerprint, "database-error");
+    /*
+      Whether this server could tell the model what would have worked, decided BEFORE the ledger
+      is told — because the answer changes what the failure costs.
+
+      Five `lfm2:24b` data-analysis runs, driven together: every one spent its three attempts on
+      `no such column`, and not one produced a successful read. The run read in full had the
+      CORRECT statement as its fourth, refused before it reached the database. The advice added
+      earlier today is what makes those retries converge — the model went from repeating one
+      spelling to trying three and landing on the right one — and each convergent step was being
+      charged as though it were a guess.
+
+      The COST and the SENTENCE are deliberately two different decisions, and reading one off the
+      other is what made the class too wide. Only the inventory branch is free: there the server
+      held the answer, handed it over, and the next statement applies a correction it dictated.
+      `otherStatementAdvice`'s two branches — the row budget, the foreign catalog — are advice
+      about a REWRITE the model still has to author, and a rewrite is exactly what the budget of
+      three exists to bound. A row-budget overrun in particular is the most expensive failure a run
+      can produce: the statement ran to completion at the engine and returned rows before it blew
+      the cap, and making it cheaper is not a correction anyone dictated.
+
+      So `columns` decides the cost, and the advice the model reads is still whichever of the three
+      applies. `columnsThatExist` is computed once and used for both rather than called twice.
+    */
+    const columns = columnsThatExist(error.message, context.connection);
+    const advice = columns ?? otherStatementAdvice(error.message, context.connection.type);
+    const answered = columns !== undefined;
+    context.repairs.recordFailure(fingerprint, answered ? "database-error-answered" : "database-error");
     return {
       kind: "refused",
       // `elapsedMs` is the tracker's own charge for this failed execution, recorded so
@@ -1706,6 +1745,10 @@ async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgent
         statementFingerprint: fingerprint,
         message: error.message,
         elapsedMs: context.tracker.usage(context.runId).totalElapsedMs - chargedBeforeMs,
+        // Recorded rather than left to be inferred: whether the inventory was in hand decides what
+        // this failure cost, and it depends on a process-wide cache a run cannot see. See the
+        // field's own note in `types.ts`.
+        answered,
       },
       // The engine's own words: untrusted, so fenced. The fingerprint stands in for
       // a correlation id, which a failed execution never produced.
@@ -1718,9 +1761,17 @@ async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgent
           operationId: call.operationId,
           reference: fingerprint,
         }),
-        ...(offersRefusalExamples(context.modelId)
-          ? [statementAdvice(error.message, context.connection.type, context.connection) ?? ""]
-          : []),
+        // EVERY model, unlike the worked examples three tools below. Those are a whole call built
+        // from the run's own ledger and long enough to crowd a small model's turn, so they stay
+        // behind a lever a measurement opened. This is one sentence naming columns the operator's
+        // own database has, and it went to two of sixteen models for as long as it existed —
+        // `lfm2:24b` lost data-analysis 0/5 drafting `employee.dept_no`, being told only that no
+        // such column exists, reading the schema, and drafting it again. Nothing about that is
+        // particular to the model.
+        //
+        // The value computed above, not a second call: the same answer decides what this failure
+        // COSTS, and the sentence and the cost disagreeing would be a bug nobody could see.
+        advice ?? "",
       ]
         .filter((part) => part.length > 0)
         .join("\n"),
@@ -1888,6 +1939,21 @@ function describeIssues(issues: readonly z.core.$ZodIssue[]): string {
       the permitted values are in the schema, already in hand at the point of refusal.
     */
     if (issue.code === "invalid_value") return `${where}: expected one of ${issue.values.join(", ")}`;
+    /*
+      A DISCRIMINATED union lands here, and it is deliberately left alone.
+
+      `claims.0.evidence.2.source: invalid union` looks like the same fault as the two cases above
+      — a refusal printing a code instead of what would have worked — and it was read that way
+      after `granite4.1:3b` lost two of five assessments to three refusals each. It is not.
+      `invalidEvidenceInput` appends `AGENT_EVIDENCE_CONTRACT` to every refusal this path gives,
+      so the model has already been handed both arms by name in the same message; the test above
+      pins that. Zod reports no branch errors for a discriminated union whose discriminant matched
+      nothing, so there is nothing here to read them from either.
+
+      What is genuinely worse for the LEDGER — `detail` carrying the bare code while the model got
+      the full sentence — is a reporting gap, not a blocked run, and pretending otherwise would
+      have put dead code in front of a model that was never short of the answer.
+    */
     return `${where}: ${issue.code.replaceAll("_", " ")}`;
   });
   return `the fields that did not match — ${named.join("; ")}`;
@@ -3388,8 +3454,26 @@ export function presentAnswerTool(
     return {
       kind: "unavailable",
       reasonCode: "INVALID_TOOL_INPUT",
+      /*
+        The failing paths, which this refusal alone was assembled without — and the omission cost a
+        cell that had already been won.
+
+        `lfm2:24b` on data-analysis: told to present before reporting, it called `present_answer`
+        three times in a row and read back the same two sentences each time, the generic refusal
+        and the contract. It never learned which field was wrong, stopped trying, and went to
+        `compose_report` — whose refusal DID name its field. Same run, same model, same validator:
+        the sibling refusal is actionable and this one was not, and the run scored `no-answer`
+        holding the answer.
+
+        `invalidEvidenceInput` states the reasoning this now follows and states it about these
+        exact paths: "restating a rule the model has read and misapplied is not what it is
+        missing. The field that failed is." That was applied to the two evidence tools and this
+        one was left behind. `detail` is the same paths again for the LEDGER, which is what makes
+        a repeated refusal diagnosable afterwards rather than a bare code three times over.
+      */
+      detail: parsed.problems,
       modelText: [
-        UNAVAILABLE_TEXT.INVALID_TOOL_INPUT,
+        `${UNAVAILABLE_TEXT.INVALID_TOOL_INPUT} (${parsed.problems})`,
         AGENT_ANSWER_CONTRACT,
         ...(example === undefined ? [] : [`A call this run could make right now: ${example}`]),
       ].join(" "),
@@ -3398,7 +3482,30 @@ export function presentAnswerTool(
 
   const artifact = producedArtifact(run.events, parsed.value.artifact);
   if (artifact === null) return unavailable("ANSWER_ARTIFACT_UNKNOWN");
-  if (artifact.operationId !== ANSWER_OPERATION) return unavailable("ANSWER_NOT_A_DATA_READ");
+  if (artifact.operationId !== ANSWER_OPERATION) {
+    /*
+      And WHICH result would have been taken, when the run is holding one.
+
+      Fifteen `qwen3:1.7b` data-analysis runs were read together and FOURTEEN were refused here on
+      their first `present_answer`, every one having cited a plan or a profile. Eight of the
+      fifteen held a good read at that moment; four of those eight never found it, and were told
+      to run a read they had already run.
+
+      The sentence stays as it is for the seven that had read nothing — "run the read first if you
+      have not" is the whole answer there, and naming an id would mean inventing one. What is
+      added is for the other eight, and it is a value this layer is already computing:
+      `presentableArtifact` is what `exampleAnswerCall` builds its worked call from. That call is
+      behind `refusalExamples` because a whole call is long enough to crowd a small model's turn.
+      An id is not, so it goes to everyone — the same reasoning the answer notice states one step
+      later, that being told to cite something "somewhere" and being handed the characters are
+      different instructions.
+    */
+    const instead = presentableArtifact(run.events);
+    return unavailable(
+      "ANSWER_NOT_A_DATA_READ",
+      instead === undefined ? undefined : `this run already read ${instead} — present that`,
+    );
+  }
   const sql = statementBehind(run.events, artifact.correlationId);
   if (sql === null) return unavailable("ANSWER_STATEMENT_UNKNOWN");
 

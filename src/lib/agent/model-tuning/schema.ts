@@ -88,6 +88,13 @@ const settingsShape = {
   reportReminderLimit: countSchema,
   planStatementRetries: countSchema,
   presentReminderLimit: countSchema,
+  /**
+   * Absent means the compiled two, which is what every entry written before this bound became
+   * per-model was measured under. Optional for the reason `suppressAgentReasoning` is: making
+   * it required would write the default into seventeen entries to say what their absence
+   * already says, and not one of those measurements would change.
+   */
+  verdictHoldLimit: countSchema.optional(),
   retryEmptyTurn: z.boolean(),
   retryUnreadStop: z.boolean(),
   suppressPlanReasoning: z.boolean(),
@@ -148,6 +155,7 @@ const measuredAgainstSchema = z.strictObject({
     reportReminderLimit: countSchema,
     planStatementRetries: countSchema,
     presentReminderLimit: countSchema,
+    verdictHoldLimit: countSchema,
     retryEmptyTurn: z.boolean(),
     retryUnreadStop: z.boolean(),
     suppressPlanReasoning: z.boolean(),
@@ -155,6 +163,17 @@ const measuredAgainstSchema = z.strictObject({
     refusalExamples: z.boolean(),
   }),
 });
+
+/**
+ * Every key an entry's `settings` may carry, in the order the schema declares them.
+ *
+ * Exported for ONE job: `docs/llms/model-tuning.md` calls its settings table "the document's own
+ * contract — every setting, its bounds", and that sentence was a claim nothing checked. Two keys
+ * had already reached this shape without reaching the table, so an operator could set neither, and
+ * a misspelling of either lands silently in `ignoredKeys`. Derived here rather than written out in
+ * the test, because a list maintained beside the schema drifts exactly the way the table did.
+ */
+export const TUNING_SETTING_KEYS = Object.keys(settingsShape) as readonly string[];
 
 const documentSchema = z.strictObject({
   schemaVersion: z.literal(TUNING_SCHEMA_VERSION),

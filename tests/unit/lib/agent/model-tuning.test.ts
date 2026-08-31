@@ -15,6 +15,7 @@ import bundled from "@/lib/agent/model-tuning/measured-profiles.json";
 import {
   ModelTuningError,
   TUNING_SCHEMA_VERSION,
+  TUNING_SETTING_KEYS,
   parseOperatorTuning,
   parseTuning,
 } from "@/lib/agent/model-tuning/schema";
@@ -23,6 +24,7 @@ import { BASELINE_NOTICES } from "@/lib/agent/models/notices";
 import {
   DEFAULT_PLAN_STATEMENT_RETRIES,
   DEFAULT_PRESENT_REMINDER_LIMIT,
+  DEFAULT_VERDICT_HOLD_LIMIT,
   DEFAULT_REFUSAL_EXAMPLES,
   DEFAULT_REPORT_REMINDER_LIMIT,
   DEFAULT_RETRY_EMPTY_TURN,
@@ -65,6 +67,7 @@ const document = (overrides: Record<string, unknown> = {}): Record<string, unkno
       reportReminderLimit: 1,
       planStatementRetries: 0,
       presentReminderLimit: 1,
+      verdictHoldLimit: 2,
       retryEmptyTurn: false,
       retryUnreadStop: false,
       suppressPlanReasoning: false,
@@ -90,7 +93,7 @@ afterEach(() => {
 describe("the document Studio ships with", () => {
   test("passes its own contract", () => {
     const tuning = parseTuning(bundled, "test");
-    expect(Object.keys(tuning.models)).toHaveLength(15);
+    expect(Object.keys(tuning.models)).toHaveLength(18);
   });
 
   test("argues for every value it changed", () => {
@@ -118,6 +121,7 @@ describe("the document Studio ships with", () => {
       reportReminderLimit: DEFAULT_REPORT_REMINDER_LIMIT,
       planStatementRetries: DEFAULT_PLAN_STATEMENT_RETRIES,
       presentReminderLimit: DEFAULT_PRESENT_REMINDER_LIMIT,
+      verdictHoldLimit: DEFAULT_VERDICT_HOLD_LIMIT,
       retryEmptyTurn: DEFAULT_RETRY_EMPTY_TURN,
       retryUnreadStop: DEFAULT_RETRY_UNREAD_STOP,
       suppressPlanReasoning: DEFAULT_SUPPRESS_PLAN_REASONING,
@@ -559,7 +563,7 @@ describe("a document an operator supplies", () => {
     process.env[ENV] = writeDocument("{ not json");
     resetTuning();
     expect(ceilingFor("gemma4:26b")).toBe(10);
-    expect(Object.keys(activeTuning().models)).toHaveLength(15);
+    expect(Object.keys(activeTuning().models)).toHaveLength(18);
   });
 
   test("reports that it ignored a document, naming the file and the reason", () => {
@@ -713,13 +717,13 @@ describe("a document an operator supplies", () => {
   test("is ignored when it breaks the contract, not partially applied", () => {
     process.env[ENV] = writeDocument(document({ schemaVersion: 99 }));
     resetTuning();
-    expect(Object.keys(activeTuning().models)).toHaveLength(15);
+    expect(Object.keys(activeTuning().models)).toHaveLength(18);
   });
 
   test("is ignored when the file is not there at all", () => {
     process.env[ENV] = "/nonexistent/models.json";
     resetTuning();
-    expect(Object.keys(activeTuning().models)).toHaveLength(15);
+    expect(Object.keys(activeTuning().models)).toHaveLength(18);
   });
 
   test("an unset or blank variable is simply no operator document", () => {
@@ -727,7 +731,7 @@ describe("a document an operator supplies", () => {
     // reading it as a path would warn on every boot of an install that configured nothing.
     process.env[ENV] = "   ";
     resetTuning();
-    expect(Object.keys(activeTuning().models)).toHaveLength(15);
+    expect(Object.keys(activeTuning().models)).toHaveLength(18);
   });
 
   test("is read once, so a run cannot see the table change under it", () => {
@@ -735,5 +739,35 @@ describe("a document an operator supplies", () => {
     resetTuning();
     const first = activeTuning();
     expect(activeTuning()).toBe(first);
+  });
+});
+
+describe("the settings table documents every key the schema accepts", () => {
+  /*
+    `docs/AGENT.md` calls the settings table in `docs/llms/model-tuning.md` "the document's own
+    contract — every setting, its bounds", and nothing checked that sentence. Two keys had reached
+    the schema without reaching the table — `verdictHoldLimit`, added with this branch's per-model
+    reminder bound, and `suppressAgentReasoning` before it — so an operator had no way to learn
+    either exists, and a misspelling of either lands silently in `ignoredKeys` rather than being
+    refused.
+
+    Asserted rather than argued, because the next key added will be added by somebody who did not
+    read this comment.
+  */
+  const TABLE = readFileSync(resolve(import.meta.dir, "../../../../docs/llms/model-tuning.md"), "utf8");
+
+  // Spread because `test.each` takes a mutable array and the export is readonly — the export is
+  // read-only on purpose, since nothing may edit the schema's key list through it.
+  test.each([...TUNING_SETTING_KEYS])("`%s` has a row", (key) => {
+    // The leading pipe and backtick are what make this a TABLE ROW rather than a mention in the
+    // prose around it: `turnTimeoutMs` is discussed in three paragraphs, and a test satisfied by
+    // prose would not have caught either of the two keys that were missing.
+    expect(TABLE).toContain(`| \`${key}\` |`);
+  });
+
+  test("and `perWorkflow`, which is a row without being a key of its own", () => {
+    // The one row that is not in `settingsShape`: it is a field of `sampling`'s sibling object
+    // rather than a setting, and it is in the table because an operator sets it by name.
+    expect(TABLE).toContain("| `perWorkflow` |");
   });
 });
