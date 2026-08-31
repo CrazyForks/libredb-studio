@@ -2,8 +2,8 @@ apiVersion: v2
 name: libredb-studio
 description: Web-based SQL IDE for cloud-native teams supporting sixteen engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra and libSQL
 type: application
-version: 0.1.57
-appVersion: "0.13.6"
+version: 0.1.58
+appVersion: "0.13.7"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
 icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
@@ -46,6 +46,12 @@ annotations:
   artifacthub.io/category: database
   artifacthub.io/license: MIT
   artifacthub.io/prerelease: "false"
+  # False: 0.1.58 tracks app release 0.13.7, which adds one metadata field to
+  # package.json and nothing else. The npm artifact declared no licence, so
+  # @libredb/studio showed as unlicensed on the registry while the repository shipped
+  # MIT throughout and the LICENSE file was always in the tarball. Nothing an operator
+  # deploys moves, no template or value changes, and the image behaves identically -
+  # the fix is legible only on the npm package page.
   # False: 0.1.57 changes only what a DEFAULT install renders, and only on Helm 4.2+.
   # `authCookieSecure: null` in values.yaml stayed nil under Helm 4.1 and is coerced to ""
   # under 4.2, which passed the template's `kindIs "invalid"` guard and wrote
@@ -89,7 +95,7 @@ annotations:
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.13.6
+      image: ghcr.io/libredb/libredb-studio:0.13.7
       platforms:
         - linux/amd64
         - linux/arm64
@@ -101,8 +107,8 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "The sign-in page no longer shows a bare Encrypted badge beside the SSO button. It named no subject, and on the default local storage provider it had no referent beyond the TLS the browser already indicates - saved connections live in the browser localStorage in plaintext by design, and the at-rest AES-256-GCM covers the sqlite and postgres server store only"
-    - "Track app release 0.13.6 (appVersion bump; default image tag follows)"
+    - "The published npm package now declares its licence. package.json carried no license field, so @libredb/studio rendered on npm as unlicensed even though the project has been MIT since its first release and the LICENSE file was always inside the tarball - npm includes it regardless of the files list. The declaration is what package managers, mirrors and licence scanners read, and only a new release can carry it. No chart template, value or image behaviour moves"
+    - "Track app release 0.13.7 (appVersion bump; default image tag follows)"
 dependencies:
   - name: postgresql
     version: "16.x.x"
