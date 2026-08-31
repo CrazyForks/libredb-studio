@@ -916,6 +916,13 @@ extraEnvFrom:
 | [Adding a Provider](docs/ADDING_A_PROVIDER.md) | Step-by-step guide to adding a database, and how to tell whether it needs a driver at all |
 | [Backlog](docs/BACKLOG.md) | Known defects and deferred work that is not yet filed as an issue |
 
+### Cross-browser testing
+
+The product is a browser application, so a browser bug is a product bug. CI runs Playwright against
+desktop Chromium, which is the limit of what a headless runner sees: Safari and older WebKit
+regressions, mobile layout, and the WebKitGTK engine behind the Linux desktop build need real
+devices. This project is tested with BrowserStack.
+
 ---
 
 ## Support
