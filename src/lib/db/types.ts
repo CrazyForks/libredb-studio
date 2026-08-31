@@ -848,9 +848,16 @@ export interface TableStats {
   /**
    * The table's own bytes, and its formatted spelling. BOTH are omitted when the engine
    * publishes no per-table size at all: SQLite's per-object page counts live in the
-   * `dbstat` virtual table, which is a compile-time option - present on node:sqlite and
-   * absent on bun:sqlite ("no such table: dbstat", measured 2026-08-24 on Bun 1.3.14 /
-   * SQLite 3.53.0) - so under Bun there is nothing to read. The field used to be
+   * `dbstat` virtual table, which is a compile-time option the build behind the driver
+   * decides - present on node:sqlite, absent on bun:sqlite through Bun 1.3.14 ("no such
+   * table: dbstat", measured 2026-08-24 on SQLite 3.53.0) and present again from Bun
+   * 1.4.0 / SQLite 3.53.2 (re-measured 2026-08-31 on Linux x86_64, where both drivers
+   * return identical bytes). Those are Bun's Linux/Windows builds: on macOS `bun:sqlite`
+   * dlopens Apple's `/usr/lib/libsqlite3.dylib` rather than Bun's own amalgamation
+   * (oven-sh/bun#16717, open, reproduced upstream), so the SQLite behind it there is
+   * Apple's and is not measured by any row here. So the omission is a property of the
+   * build, not of the driver's name, and
+   * the fields stay optional for every build that still has nothing to read. It used to be
    * required, and what filled it was `rowCount * 100` ("Assume 100 bytes average per
    * row"), which the Storage tab then summed into the Data figure it draws beside the
    * measured database size: a guess presented as a measurement. A `0` would be the

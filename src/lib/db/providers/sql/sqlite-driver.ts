@@ -104,7 +104,8 @@ async function loadBunDriver(): Promise<SQLiteConstructor> {
  * - `run()` reports `changes` as `number | bigint`; normalize to `number`.
  *
  * Exported (with the injectable ctor) so the adapter semantics are unit-testable
- * in-process under Bun, where node:sqlite itself cannot be imported.
+ * in-process against a stand-in, on any runtime, rather than only where node:sqlite
+ * happens to resolve - Bun could not import it before 1.4.0.
  */
 export function createNodeSQLiteDriver(DatabaseSyncCtor: NodeSQLiteModule["DatabaseSync"]): SQLiteConstructor {
   class NodeSQLiteDatabase implements SQLiteDatabase {
@@ -143,9 +144,11 @@ async function importNodeSQLite(): Promise<NodeSQLiteModule> {
 }
 
 /**
- * Load the node:sqlite-backed driver. The module import is injectable so the
- * success path is unit-testable under Bun (which lacks node:sqlite); callers
- * outside tests use the default importer.
+ * Load the node:sqlite-backed driver. The module import is injectable for deterministic
+ * test isolation: the success path is then driven the same way on every runtime instead
+ * of only where node:sqlite resolves. Bun gained it in 1.4.0, so the real module is
+ * exercised too - both arms are asserted rather than whichever one the toolchain allows.
+ * Callers outside tests use the default importer.
  */
 export async function loadNodeSQLiteDriver(
   importModule: () => Promise<NodeSQLiteModule> = importNodeSQLite,
@@ -154,10 +157,23 @@ export async function loadNodeSQLiteDriver(
   return createNodeSQLiteDriver(sqlite.DatabaseSync);
 }
 
+/** The real loader for a driver name — the default behind the seam below. */
+async function importDriverForName(name: SQLiteDriverName): Promise<SQLiteConstructor> {
+  return name === "bun" ? loadBunDriver() : loadNodeSQLiteDriver();
+}
+
 /**
  * Load the runtime-appropriate SQLite driver (lazily, cached per driver).
+ *
+ * The loader is injectable for the same reason `loadNodeSQLiteDriver`'s importer is:
+ * the failure arm is otherwise reachable only on a runtime that lacks the module, so a
+ * test asserting it is really asserting a property of the installed Bun. It was written
+ * that way once and went quietly unexercised the day Bun 1.4.0 shipped `node:sqlite`.
+ * Callers outside tests pass nothing.
  */
-export async function loadSQLiteDriver(): Promise<SQLiteConstructor> {
+export async function loadSQLiteDriver(
+  loadDriver: (name: SQLiteDriverName) => Promise<SQLiteConstructor> = importDriverForName,
+): Promise<SQLiteConstructor> {
   const name = resolveSQLiteDriverName();
 
   const cached = loadedDrivers.get(name);
@@ -170,7 +186,7 @@ export async function loadSQLiteDriver(): Promise<SQLiteConstructor> {
   }
 
   try {
-    const driver = name === "bun" ? await loadBunDriver() : await loadNodeSQLiteDriver();
+    const driver = await loadDriver(name);
     loadedDrivers.set(name, driver);
     return driver;
   } catch (error) {
