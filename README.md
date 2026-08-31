@@ -65,7 +65,7 @@
 
 ## Quick Start
 
-Run a full SQL IDE in one command, no clone, no build:
+Run a full Database Editor in one command, no clone, no build:
 
 ```bash
 # Docker (recommended)
