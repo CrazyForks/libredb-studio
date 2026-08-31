@@ -1,6 +1,7 @@
 {
   "name": "@libredb/studio",
   "version": "0.13.6",
+  "license": "MIT",
   "private": false,
   "publishConfig": {
     "access": "public"
