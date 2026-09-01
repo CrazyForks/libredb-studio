@@ -218,7 +218,9 @@ Health check endpoint: `GET /api/db/health` · Container HTTP port: `3000`.
 
 ## Links
 
+- **Project website:** <https://libredb.org>
 - **Source & docs:** <https://github.com/libredb/libredb-studio>
+- **Contributing:** [CONTRIBUTING.md](https://github.com/libredb/libredb-studio/blob/main/CONTRIBUTING.md) — how to open an issue, run the test suite and send a pull request, alongside the [Code of Conduct](https://github.com/libredb/libredb-studio/blob/main/CODE_OF_CONDUCT.md)
 - **Live demo:** <https://app.libredb.org>
 - **DeepWiki docs:** <https://deepwiki.com/libredb/libredb-studio>
 - **License:** MIT

@@ -952,6 +952,11 @@ an endorsement of libredb-studio by the company named. The full list, what each
 one covers and what attribution is owed in return are at
 [libredb.org/supporters](https://libredb.org/supporters/).
 
+- **[Docker](https://www.docker.com/community/open-source/)** — the
+  Docker-Sponsored Open Source programme behind the `libredb` namespace on
+  Docker Hub, which removes pull rate limits for everyone pulling the public
+  image. The canonical image is still GHCR; this is what keeps the Hub mirror
+  usable without an account. Since 2026-09-01.
 - **[Tailscale](https://tailscale.com/opensource)** — the Community on GitHub
   plan behind the private network maintainers use to reach the database probe
   hosts, so testing against real engines does not mean exposing database ports
