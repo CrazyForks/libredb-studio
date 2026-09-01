@@ -957,10 +957,17 @@ one covers and what attribution is owed in return are at
   Docker Hub, which removes pull rate limits for everyone pulling the public
   image. The canonical image is still GHCR; this is what keeps the Hub mirror
   usable without an account. Since 2026-09-01.
+
+- **[BrowserStack](https://www.browserstack.com/opensource)** — the BrowserStack
+  Open Source programme behind the cross-browser testing that runs Playwright
+  against desktop Chromium, which is the limit of what a headless runner sees:
+  Safari and older WebKit regressions, mobile layout, and the WebKitGTK engine
+  behind the Linux desktop build need real devices. Since 2026-08-31.
+
 - **[Tailscale](https://tailscale.com/opensource)** — the Community on GitHub
   plan behind the private network maintainers use to reach the database probe
   hosts, so testing against real engines does not mean exposing database ports
-  to the internet. Since 2026-09-01.
+  to the internet. Since 2026-08-30.
 
 ---
 
