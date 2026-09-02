@@ -5,7 +5,7 @@
       "author": "Maintainer"
     },
     {
-      "content": "LibreDB Studio runs two ways: as a standalone Next.js app AND as an embedded npm package (@libredb/studio) consumed by the closed-source libredb-platform. The embedding layer lives in src/workspace/ (the StudioWorkspace shell plus connection/query adapter hooks) and src/exports/ (the public package entry points). build:lib (tsup) produces the package dist, which is separate from the Next.js production build - changes to platform-facing components require running build:lib, not just the Next.js build.",
+      "content": "LibreDB Studio runs two ways: as a standalone Next.js app AND as an embeddable npm package (@libredb/studio) that host apps can mount. It is not embedded in libredb-platform - the two were decoupled on 2026-08-14 and are separate products. The embedding layer lives in src/workspace/ (the StudioWorkspace shell plus connection/query adapter hooks) and src/exports/ (the public package entry points). build:lib (tsup) produces the package dist, which is separate from the Next.js production build - any change reachable from src/exports/ requires running build:lib, not just the Next.js build.",
       "author": "Maintainer"
     },
     {
@@ -148,8 +148,8 @@
       ]
     },
     {
-      "title": "Platform Integration & npm Package",
-      "purpose": "Document how LibreDB Studio is consumed as the embedded @libredb/studio npm package by the closed-source libredb-platform, alongside running as a standalone app. Cover the embedding layer: src/workspace/ (StudioWorkspace.tsx as the embeddable shell, the use-connection-adapter and use-query-adapter hooks in src/workspace/hooks/, and src/workspace/types.ts) and src/exports/ (the package's public entry points: index.ts, components.ts, providers.ts, workspace.ts, types.ts). Explain the build:lib script (tsup) that produces the package dist - separate from the Next.js build - and why platform-facing component changes require running build:lib. Reference the platform-integration rules in .claude/rules/platform-integration.md.",
+      "title": "Embeddable Surface & npm Package",
+      "purpose": "Document the embeddable surface this repo publishes as the @libredb/studio npm package, alongside the standalone Next.js app. The two run modes are both this project's own: there is no downstream platform consumer - studio and libredb-platform were decoupled on 2026-08-14 and are separate products. Cover the embedding layer: src/workspace/ (StudioWorkspace.tsx as the embeddable shell, which deliberately renders no app header, the use-connection-adapter and use-query-adapter hooks in src/workspace/hooks/, and src/workspace/types.ts) and src/exports/ (the package's public entry points, which are exactly the tsup entries: index.ts, providers.ts, types.ts, components.ts, workspace.ts, security.ts). Explain the build:lib script (tsup + scripts/copy-theme.mjs) that produces the package dist - separate from the Next.js build - and that any change reachable from src/exports/ requires running build:lib, because bun run build does not update the dist. Reference CLAUDE.md and docs/TOOLCHAIN.md.",
       "parent": "Architecture Overview",
       "page_notes": [
         "This dual-mode design (standalone app AND embedded package) is the single most load-bearing architectural fact about the repo - foreground it.",
@@ -189,7 +189,7 @@
     },
     {
       "title": "Release History",
-      "purpose": "Document the project's release history from docs/releases/: v0.3.0, v0.4.0, v0.5.0, v0.5.6, v0.6.1, v0.6.7, v0.7.0, and v0.8.0, plus the 2026-03-27 platform-integration-fixes notes. Summarize key features added in each release and the evolution from a simple PostgreSQL editor into a multi-database, AI-powered IDE that also ships as the embedded @libredb/studio npm package. The current project version is 0.9.29 (per package.json); releases beyond v0.8.0 are cut as git tags and may not all have a dedicated docs/releases/ file."
+      "purpose": "Document the project's release history. The docs/releases/ directory no longer exists (moved out in 0ae69260), so the canonical record is the git tag namespace plus the GitHub releases: app tags carry no v prefix from 0.9.28 onward (tags before that are v-prefixed and frozen), and chart releases use the separate libredb-studio-<chart version> namespace. Summarize the evolution from a simple PostgreSQL editor into a multi-database, AI-powered IDE that also ships as an embeddable @libredb/studio npm package. Read the current version from package.json rather than pinning one here."
     },
     {
       "title": "Glossary",

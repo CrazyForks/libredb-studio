@@ -21,8 +21,9 @@ and the list of changed files. Judge the diff, not the agent's narrative.
    codebase already uses a modern equivalent.
 3. **Convention sync** — the CLAUDE.md rules that commonly bite: the provider triad (provider code
    ↔ `docs/providers/<type-id>.md` ↔ `tests/integration/db/<type-id>-provider.test.ts` must move
-   in the SAME commit), platform-integration rules for anything touching components / `.tsx` /
-   `globals.css`, and `build:lib` relevance for platform-facing exports.
+   in the SAME commit); `globals.css` stays out of the Biome formatter (`docs/TOOLCHAIN.md`);
+   and any change reachable from `src/exports/` needs `bun run build:lib` (`CLAUDE.md` —
+   `bun run build` does not update the package dist).
 4. **Tests are real** — new/changed tests must fail without the fix (reason it out from the code;
    if you run anything, use only project-standard commands from `CLAUDE.md`) and must exercise
    production code, not a reimplementation of it inside the test.

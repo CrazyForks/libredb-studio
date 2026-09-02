@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
 # Gate script — mechanical definition of "done" for one maintainer-loop iteration.
-# Mirrors CLAUDE.md's Pre-Commit Verification exactly; do not reorder or drop a step.
+# Mirrors CLAUDE.md's Pre-Commit Verification and the required CI checks
+# (.github/workflows/ci.yml: "Lint, Typecheck and Build" + "Unit & Integration Tests");
+# do not reorder or drop a step.
 
 set -euo pipefail
 
@@ -22,6 +24,13 @@ bun run knip
 
 echo "=== gate: test ==="
 bun run test
+
+# The required "Unit & Integration Tests" job runs these two, not `bun run test`:
+# coverage goes through tests/run-core.sh per-file process isolation, and
+# scripts/check-coverage.mjs enforces 100% lines on the merged lcov.
+echo "=== gate: coverage ==="
+bun run test:coverage
+bun run coverage:check
 
 echo "=== gate: build ==="
 bun run build

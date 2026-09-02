@@ -100,8 +100,9 @@ A human removing the label is the only way the task becomes pickable again.
 - Then write the minimal honest implementation that makes the test pass. Real code, not a stub.
 - The right fix is the minimal one that matches this repo's existing patterns and philosophy:
   local-first / secure-by-default behavior, zero-config first run, the provider triad
-  (code ↔ docs ↔ tests in the same commit), the platform-integration rules for anything touching
-  components / `.tsx` / `globals.css`, and current non-deprecated APIs matching the surrounding
+  (code ↔ docs ↔ tests in the same commit), `globals.css` staying out of the Biome formatter
+  (`docs/TOOLCHAIN.md`), `bun run build:lib` after any change reachable from `src/exports/`
+  (`CLAUDE.md`), and current non-deprecated APIs matching the surrounding
   code. Prefer extending an existing mechanism over introducing a new one. If the only correct
   fix requires a new dependency or a new architectural mechanism, that is a 1b escalation, not a
   judgment call.
@@ -123,6 +124,11 @@ A human removing the label is the only way the task becomes pickable again.
   Record the verdict in `.loop/PROGRESS.md` either way. Never argue the reviewer down; if you
   believe a finding is wrong, record why and treat that round as a failed attempt (999d counts
   these).
+- Optional cold-read judge: for a subjective bar (readability, a milestone-close "is this
+  coherent in one sitting?" check), launch the `loop-judge` subagent (defined in
+  `.claude/agents/loop-judge.md`) after the mechanical gate and the mandatory review are green.
+  It is advisory — never a substitute for `loop-reviewer` — and its verdict is recorded in
+  `.loop/PROGRESS.md` the same way.
 - Only when ALL gates are green AND the review verdict is PASS or PASS WITH NOTES: FIRST tick
   the task off in `.loop/IMPLEMENTATION_PLAN.md` and
   append a note to `.loop/PROGRESS.md`, THEN commit everything together — one task, ONE commit

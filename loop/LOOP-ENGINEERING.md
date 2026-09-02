@@ -2,10 +2,11 @@
 
 > How to let a coding agent build your project autonomously, test-first, without losing reliability or honesty.
 >
-> Read [`HANDOFF.md`](./HANDOFF.md), the repo root `CLAUDE.md`, and the current task's linked
+> Read `.loop/HANDOFF.md` (seeded from [`HANDOFF.md.template`](./HANDOFF.md.template)), the repo
+> root `CLAUDE.md`, and the current task's linked
 > GitHub issue first — this maintainer variant has no `MANIFESTO.md`/`DESIGN.md`; the repo's
 > existing conventions and the issue tracker are the spec.
-> This document is the operating discipline; [`PROMPT.md`](./PROMPT.md) is the iteration prompt; [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) is the live task list; [`scripts/loop.sh`](./scripts/loop.sh) runs it.
+> This document is the operating discipline; [`PROMPT.md`](./PROMPT.md) is the iteration prompt; `.loop/IMPLEMENTATION_PLAN.md` (seeded from [`IMPLEMENTATION_PLAN.md.template`](./IMPLEMENTATION_PLAN.md.template)) is the live task list; [`scripts/loop.sh`](./scripts/loop.sh) runs it.
 
 ---
 
@@ -155,8 +156,8 @@ Planning is cheap and regenerable. Prefer regenerating the plan over letting the
 Nothing commits unless every gate is green. Define one command in `loop/scripts/gate.sh`:
 
 ```bash
-# Example shape — adapt to your stack (see gate.sh.example)
-typecheck && lint && test && build
+# This repo's concrete gate — see loop/scripts/gate.sh for the authoritative list
+format && lint && typecheck && knip && test && test:coverage + coverage:check && build
 ```
 
 Tests are the primary gate — derived from acceptance criteria, written before implementation.
@@ -166,7 +167,8 @@ For subjective goals ("is the code readable in one sitting?"), use a binary LLM-
 Separate from the subjective judge, every build iteration runs a **mandatory fresh-context
 review before committing**: the [`loop-reviewer`](../.claude/agents/loop-reviewer.md) subagent
 judges the task's diff for correctness against the sanitized spec, convention fit (provider
-triad, platform-integration rules), test realness, scope discipline, and supply-chain red flags
+triad; `globals.css` out of the formatter per [`docs/TOOLCHAIN.md`](../docs/TOOLCHAIN.md); `build:lib`
+after a `src/exports/` change per [`CLAUDE.md`](../CLAUDE.md)), test realness, scope discipline, and supply-chain red flags
 (`PROMPT.md` step 3). A BLOCK verdict stops the commit; the gate alone is not enough when the
 task originates from untrusted public input.
 
@@ -236,7 +238,7 @@ The loop ends when any holds:
 
 ## 9. Acceptance criteria (milestone template)
 
-Copy and fill [`ACCEPTANCE.md`](./ACCEPTANCE.md) per milestone. The completion marker fires only when ALL criteria are met.
+Copy and fill [`ACCEPTANCE.md.template`](./ACCEPTANCE.md.template) into `.loop/ACCEPTANCE.md` per milestone (`new-milestone.sh` does this). The completion marker fires only when ALL criteria are met.
 
 Example structure:
 

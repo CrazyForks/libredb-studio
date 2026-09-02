@@ -417,7 +417,7 @@ reason licenses naming a figure:
 
 (`getHealth()`'s `slowQueries: [{ query: "Error fetching health info" }]` placeholder is the same
 class of fabrication one size down and is still there; it is tracked separately, because removing it
-needs `HealthInfo.slowQueries` to become optional across all 15 type-ids.)
+needs `HealthInfo.slowQueries` to become optional across all 17 type-ids.)
 
 ### 7.3 A database size nobody published is absent, not `0 B`
 
@@ -662,7 +662,7 @@ Over the API: `POST /api/db/query` (JSON MQL in the `sql` field) and `POST /api/
   them and a denied `serverStatus` reports two counts nobody took
   ([§7.3](#73-a-database-size-nobody-published-is-absent-not-0-b)). *Future:* the same change the
   connection count and the byte figure got, which needs the two fields to become optional across all
-  15 type-ids.
+  17 type-ids.
 - **`Binary` values are shown as a placeholder** (`<Binary: N bytes>`), not the raw bytes, and only
   a subset of BSON types are normalised (`Long`/`Timestamp`/`UUID`/`RegExp`/`Code`/`DBRef` render as
   generic objects).

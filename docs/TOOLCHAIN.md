@@ -37,9 +37,10 @@ Consequences:
   so attw must verify CJS resolution too.
 - **ESLint is NOT reduced to type-aware-only** (the database move). `eslint-config-next` is the canonical
   Next linter and Studio ships as a Next app; reducing it would drop curated Next/React coverage.
-- **CSS is excluded from the Biome formatter** - the platform-integration rules
-  (`.claude/rules/platform-integration.md`) warn that `globals.css` can break silently when embedded in
-  platform. Keep CSS out of Biome's scope as a safe start.
+- **CSS is excluded from the Biome formatter** - `src/app/globals.css` is order-sensitive: it carries
+  deliberately unlayered declarations that must outrank Tailwind's utility layer and shadcn's `@layer base`
+  rules, and a formatter that reorders or re-nests them silently changes which rule wins (every gate stays
+  green; only the rendered page differs). Keep CSS out of Biome's scope.
 - **attw needs `build:lib` (tsup), not `next build`** - do not mix the two in CI.
 
 ## Why lineWidth = 120 (carried over from database)
@@ -98,7 +99,8 @@ Notes:
 - Style is double-quote + semicolons: consistent with database and with the existing `eslint.config.mjs`.
   The repo is inconsistent today (`tsup.config.ts` is single-quote / no-semi); the reformat unifies it.
 - `css.formatter.enabled: false` (plus `json.formatter.enabled: false`) keeps `globals.css` and JSON files
-  untouched (platform-integration risk).
+  untouched - `globals.css` is order-sensitive (see the CSS note above) and formatting JSON would churn
+  generated/config files for no gain.
 - Deliverable: a single `chore(format): adopt Biome formatter` PR (~256 files). Afterwards run `build:lib`
   and verify BOTH modes (standalone + embedded), per the repo's UI-change rule. Coordinate timing to avoid
   clashing with open PRs.
@@ -268,7 +270,8 @@ phase that can affect output.
 ## Studio-specific risks
 
 1. Big-bang reformat diff churn - coordinate with open PRs / platform; one PR; verify both modes.
-2. platform-integration rules - keep CSS out of Biome; verify the embedded mode after the reformat.
+2. Order-sensitive CSS - keep `globals.css` out of Biome; verify the embedded (`StudioWorkspace`) render
+   path as well as the standalone app after the reformat.
 3. Oxlint React noise on the first run - expect minor rule tuning.
 4. attw must use `build:lib`, not `next build`.
 5. `mock.module()` test isolation is unaffected by these static tools.

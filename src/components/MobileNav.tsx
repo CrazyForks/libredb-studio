@@ -42,7 +42,7 @@ export function MobileNav({ activeTab, onTabChange, onOpenAgent }: MobileNavProp
             <div
               className={cn("p-2 rounded-xl transition-all", isActive ? "bg-blue-500/10 scale-110" : "hover:bg-fill")}
             >
-              {/* strokeWidth per the platform-integration rule; the row's new agent
+              {/* strokeWidth 1.5 matches the shared icon contract; the row's new agent
                   icon would otherwise render visibly thinner than its siblings. */}
               <Icon strokeWidth={1.5} className="w-5 h-5" />
             </div>

@@ -164,7 +164,8 @@
  * specificity (layer order beats specificity). Unlayered declarations outrank
  * every layer, so this is the only way to override those items without editing
  * `src/components/ui/**`, which must stay upstream-pure so `shadcn add` re-syncs
- * cleanly (see .oxlintrc.json and .claude/rules/platform-integration.md).
+ * cleanly (see .oxlintrc.json). This block is also why CSS is excluded from the
+ * Biome formatter - see docs/TOOLCHAIN.md.
  *
  * Keyed on ARIA roles rather than `data-slot` so it survives upstream renames:
  * Radix menu items render role="menuitem|menuitemcheckbox|menuitemradio",

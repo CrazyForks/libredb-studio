@@ -92,12 +92,16 @@ its `.loop/PROGRESS.md` entry and its commit; a trace line is not evidence that 
 ## The two gates every milestone must pass
 
 1. **Mechanical** — `scripts/gate.sh`: the exact pre-commit verification from the root
-   `CLAUDE.md` (format · lint · typecheck · knip · test · build), per task, before every commit.
+   `CLAUDE.md` plus the required CI coverage check
+   (format · lint · typecheck · knip · test · test:coverage + coverage:check · build), per task,
+   before every commit.
 2. **Functional** — `scripts/functional-smoke.sh`: boot the built app, create a real
    PostgreSQL connection through the UI, run a SQL query, assert the rows render. Mandatory
    before a milestone may complete. (CI covers the same flow by running the underlying spec,
-   `e2e/functional-smoke.spec.ts`, inside the regular Playwright E2E job — not this wrapper;
-   the wrapper additionally hard-fails when Docker is missing, the spec skips.)
+   `e2e/functional-smoke.spec.ts`, in its own bare-runner job `Functional Smoke (PostgreSQL)`
+   — the containerised E2E job excludes it with `--grep-invert "Functional smoke"` because it
+   cannot reach the spec's host-loopback postgres. Neither job runs this wrapper; the wrapper
+   additionally hard-fails when Docker is missing, where the spec skips.)
 
 ## Trust model in one paragraph
 

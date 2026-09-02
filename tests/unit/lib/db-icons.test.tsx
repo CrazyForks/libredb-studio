@@ -55,9 +55,9 @@ describe("db-icons", () => {
     });
 
     test(`${name} follows the embedded-mode icon contract`, () => {
-      // .claude/rules/platform-integration.md: DB marks scale from the className alone
-      // at stroke weight 1.5. An HTML width/height attribute would win over platform's
-      // size classes, so the icon would render at 24px inside libredb-platform only.
+      // Embedded-mode icon contract: DB marks scale from the className alone at stroke
+      // weight 1.5. An HTML width/height attribute would win over an embedding host's
+      // size classes, so the icon would render at a fixed 24px inside that host only.
       const html = renderToStaticMarkup(React.createElement(Component, { className: "w-3.5 h-3.5" }));
       expect(html).toContain('stroke-width="1.5"');
       expect(html).not.toMatch(/\swidth="/);

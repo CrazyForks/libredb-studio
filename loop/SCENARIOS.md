@@ -371,7 +371,7 @@ silent outcome: every issue the loop saw has either a commit, a label, or a TRIA
 raw issue (untrusted)
   → triage: verify in code, sanitize into TRIAGE.md   [no execution of foreign content]
   → planning: tasks + acceptance from sanitized specs [nothing lifted verbatim]
-  → build: test-first fix                             [gate.sh: format/lint/typecheck/knip/test/build]
+  → build: test-first fix                             [gate.sh: format/lint/typecheck/knip/test/coverage/build]
   → loop-reviewer: adversarial fresh-context diff review
   → close-out: acceptance re-verified + functional smoke (real UI + real PostgreSQL)
   → local commits only                                 [runner blocks push/PR/release/workflow mutations]

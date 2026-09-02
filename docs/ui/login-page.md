@@ -36,7 +36,7 @@ src/app/login/
 │  (pg) PostgreSQL (my) MySQL │ <- every engine,     │
 │  (lt) SQLite ... (lb)LibreDB│    icon + label      │
 │                             │   │  OIDC: SSO   │   │
-│  16        24        2      │ <- derived counts    │
+│  [E]       [C]       [M]    │ <- derived counts    │
 │  engines   channels  modes  │   │  or email/pw │   │
 │  <one qualifying line each> │   └──────────────┘   │
 │  Runs on Linux · macOS · …  │                      │
@@ -45,6 +45,17 @@ src/app/login/
 │  (gh)(in)(X)(yt)(ig)(rd)(d) │    + social icons    │
 └─────────────────────────────┴──────────────────────┘
 ```
+
+`[E]`, `[C]` and `[M]` are placeholders on purpose - the three numerals are **derived**, not
+written down. `src/components/login/hero-proof.tsx` renders each one as a `.length` on the array
+that already defines it, so this doc names the source instead of a figure that would go stale the
+next time an engine or a channel lands:
+
+| Slot | Source | Reads |
+|---|---|---|
+| `[E]` engines | `EXTERNAL_DATABASE_TYPES.length` (`src/lib/db/compatibility.ts`) | every shipped `DatabaseType` except the embedded `libredb` |
+| `[C]` channels | `LIVE_CHANNELS.length` (`src/lib/distribution/channels.generated.ts`, generated from `distribution/channels.yaml`) | the channels currently live |
+| `[M]` modes | `AGENT_MODES.length` (`src/components/login/hero-proof.tsx`) | plan mode and agent mode |
 
 The panel carries three tiers of weight - thesis, evidence, proof - rather than six blocks at
 one weight. That is the whole shape of the redesign, and it is load-bearing rather than
@@ -78,7 +89,7 @@ to undo from the outside:
 │   └──────────────┘   │
 │                      │
 │   [PG] [MySQL] ...   │  <- every engine
-│   16 engines · 24 …  │  <- the same claims,
+│   [E] engines · [C]… │  <- the same claims,
 │                      │     joined into a line
 │   Open source · gh…  │
 │   (gh)(in)(X)(yt)…   │

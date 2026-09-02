@@ -67,7 +67,8 @@ export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-15}"
 # --- guards ----------------------------------------------------------------
 if [[ ! -f "$PROMPT_FILE" ]]; then
   echo "ERROR: prompt file not found: $PROMPT_FILE" >&2
-  echo "Copy loop/PROMPT.md.template → loop/PROMPT.md and customize." >&2
+  echo "Expected one of the tracked mode prompts: loop/PROMPT.md (build)," >&2
+  echo "loop/PROMPT-TRIAGE.md, loop/PROMPT-PLANNING.md — or set LOOP_PROMPT_FILE." >&2
   exit 1
 fi
 
