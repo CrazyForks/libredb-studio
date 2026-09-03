@@ -219,6 +219,23 @@ PostgreSQL · MySQL · Oracle · SQL Server · SQLite · libSQL · DuckDB · Mon
 
 Kubernetes 用户还有一个 OpenShift / OLM Operator bundle。
 
+### 中国大陆网络下的拉取加速
+
+在部分国内网络下，从 GHCR 拉取镜像会很慢或超时。镜像只有一份，`ghcr.io/libredb/libredb-studio`，下面只是换一个拉取域名：
+
+```bash
+# 南京大学镜像：把 ghcr.io 换成 ghcr.nju.edu.cn
+docker pull ghcr.nju.edu.cn/libredb/libredb-studio:latest
+
+# DaoCloud 镜像：在完整镜像名前加 m.daocloud.io/
+docker pull m.daocloud.io/ghcr.io/libredb/libredb-studio:latest
+
+# npx / npm：使用 npmmirror 源
+npx --registry=https://registry.npmmirror.com @libredb/studio
+```
+
+镜像站会变动（上海交通大学镜像已于 2026 年 6 月停止服务），以上只是当前可用的例子。拉取失败时，请到 [dongyubin/DockerHub](https://github.com/dongyubin/DockerHub) 查看仍在服务的镜像列表。
+
 ### 嵌入到你自己的产品里
 
 ```bash
