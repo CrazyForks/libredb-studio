@@ -151,10 +151,14 @@ export const DEPARTMENTS = [
   "research",
 ] as const;
 
-const PG_COLUMN_ROWS = DEPARTMENTS.flatMap((table) => [
-  { table_schema: "public", table_name: table, column_name: "id", data_type: "integer", is_nullable: "NO" },
-  { table_schema: "public", table_name: table, column_name: "name", data_type: "text", is_nullable: "YES" },
-]);
+const PG_COLUMN_ROWS = DEPARTMENTS.map((table) => ({
+  table_schema: "public",
+  table_name: table,
+  columns: [
+    { name: "id", type: "integer", nullable: "NO" },
+    { name: "name", type: "text", nullable: "YES" },
+  ],
+}));
 
 const SQLITE_DDL_ROWS = DEPARTMENTS.map((table) => ({
   name: table,
@@ -220,7 +224,7 @@ export const EVAL_ENGINES: Readonly<Record<EvalEngine, EvalEnginePreset>> = Obje
     groundingReads: ["information_schema.columns", "pg_constraint", "pg_index", "pg_stats"],
     catalogAnswer: (sql) => {
       if (sql.includes("information_schema.columns")) {
-        return result(PG_COLUMN_ROWS, ["table_schema", "table_name", "column_name", "data_type", "is_nullable"]);
+        return result(PG_COLUMN_ROWS, ["table_schema", "table_name", "columns"]);
       }
       if (sql.includes("pg_constraint")) return result([], ["table_name"]);
       // Before `pg_index`: the statistics read joins `pg_class` to `pg_stats` and

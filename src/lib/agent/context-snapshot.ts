@@ -65,10 +65,11 @@
  * identity it advertises is the one its own inventory produces.
  *
  * SQLite and PostgreSQL answer differently and the asymmetry is structural, not
- * cosmetic: PostgreSQL has three flat catalog projections, while SQLite has no
- * structured catalog on this path at all (the guard refuses every `pragma_*`
- * function) and its columns, keys and relations are read out of the DDL text the
- * engine stored — see `sqlite-ddl.ts`.
+ * cosmetic: PostgreSQL aggregates its columns into one projection per table and
+ * keeps its relation and index projections flat, while SQLite has no structured
+ * catalog on this path at all (the guard refuses every `pragma_*` function) and
+ * its columns, keys and relations are read out of the DDL text the engine stored —
+ * see `sqlite-ddl.ts`.
  */
 
 import { createHash } from "node:crypto";
@@ -258,6 +259,41 @@ function truthy(value: unknown): boolean {
 
 const qualified = (schema: unknown, table: unknown): string => `${text(schema)}.${text(table)}`;
 
+/**
+ * The column list a PostgreSQL column row carries, aggregated by `json_agg` (B52).
+ *
+ * `pg` parses a `json` column into an array in memory, but the same rows may arrive
+ * as a JSON string from another transport or from a fixture, so both are read.
+ * Anything else is the empty inventory rather than an exception: a row this cannot
+ * read says nothing about its columns, and refusing it here would turn one malformed
+ * row into a lost snapshot.
+ *
+ * The ELEMENTS are filtered for the same reason the value is, and the filter is the
+ * load-bearing half: `Array.isArray` says nothing about what is IN the array, so a
+ * `null` element used to reach the fold and be read as `column.name` — a TypeError,
+ * raised where `buildPostgresTables` runs OUTSIDE `readInventory`'s catch, which ends
+ * the run `internal` rather than degrading the capture (the shape B48 exists to keep
+ * out of this path). A bad element is dropped rather than emptying the list: the rest
+ * of the array is still an inventory, and losing one entry says less than losing the
+ * table.
+ */
+function parsePostgresColumns(value: unknown): readonly Record<string, unknown>[] {
+  const entries = (candidate: unknown): readonly Record<string, unknown>[] =>
+    Array.isArray(candidate)
+      ? candidate.filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+      : [];
+
+  if (Array.isArray(value)) return entries(value);
+  if (typeof value === "string" && value.trim() !== "") {
+    try {
+      return entries(JSON.parse(value) as unknown);
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
 /** Applies `change` to a known table, and drops the row when there is no such table. */
 function attach(tables: TableIndex, name: string, change: (table: MutableTable) => void): void {
   const table = tables.get(name);
@@ -281,12 +317,14 @@ function buildPostgresTables(rows: ReadonlyMap<AgentCatalogKind, readonly Record
     const name = qualified(row.table_schema, row.table_name);
     const table = tables.get(name) ?? emptyTable(name);
     tables.set(name, table);
-    table.columns.push({
-      name: text(row.column_name),
-      type: text(row.data_type),
-      nullable: text(row.is_nullable).toUpperCase() === "YES",
-      isPrimary: false,
-    });
+    for (const column of parsePostgresColumns(row.columns)) {
+      table.columns.push({
+        name: text(column.name),
+        type: text(column.type),
+        nullable: text(column.nullable).toUpperCase() === "YES",
+        isPrimary: false,
+      });
+    }
   }
 
   for (const row of rows.get("relations") ?? []) {

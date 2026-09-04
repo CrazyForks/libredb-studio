@@ -206,7 +206,8 @@ const eventOfKind = <K extends AgentRunEvent["kind"]>(
 
 describe("a refused capture records why it was refused", () => {
   test("postgres: the row budget refusal carries both numbers and no fabricated count", async () => {
-    // The measured shape of B52, as the provider itself raises it: `queryReadOnly`
+    // The shape the provider raises when a read overruns its row budget (B52's
+    // measurement): `queryReadOnly`
     // refuses rather than truncating, and the two numbers are the whole diagnosis —
     // 536 rows against a 200-row budget says "narrow the capture", where the reason
     // code alone says only "somebody said no".

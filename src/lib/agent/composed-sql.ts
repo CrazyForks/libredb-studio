@@ -81,9 +81,10 @@ export const MAX_CATALOG_SELECTOR_LENGTH = 128;
  * how many reads the inventory takes and a single composed monster would have to be
  * verified per dialect anyway. Each kind is one bounded read (`sql.query.read`)
  * under the same descriptor, so the split costs statements out of the run's budget
- * and buys nothing in privilege — which is exactly the trade the row cap forces:
- * one flat projection per kind stays diagnosable when it overflows, where a nested
- * aggregate would come back as one unreadable row-per-table blob.
+ * and buys nothing in privilege — which is exactly the trade the row cap forces.
+ * The PostgreSQL column kind aggregates its columns per table so a stock image's
+ * own catalog cannot overflow the cap (B52); the relation and index kinds stay
+ * flat, where an overflow is a narrowing the selector names.
  *
  * `statistics` is the newest and the only one whose values are ESTIMATES: it reads
  * what the engine already recorded about table sizes and column distributions, and
@@ -153,14 +154,52 @@ function equalsClause(column: string, value: string | undefined, field: string, 
   return ` AND ${column} = ${quoteLiteral(assertSelector(value, field), dialect)}`;
 }
 
+/**
+ * The column inventory, one row per TABLE with its columns aggregated (B52).
+ *
+ * The projection used to be one row per COLUMN. Against `maxResultRows: 200` that
+ * refused an unnarrowed capture on any PostgreSQL image whose own catalogs are wide
+ * before the user creates anything. Two measurements exist and they disagree by
+ * design, so each is stated with what it was taken UNDER: as a least-privilege agent
+ * role on 2026-08-20, TimescaleDB answered 478 flat rows, Cloudberry 289 and AlloyDB
+ * Omni 536; re-measured on 2026-09-01 with the aggregation in place and two seeded
+ * user tables, the same reads answer 46, 67 and 70 OBJECT rows. The totals are
+ * per-role and per-image and mean nothing without both.
+ *
+ * `json_agg … ORDER BY ordinal_position` keeps the column order, which is the one
+ * property the flat projection used to guarantee. The object keys are the ones
+ * `buildPostgresTables` reads (`name`, `type`, `nullable`), so the fold parses one
+ * array per table instead of one row per column.
+ *
+ * MEASURED ON, and only on, the three servers B52 named plus stock PostgreSQL: the
+ * aggregate runs on Cloudberry's MPP planner, which is the one that refuses other
+ * reads with `multiple segworker groups is not supported`. NOT measured on the
+ * jsonb-only relatives in `WIRE_COMPATIBLE_ENGINES` — Materialize and RisingWave
+ * have no `json` type and may not carry `json_agg`/`json_build_object` at all. Both
+ * are `query-only` there and claim no grounding, so nothing regressed that was
+ * promised; a run that ever claims grounding on either has to measure this read
+ * first.
+ *
+ * The row budget now counts TABLES rather than columns, which is what a wide
+ * catalog needs; two bounds still stand and are worth naming. A schema with more
+ * than `maxResultRows` tables is still refused — B52 removes the per-column
+ * overflow, not the per-table one — and a single table whose aggregated JSON
+ * exceeds `maxResultBytes` is refused by the byte budget, the same backstop every
+ * read meets, measured over the serialized rows. The model-facing pack then
+ * bounds the prompt independently (`MAX_COLUMNS_PER_TABLE`,
+ * `AGENT_CONTEXT_PACK_MAX_CHARS`), so a wide table does not spend the context
+ * window on itself.
+ */
 function composePostgresCatalog(selector: AgentCatalogSelector): string {
   return (
-    "SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position " +
+    "SELECT table_schema, table_name, json_agg(json_build_object(" +
+    "'name', column_name, 'type', data_type, 'nullable', is_nullable) " +
+    "ORDER BY ordinal_position) AS columns " +
     "FROM information_schema.columns " +
     "WHERE table_schema NOT IN ('pg_catalog', 'information_schema')" +
     equalsClause("table_schema", selector.schema, "schema", "postgres") +
     equalsClause("table_name", selector.table, "table", "postgres") +
-    " ORDER BY table_schema, table_name, ordinal_position"
+    " GROUP BY table_schema, table_name ORDER BY table_schema, table_name"
   );
 }
 
@@ -638,14 +677,9 @@ const ESTIMATING_EXPLAIN_PREFIX: Partial<Record<DatabaseType, string>> = {
  * claims to be whole is worse than a refusal a caller can narrow — and the selector
  * is how a caller narrows it.
  *
- * KNOWN LIMITATION, with its number: the PostgreSQL projection is one row per COLUMN,
- * so against `maxResultRows: 200` an unnarrowed call overflows at roughly 25 tables of
- * eight columns and comes back as a repairable database error. The engine's message
- * names the budget, so it is diagnosable, but it does cost one repair attempt. The
- * SQLite side is one row per OBJECT and is nowhere near the cap. Making the two
- * symmetric means aggregating columns per table, which changes what a caller parses
- * out of the result — that decision belongs with the context snapshot that consumes
- * it, not here.
+ * The PostgreSQL column kind aggregates its columns per table (B52), one row per
+ * OBJECT and symmetric with the SQLite side, so a stock image's own wide catalog
+ * no longer overflows the row cap before the user has created anything.
  */
 export function composeCatalogRead(dialect: DatabaseType, selector: AgentCatalogSelector): string {
   if (!Object.hasOwn(CATALOG_COMPOSERS, dialect)) {

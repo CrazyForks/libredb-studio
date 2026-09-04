@@ -182,16 +182,20 @@ const ASSESSMENT = "Tell me what is wrong with this database.";
 
 /** One under-populated, unindexed foreign key — the shape Autopilot's index section was for. */
 const PG_COLUMNS = [
-  { table_schema: "public", table_name: "employees", column_name: "emp_no", data_type: "integer", is_nullable: "NO" },
   {
     table_schema: "public",
     table_name: "employees",
-    column_name: "department_id",
-    data_type: "integer",
-    is_nullable: "YES",
+    columns: [
+      { name: "emp_no", type: "integer", nullable: "NO" },
+      { name: "department_id", type: "integer", nullable: "YES" },
+      { name: "hired_on", type: "date", nullable: "YES" },
+    ],
   },
-  { table_schema: "public", table_name: "employees", column_name: "hired_on", data_type: "date", is_nullable: "YES" },
-  { table_schema: "public", table_name: "departments", column_name: "id", data_type: "integer", is_nullable: "NO" },
+  {
+    table_schema: "public",
+    table_name: "departments",
+    columns: [{ name: "id", type: "integer", nullable: "NO" }],
+  },
 ];
 
 const PG_RELATIONS = [
@@ -237,7 +241,7 @@ const SQLITE_OBJECTS = [
 const INVENTORY: Readonly<Record<"postgres" | "sqlite", (sql: string) => ReturnType<typeof rows> | null>> = {
   postgres: (sql) => {
     if (sql.includes("information_schema.columns")) {
-      return rows(PG_COLUMNS, ["table_schema", "table_name", "column_name", "data_type", "is_nullable"]);
+      return rows(PG_COLUMNS, ["table_schema", "table_name", "columns"]);
     }
     if (sql.includes("pg_constraint")) {
       return rows(PG_RELATIONS, [

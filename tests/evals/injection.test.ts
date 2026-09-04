@@ -78,11 +78,17 @@ function expectEnvelopeIntact(transcript: string): void {
 
 const pgCatalogRows = (tableName: string, columnName: string) => ({
   rows: [
-    { table_schema: "public", table_name: tableName, column_name: "id", data_type: "integer", is_nullable: "NO" },
-    { table_schema: "public", table_name: tableName, column_name: columnName, data_type: "text", is_nullable: "YES" },
+    {
+      table_schema: "public",
+      table_name: tableName,
+      columns: [
+        { name: "id", type: "integer", nullable: "NO" },
+        { name: columnName, type: "text", nullable: "YES" },
+      ],
+    },
   ],
-  fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
-  rowCount: 2,
+  fields: ["table_schema", "table_name", "columns"],
+  rowCount: 1,
   executionTime: 3,
 });
 

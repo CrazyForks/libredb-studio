@@ -827,8 +827,9 @@ export type AgentRunEvent =
        * (`docs/llms/setup.md`) and, for exactly the case an operator has to diagnose, it
        * was not: the refusal branch pushed a sentence into the prompt and returned, so a
        * plan run whose capture was refused left four events and nothing between the
-       * second and the third. The measured cost is B52 — 536 rows against a 200-row
-       * budget on a live AlloyDB Omni — where the reason code, the numbers and the
+       * second and the third. The measured cost at the time was the grounding refusal
+       * B52 later fixed — 536 rows against a 200-row budget on a live AlloyDB Omni —
+       * where the reason code, the numbers and the
        * catalog read were all computed, handed to the model, and then dropped. And a
        * missing event is worse here than missing telemetry: it reads as work that was
        * not needed rather than knowledge that was lost.

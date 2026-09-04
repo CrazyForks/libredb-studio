@@ -70,6 +70,18 @@ describe("composeCatalogRead — PostgreSQL", () => {
   test("orders the rows, so two identical inventories serialise identically", () => {
     expect(composeCatalogRead("postgres", {})).toContain("ORDER BY");
   });
+
+  test("aggregates the columns per table, one row per object (B52)", () => {
+    const sql = composeCatalogRead("postgres", {});
+
+    expect(sql).toContain("json_agg");
+    expect(sql).toContain("json_build_object");
+    expect(sql).toContain("GROUP BY table_schema, table_name");
+    expect(sql).toContain("ORDER BY ordinal_position");
+    // The projection is per table: the column names sit only inside the aggregated
+    // object, never as top-level select items.
+    expect(sql).not.toContain("column_name, data_type, is_nullable");
+  });
 });
 
 describe("composeCatalogRead — SQLite", () => {

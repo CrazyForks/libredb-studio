@@ -40,7 +40,7 @@ None of it is a GitHub issue.
 - [Security Phase 2 deferrals](#security-phase-2-deferrals) — C3–C10 · 8
 - [Security Phase 3 deferrals](#security-phase-3-deferrals) — K4
 - [Agent M1 deferrals (#328)](#agent-m1-deferrals-328) — A1–A5 · 4
-- [Agent M2 deferrals (#329)](#agent-m2-deferrals-329) — B2–B75 · 22
+- [Agent M2 deferrals (#329)](#agent-m2-deferrals-329) — B2–B76 · 22
 
 ---
 
@@ -1809,66 +1809,6 @@ a run resumed often enough passes any constant.
 per-drive constant — most likely as part of B6 — with a test that drives one run twice past the cap and
 shows the first drive's cited results still readable, or the surface stating that they are not.
 
-### B52. The grounding capture's row cap is reached by what the image ships, not by a wide user schema
-
-`composeCatalogRead` records a known limitation with a number: the PostgreSQL projection is one row per
-COLUMN against `maxResultRows: 200`, so an unnarrowed call "overflows at roughly 25 tables of eight
-columns". That estimate frames the cap as something a large user schema reaches. Three measurements say
-otherwise.
-
-**TimescaleDB — two user tables are enough.** Measured 2026-08-20 against
-`timescale/timescaledb:latest-pg17` (2.29.2 on PostgreSQL 17.11). `information_schema.columns` outside
-`pg_catalog` and `information_schema` answers **478 rows**, of which **473 belong to the extension** and
-**5 are the user's**. The read is refused rather than truncated, by design, so the plan run answers
-ungrounded with "This run was given no inventory of this database." The identical run against plain
-PostgreSQL 18 captured "3 tables, fingerprint ctx_0d63" and named them. Granting the agent role USAGE
-and SELECT on the internal schemas does not change the outcome, so this is the row cap and not a
-privilege.
-
-**Cloudberry — and it is not an extension.** Measured against `woblerr/cloudberry:2.1.0-incubating`
-(PostgreSQL 14.4) with the same two user tables: `CATALOG_READ_REFUSED`, "289 rows > 200 allowed". **282
-of those 289 belong to `gp_toolkit`.** The figure is per-role: the same read as `gpadmin` answers **481**
-rows. Cloudberry is a PostgreSQL fork rather than a PostgreSQL carrying an extension, so what
-generalises is narrower than the first measurement suggested — any PostgreSQL-wire server whose own
-catalogs are wide before the user creates anything.
-
-Cloudberry also fails one step earlier, which matters for anyone trying to work around this. Its usual
-login is `gpadmin`, a superuser, and the agent's execution profile refuses that role as too broad. So
-the row budget is only reached after a least-privilege `agentUser` has been created by hand — and it is
-then reached anyway.
-
-**AlloyDB Omni settles which fix is viable.** Measured against `google/alloydbomni:17.9.0` (PostgreSQL
-17.9), same two user tables: `CATALOG_READ_REFUSED`, "536 rows > 200 allowed". Only **7 of the 536 are
-the user's**. As the agent role sees it: `public` **348**, `google_ml` 144, `ai` 44 — and **341 of the
-348 in `public` are the 49 extension views the image installs into `public` itself**.
-
-That is what makes it decisive. On TimescaleDB and Cloudberry the overflow sits in a separate internal
-schema, so the candidate fix "exclude the schemas the object browser already treats as internal" would
-rescue both. Here it rescues nothing: narrowing to `schema=public` still refuses, at **348 rows against
-200**. The only selector that fits is a single table (`schema=public table=orders` projects 4 rows),
-which is not a schema capture at all.
-
-**So of the two candidate fixes only one survives: aggregate columns per table so the projection is one
-row per OBJECT, symmetric with the SQLite side. The schema-exclusion fix is refuted and should not be
-attempted.**
-
-Two controls keep the AlloyDB numbers attributable. Plain PostgreSQL 18.4, in the same pass, projects
-**7 rows** and captures its 2 tables. And the `relations` capture kind projects 0 rows as the agent role
-and 3 as a superuser on AlloyDB — but the plain PostgreSQL baseline behaves identically, so that is
-PostgreSQL's own privilege rule (B44) and not an AlloyDB property.
-
-AlloyDB Omni also fails the earlier step, for Cloudberry's reason: as the image's own `postgres`
-superuser both profiles are refused with `PROFILE_PRIVILEGES_TOO_BROAD`. With a hand-made
-least-privilege role both acquire and `queryReadOnly` is present, so the boundary works — and the capture
-is refused anyway.
-
-The consequence: the agent is unusable out of the box on TimescaleDB, Cloudberry and AlloyDB Omni, and
-the same shape will appear on any PostgreSQL-wire server whose image ships wide catalogs or wide
-extension views before the user creates anything.
-
-**Done when:** a plan run against a stock TimescaleDB, one against a stock Cloudberry and one against a
-stock AlloyDB Omni all report a captured schema naming the user's tables.
-
 ### B59. Per-model instructions have nowhere to go, and the mechanism that held them is gone
 
 Wording is measured, not constant: this repository twice changed a shared sentence, won several
@@ -2025,3 +1965,31 @@ so), and none of them has been measured.
 
 **Done when:** a resume onto a repointed connection does one stated thing, and the run's own record
 says which.
+
+### B76. The aggregated grounding capture admits the image's own extension views
+
+The aggregation that fixed the row-cap refusal made a stock image's wide catalog capture SUCCEED instead
+of refusing, and the price
+is that it succeeds by admitting the image's own objects. Measured live on 2026-09-01 against the
+`compat` profile images (`database-compose.yml`), with two user tables seeded:
+
+- TimescaleDB (`timescale/timescaledb:latest-pg17`): 385 column rows aggregate to 46 tables.
+- Cloudberry (`woblerr/cloudberry:2.1.0-incubating`): 479 to 67 as gpadmin, 53 as a least-privilege role.
+- AlloyDB Omni (`google/alloydbomni:17.9.0`): 542 to 70 as postgres, 69 as a least-privilege role.
+
+AlloyDB is the sharp case: the least-privilege role's 69 tables are 2 user tables plus 67 extension views,
+and where they SIT is the part that makes them noise rather than a schema to exclude — 49 of them are
+installed into `public` itself (`google_db_advisor_*`, `hypopg_list_indexes`), beside 14 in `google_ml` and
+4 in `ai`. Not a privilege leak —
+`information_schema.columns` applies its own visibility rules and the role genuinely sees those views —
+but grounding noise: the inventory a run reasons over is mostly objects the user did not create, and the
+model-facing pack spends `AGENT_CONTEXT_PACK_MAX_CHARS` ranking them against the objective. The old flat
+projection had the same object set; it just refused before any of it reached a run.
+
+The candidate fixes are the ones the row-cap fix recorded and set aside: filter by `table_type`, or
+exclude the objects the object browser already treats as internal. That fix refuted only the
+schema-exclusion variant AS A FIX FOR THE ROW CAP; as a fix for grounding noise the question is open and
+unmeasured.
+
+**Done when:** a run grounded on one of these images reasons over the user's objects — or the internal
+ones are excluded — with a test per shape (TimescaleDB, Cloudberry, AlloyDB Omni).

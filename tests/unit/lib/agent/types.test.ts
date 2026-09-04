@@ -150,7 +150,8 @@ const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
   // The capture that was REFUSED (B54). Its own kind rather than the entry above
   // carrying an absence, and the fixture is the row-budget case because that is the
   // shape with fields to get wrong — and because it is the one an operator has to
-  // diagnose: B52's 536 rows against a 200-row bound. No `tableCount` and no
+  // diagnose: 536 rows against a 200-row bound (the B52 measurement, now fixed). No
+  // `tableCount` and no
   // `fingerprint` exist on it at all, which is the absence rule in the type system
   // rather than in a convention (#477).
   "context-unavailable": {

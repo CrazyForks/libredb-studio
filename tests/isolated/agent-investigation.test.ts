@@ -827,19 +827,15 @@ describe("planning mode runs no statement of the user's", () => {
             {
               table_schema: "public",
               table_name: "orders",
-              column_name: "customer_id",
-              data_type: "character varying",
-              is_nullable: "NO",
+              columns: [{ name: "customer_id", type: "character varying", nullable: "NO" }],
             },
             {
               table_schema: "public",
               table_name: "customers",
-              column_name: "id",
-              data_type: "character varying",
-              is_nullable: "NO",
+              columns: [{ name: "id", type: "character varying", nullable: "NO" }],
             },
           ],
-          fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
+          fields: ["table_schema", "table_name", "columns"],
           rowCount: 2,
         });
       }
@@ -930,11 +926,9 @@ describe("planning mode runs no statement of the user's", () => {
             rows: Array.from({ length: 300 }, (_unused, index) => ({
               table_schema: "public",
               table_name: `department_table_${index}`,
-              column_name: "identifier_column",
-              data_type: "character varying",
-              is_nullable: "NO",
+              columns: [{ name: "identifier_column", type: "character varying", nullable: "NO" }],
             })),
-            fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
+            fields: ["table_schema", "table_name", "columns"],
             rowCount: 300,
           })
         : queryResult({ rows: [], fields: [], rowCount: 0 });
@@ -1114,27 +1108,19 @@ describe("planning mode runs no statement of the user's", () => {
             {
               table_schema: "public",
               table_name: "orders",
-              column_name: "id",
-              data_type: "integer",
-              is_nullable: "NO",
-            },
-            {
-              table_schema: "public",
-              table_name: "orders",
-              column_name: "customer_id",
-              data_type: "integer",
-              is_nullable: "NO",
+              columns: [
+                { name: "id", type: "integer", nullable: "NO" },
+                { name: "customer_id", type: "integer", nullable: "NO" },
+              ],
             },
             {
               table_schema: "public",
               table_name: "customers",
-              column_name: "id",
-              data_type: "integer",
-              is_nullable: "NO",
+              columns: [{ name: "id", type: "integer", nullable: "NO" }],
             },
           ],
-          fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
-          rowCount: 3,
+          fields: ["table_schema", "table_name", "columns"],
+          rowCount: 2,
         });
       }
       if (sql.includes("pg_constraint")) {
@@ -1767,12 +1753,10 @@ describe("planning mode runs no statement of the user's", () => {
                 {
                   table_schema: "public",
                   table_name: "invoices",
-                  column_name: "id",
-                  data_type: "integer",
-                  is_nullable: "NO",
+                  columns: [{ name: "id", type: "integer", nullable: "NO" }],
                 },
               ],
-              fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
+              fields: ["table_schema", "table_name", "columns"],
               rowCount: 1,
             })
           : queryResult({ rows: [], fields: [], rowCount: 0 });
@@ -1838,11 +1822,9 @@ describe("planning mode runs no statement of the user's", () => {
           rows: Array.from({ length: 300 }, (_, index) => ({
             table_schema: "public",
             table_name: `department_table_${index}`,
-            column_name: "identifier_column",
-            data_type: "character varying",
-            is_nullable: "NO",
+            columns: [{ name: "identifier_column", type: "character varying", nullable: "NO" }],
           })),
-          fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
+          fields: ["table_schema", "table_name", "columns"],
           rowCount: 300,
         });
       }
@@ -2387,10 +2369,18 @@ describe("planning mode runs no statement of the user's", () => {
       sql.includes("information_schema.columns")
         ? queryResult({
             rows: [
-              { table_schema: "public", table_name: "film", column_name: "title", data_type: "text" },
-              { table_schema: "public", table_name: "actor", column_name: "name", data_type: "text" },
+              {
+                table_schema: "public",
+                table_name: "film",
+                columns: [{ name: "title", type: "text", nullable: "NO" }],
+              },
+              {
+                table_schema: "public",
+                table_name: "actor",
+                columns: [{ name: "name", type: "text", nullable: "NO" }],
+              },
             ],
-            fields: ["table_schema", "table_name", "column_name", "data_type"],
+            fields: ["table_schema", "table_name", "columns"],
             rowCount: 2,
           })
         : queryResult({ rows: [], fields: [], rowCount: 0 });

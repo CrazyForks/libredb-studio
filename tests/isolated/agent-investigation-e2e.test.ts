@@ -105,56 +105,26 @@ function engineRows(data: Record<string, unknown>[]): EngineAnswer {
 
 /**
  * The column inventory `information_schema.columns` answers for this fixture's two
- * tables — one row per column, which is the projection `composed-sql.ts` composes.
+ * tables — one row per table, which is the projection `composed-sql.ts` composes.
  */
 const PG_COLUMN_ROWS: Record<string, unknown>[] = [
   {
     table_schema: "public",
     table_name: "customers",
-    column_name: "id",
-    data_type: "integer",
-    is_nullable: "NO",
-    ordinal_position: 1,
-  },
-  {
-    table_schema: "public",
-    table_name: "customers",
-    column_name: "name",
-    data_type: "text",
-    is_nullable: "NO",
-    ordinal_position: 2,
+    columns: [
+      { name: "id", type: "integer", nullable: "NO" },
+      { name: "name", type: "text", nullable: "NO" },
+    ],
   },
   {
     table_schema: "public",
     table_name: "orders",
-    column_name: "id",
-    data_type: "integer",
-    is_nullable: "NO",
-    ordinal_position: 1,
-  },
-  {
-    table_schema: "public",
-    table_name: "orders",
-    column_name: "customer_id",
-    data_type: "integer",
-    is_nullable: "NO",
-    ordinal_position: 2,
-  },
-  {
-    table_schema: "public",
-    table_name: "orders",
-    column_name: "status",
-    data_type: "text",
-    is_nullable: "NO",
-    ordinal_position: 3,
-  },
-  {
-    table_schema: "public",
-    table_name: "orders",
-    column_name: "total_cents",
-    data_type: "integer",
-    is_nullable: "NO",
-    ordinal_position: 4,
+    columns: [
+      { name: "id", type: "integer", nullable: "NO" },
+      { name: "customer_id", type: "integer", nullable: "NO" },
+      { name: "status", type: "text", nullable: "NO" },
+      { name: "total_cents", type: "integer", nullable: "NO" },
+    ],
   },
 ];
 
@@ -742,11 +712,12 @@ describe("the whole investigation, against the PostgreSQL suite's engine fixture
       columnNames: ["status", "order_count"],
       rowCount: 2,
       rowValue: "paid",
-      // The PostgreSQL catalog read is a structured column inventory, so a column of
-      // the table the selector narrowed to is what the model sees.
+      // The PostgreSQL catalog read is a structured column inventory, aggregated per
+      // table (B52), so a column of the table the selector narrowed to is what the
+      // model sees.
       catalogText: "customer_id",
-      // One row per COLUMN of `orders`, and none of `customers`.
-      catalogRowCount: 4,
+      // One row per TABLE: the selector narrowed to `orders`, so exactly one.
+      catalogRowCount: 1,
       rows: PG_STATUS_ROWS,
     });
   });

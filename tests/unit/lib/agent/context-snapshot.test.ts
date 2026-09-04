@@ -18,6 +18,7 @@ import type { AgentToolContext } from "@/lib/agent/tools";
 import type { AgentContextSnapshot, AgentRunEvent } from "@/lib/agent/types";
 import { UNTRUSTED_CONTENT_BEGIN, UNTRUSTED_CONTENT_END } from "@/lib/agent/untrusted-content";
 import { ConnectionError, ExecutionProfileError, QueryError } from "@/lib/db/errors";
+import { measureResultBytes } from "@/lib/db/providers/sql/read-only-budget";
 import { ExecutionArtifactStore } from "@/lib/db/operations/artifacts";
 import { ExecutionBudgetTracker } from "@/lib/db/operations/budgets";
 import {
@@ -74,19 +75,25 @@ function result(rows: readonly Record<string, unknown>[]): QueryResult {
   };
 }
 
-/** What a PostgreSQL server answers each of the three composed catalog reads. */
+/** What a PostgreSQL server answers the composed column read: one row per table (B52). */
 const PG_COLUMNS = [
-  { table_schema: "public", table_name: "orders", column_name: "id", data_type: "integer", is_nullable: "NO" },
   {
     table_schema: "public",
     table_name: "orders",
-    column_name: "customer_id",
-    data_type: "integer",
-    is_nullable: "NO",
+    columns: [
+      { name: "id", type: "integer", nullable: "NO" },
+      { name: "customer_id", type: "integer", nullable: "NO" },
+      { name: "total", type: "numeric", nullable: "YES" },
+    ],
   },
-  { table_schema: "public", table_name: "orders", column_name: "total", data_type: "numeric", is_nullable: "YES" },
-  { table_schema: "public", table_name: "customers", column_name: "id", data_type: "integer", is_nullable: "NO" },
-  { table_schema: "public", table_name: "customers", column_name: "name", data_type: "text", is_nullable: "YES" },
+  {
+    table_schema: "public",
+    table_name: "customers",
+    columns: [
+      { name: "id", type: "integer", nullable: "NO" },
+      { name: "name", type: "text", nullable: "YES" },
+    ],
+  },
 ];
 
 const PG_RELATIONS = [
@@ -248,6 +255,189 @@ describe("captureContextSnapshot — PostgreSQL", () => {
   });
 });
 
+/**
+ * B52 measured the failure on three PostgreSQL-wire servers whose own catalogs are
+ * wide before the user creates anything: TimescaleDB, Cloudberry and AlloyDB Omni.
+ * Each answered hundreds of COLUMN rows against `maxResultRows: 200` under the old
+ * flat projection, so the capture was refused. The aggregated projection answers
+ * one row per TABLE, which is what these fixtures model: the column count of each
+ * shape is deliberately above 200 while the table count stays far below it, and the
+ * capture must still succeed and name the user's tables.
+ */
+describe("captureContextSnapshot — wide PostgreSQL catalogs (B52)", () => {
+  const USER_TABLES = [
+    {
+      table_schema: "public",
+      table_name: "orders",
+      columns: [{ name: "id", type: "integer", nullable: "NO" }],
+    },
+    {
+      table_schema: "public",
+      table_name: "customers",
+      columns: [{ name: "id", type: "integer", nullable: "NO" }],
+    },
+  ];
+
+  const extensionRows = (schema: string, tables: number, columnsPerTable: number) =>
+    Array.from({ length: tables }, (_unused, tableIndex) => ({
+      table_schema: schema,
+      table_name: `ext_table_${tableIndex}`,
+      columns: Array.from({ length: columnsPerTable }, (_unused, columnIndex) => ({
+        name: `col_${columnIndex}`,
+        type: "integer",
+        nullable: "NO",
+      })),
+    }));
+
+  const cases = [
+    // TimescaleDB: 30 extension tables × 16 columns = 480 column rows in the flat shape.
+    { name: "TimescaleDB", schema: "_timescaledb_catalog", tables: 30, columnsPerTable: 16 },
+    // Cloudberry: 80 `gp_toolkit` views × 4 columns = 320 column rows.
+    { name: "Cloudberry", schema: "gp_toolkit", tables: 80, columnsPerTable: 4 },
+    // AlloyDB Omni: 60 extension views in `public` × 9 columns = 540 column rows.
+    { name: "AlloyDB Omni", schema: "public", tables: 60, columnsPerTable: 9 },
+  ];
+
+  for (const server of cases) {
+    test(`a ${server.name}-shaped catalog captures, and names the user's tables`, async () => {
+      const h = harness("postgres", async (sql: string) => {
+        if (sql.includes("information_schema.columns")) {
+          return result([...extensionRows(server.schema, server.tables, server.columnsPerTable), ...USER_TABLES]);
+        }
+        return result([]);
+      });
+
+      const capture = await captureContextSnapshot(h.context);
+
+      expect(capture.kind).toBe("captured");
+      if (capture.kind !== "captured") throw new Error("unreachable");
+      expect(capture.snapshot.tables.map((table) => table.name)).toEqual(
+        expect.arrayContaining(["public.orders", "public.customers"]),
+      );
+    });
+  }
+
+  test("reads columns that arrive as a JSON string, from another transport", async () => {
+    const h = harness("postgres", async (sql: string) =>
+      sql.includes("information_schema.columns")
+        ? result([
+            {
+              table_schema: "public",
+              table_name: "orders",
+              columns: JSON.stringify([{ name: "id", type: "integer", nullable: "NO" }]),
+            },
+          ])
+        : result([]),
+    );
+
+    const capture = await captureContextSnapshot(h.context);
+
+    expect(capture.kind).toBe("captured");
+    if (capture.kind !== "captured") throw new Error("unreachable");
+    expect(capture.snapshot.tables.find((table) => table.name === "public.orders")?.columns).toEqual([
+      { name: "id", type: "integer", nullable: false, isPrimary: false },
+    ]);
+  });
+
+  test("a malformed columns value yields an empty column list, never a lost snapshot", async () => {
+    // `'"nope"'` is the one that parses and is still not an inventory: valid JSON,
+    // wrong shape, which is a different arm from text that does not parse at all.
+    for (const malformed of [null, "", "not json", '"nope"', 42, { name: "id" }]) {
+      const h = harness("postgres", async (sql: string) =>
+        sql.includes("information_schema.columns")
+          ? result([{ table_schema: "public", table_name: "orders", columns: malformed }])
+          : result([]),
+      );
+
+      const capture = await captureContextSnapshot(h.context);
+
+      expect(capture.kind).toBe("captured");
+      if (capture.kind !== "captured") throw new Error("unreachable");
+      const columns = capture.snapshot.tables.find((table) => table.name === "public.orders")?.columns;
+      expect(columns, `columns = ${JSON.stringify(malformed)}`).toEqual([]);
+    }
+  });
+
+  /**
+   * The element-level half of the same guard, and the one that bites: an array PASSES
+   * `Array.isArray`, so a non-object element reaches the fold and `column.name` is read
+   * off it. On `null` that is a TypeError, and `plan.build` runs OUTSIDE the catch in
+   * `readInventory`, so it would not degrade the capture — it would end the run
+   * `internal`, which is the shape B48 exists to keep out of this path.
+   *
+   * A bad element is dropped rather than emptying the list, because the rest of the
+   * array is still a column inventory: losing one entry says less than losing the table.
+   */
+  test("drops column entries that are not objects, and keeps the ones that are", async () => {
+    const h = harness("postgres", async (sql: string) =>
+      sql.includes("information_schema.columns")
+        ? result([
+            {
+              table_schema: "public",
+              table_name: "orders",
+              columns: [null, "id", 42, { name: "customer_id", type: "integer", nullable: "NO" }],
+            },
+          ])
+        : result([]),
+    );
+
+    const capture = await captureContextSnapshot(h.context);
+
+    expect(capture.kind).toBe("captured");
+    if (capture.kind !== "captured") throw new Error("unreachable");
+    expect(capture.snapshot.tables.find((table) => table.name === "public.orders")?.columns).toEqual([
+      { name: "customer_id", type: "integer", nullable: false, isPrimary: false },
+    ]);
+  });
+
+  test("a JSON string of non-object entries yields an empty column list", async () => {
+    const h = harness("postgres", async (sql: string) =>
+      sql.includes("information_schema.columns")
+        ? result([{ table_schema: "public", table_name: "orders", columns: "[null, 1]" }])
+        : result([]),
+    );
+
+    const capture = await captureContextSnapshot(h.context);
+
+    expect(capture.kind).toBe("captured");
+    if (capture.kind !== "captured") throw new Error("unreachable");
+    expect(capture.snapshot.tables.find((table) => table.name === "public.orders")?.columns).toEqual([]);
+  });
+
+  test("preserves column order for a wide table, and the aggregated payload stays inside the byte budget", async () => {
+    const width = 2_000;
+    const rows = [
+      {
+        table_schema: "public",
+        table_name: "wide",
+        columns: Array.from({ length: width }, (_unused, index) => ({
+          name: `col_${index}`,
+          type: "integer",
+          nullable: "NO",
+        })),
+      },
+    ];
+
+    // The byte budget is the backstop the row budget leaves behind: even a
+    // 2,000-column table, aggregated into one JSON array, stays under the
+    // 262_144-byte cap the read-only profile enforces.
+    expect(measureResultBytes(rows)).toBeLessThan(262_144);
+
+    const h = harness("postgres", async (sql: string) =>
+      sql.includes("information_schema.columns") ? result(rows) : result([]),
+    );
+
+    const capture = await captureContextSnapshot(h.context);
+
+    expect(capture.kind).toBe("captured");
+    if (capture.kind !== "captured") throw new Error("unreachable");
+    const columns = capture.snapshot.tables.find((table) => table.name === "public.wide")?.columns;
+    expect(columns).toHaveLength(width);
+    expect(columns?.[0]?.name).toBe("col_0");
+    expect(columns?.[width - 1]?.name).toBe(`col_${width - 1}`);
+  });
+});
+
 describe("captureContextSnapshot — SQLite", () => {
   test("takes two reads, because the table DDL carries the relations as well", async () => {
     const h = harness("sqlite");
@@ -317,16 +507,13 @@ describe("captureContextSnapshot — the fingerprint", () => {
 
     const withColumn = harness("postgres", async (sql: string) =>
       sql.includes("information_schema.columns")
-        ? result([
-            ...PG_COLUMNS,
-            {
-              table_schema: "public",
-              table_name: "orders",
-              column_name: "note",
-              data_type: "text",
-              is_nullable: "YES",
-            },
-          ])
+        ? result(
+            PG_COLUMNS.map((row) =>
+              row.table_name === "orders"
+                ? { ...row, columns: [...row.columns, { name: "note", type: "text", nullable: "YES" }] }
+                : row,
+            ),
+          )
         : answerPostgres(sql),
     );
     const withIndex = harness("postgres", async (sql: string) =>
@@ -367,7 +554,18 @@ describe("captureContextSnapshot — the fingerprint", () => {
     // A column that changed type, keeping its name and position.
     const withRetypedColumn = harness("postgres", async (sql: string) =>
       sql.includes("information_schema.columns")
-        ? result(PG_COLUMNS.map((row) => (row.column_name === "total" ? { ...row, data_type: "bigint" } : row)))
+        ? result(
+            PG_COLUMNS.map((row) =>
+              row.table_name === "orders"
+                ? {
+                    ...row,
+                    columns: row.columns.map((column) =>
+                      column.name === "total" ? { ...column, type: "bigint" } : column,
+                    ),
+                  }
+                : row,
+            ),
+          )
         : answerPostgres(sql),
     );
 
