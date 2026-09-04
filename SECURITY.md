@@ -2,14 +2,17 @@
 
 ## Supported Versions
 
-We actively support and provide security updates for the following versions of LibreDB Studio:
+<!-- No version number belongs in this section. A hardcoded minor here has no gate behind it:
+     nothing in CI reads it, so it silently rots every release and then reads as an abandoned
+     policy to the one auditor it exists for. State the rule instead; the releases page is the
+     source of truth. Pinned by tests/security/vulnerability-disclosure.test.ts. -->
 
-| Version  | Supported          |
-| -------- | ------------------ |
-| 0.10.x   | :white_check_mark: |
-| < 0.10.0 | :x:                |
+Security fixes are released against the **latest published release only**. There is no long-term
+support branch and no backport policy: if you are running an older version, the upgrade path to a
+fix is the current release.
 
-> **Note**: We recommend always using the latest version to ensure you have the most recent security patches.
+The releases page is the authority on what that currently is:
+<https://github.com/libredb/libredb-studio/releases>
 
 ## Reporting a Vulnerability
 
@@ -233,9 +236,9 @@ trivy image --format cyclonedx --scanners license \
 ### Security Updates
 
 Security updates will be released as:
-- **Patch releases** (e.g., 0.5.4 → 0.5.5) for critical security fixes
-- **Minor releases** (e.g., 0.5.x → 0.6.0) for security improvements
-- **Security advisories** will be published in the GitHub Security tab
+- **Patch releases** for critical security fixes
+- **Minor releases** for security improvements
+- **Security advisories** published in the GitHub Security tab
 
 ### Security Audit
 
