@@ -51,10 +51,14 @@ export interface AgentModelProfile {
   /**
    * How many extra turns a PLAN run gets when its prose named no statement and no refusal.
    *
-   * Zero by default, because a run that answered its objective is not obviously owed another
-   * turn, and 24 models clear this bar unaided. `qwen3:14b` is the measured case: its losing
-   * plan describes all eight tables and every relation and then stops without the fenced
-   * statement or the explicit refusal that plan mode scores.
+   * Stated by every measured profile, and the number a profile states is what that model gets:
+   * 0 where the model was watched declining the ask, 1 where the extra turn is what closed the
+   * cell. `qwen3:14b` is the measured case for 1 — its losing plan describes all eight tables and
+   * every relation and then stops without the fenced statement or the explicit refusal that plan
+   * mode scores.
+   *
+   * A model with no profile is a different question, and it is answered in `planStatementAsksFor`
+   * rather than here: absence is not a measurement, so an unmeasured model is asked once.
    */
   readonly planStatementRetries?: number;
 
@@ -235,6 +239,14 @@ export interface AgentNotices {
   readonly reportReminder: string;
   /** A PLAN run whose prose carried neither a runnable statement nor an explicit refusal. */
   readonly planStatement: string;
+  /**
+   * A turn the per-call ceiling cut off, on a run whose own deadline still has room.
+   *
+   * The one stop shape in the drive that had no recovery path. Measured on `qwen3.6:35b`: nine
+   * losses, every one cut at the ceiling with 333 to 353 seconds of a 450-second deadline and 34
+   * of 36 turns unspent, while the same cell's longest PASSING run took 183 seconds.
+   */
+  readonly turnCutOff: string;
   /** An answer-presenting run about to report a result it read but never presented. */
   readonly presentBeforeReport: string;
   /** A run that stopped without calling anything, having asked for what it could have read. */
@@ -263,7 +275,12 @@ export const DEFAULT_REPORT_REMINDER_LIMIT = 1;
  * No extra turn, which is what every locked plan cell was measured against.
  *
  * A plan run that produced prose has answered or it has not, and the verifier reads that for
- * itself. Offering another turn to every model would change 24 models' runs to reach one.
+ * itself. This is the number a MEASURED profile falls back to when it states none, and every
+ * profile that ships states one, so in practice it changes no measured model's run.
+ *
+ * It is not what an unmeasured model gets. That is `planStatementAsksFor`, which answers 1: a
+ * model nobody has watched has not been watched declining the ask either, and refusing it a turn
+ * on the strength of a missing measurement is the server deciding by silence.
  */
 export const DEFAULT_PLAN_STATEMENT_RETRIES = 0;
 
