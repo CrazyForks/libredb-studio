@@ -4,6 +4,80 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "The light theme stops painting dark-tuned accent colour. Warning, success and danger text, the query editor Explain control and the monitoring status rings were drawn in colours chosen against a dark ground and reused unchanged on the light one, where the worst of them sat at 1.46:1 against the surface behind it. Every accent is now a token measured on the ground it is drawn on, and the measurement runs as a test rather than being recorded in a comment"
+        - "Both themes now clear a 4.79:1 contrast floor for accent text, measured per token on every surface it can land on"
+        - "Engine identity colours are separated by measurement instead of by eye, so two engines listed next to each other no longer read as the same colour on either theme"
+        - "The Overview and Health panels answer on the MySQL-wire engines that refused a filter they never needed. SHOW STATUS is now read bare and the wanted rows picked out of the answer, so Apache Doris renders instead of failing outright, and a status variable an engine does not publish reads as absent rather than as a fabricated default"
+        - "A query plan is asked for in the grammar the server actually accepts, measured when the connection opens on both wire families. The Explain panel was sending one MySQL form and one PostgreSQL form to every relative of each, so it showed an empty no-plan state on Materialize, CockroachDB, TiDB, StarRocks, SingleStore, Apache Doris and Databend. All seven now render their own plan"
+        - "LOG_LEVEL is documented in .env.example, and an environment variable the app reads can no longer go undocumented without failing a test"
+        - "Track app release 0.14.1 (appVersion bump; default image tag follows)"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.14.1
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.14.1
+    created: "2026-09-07T02:51:28.422078996Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting sixteen engines
+      - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase,
+      ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra
+      and libSQL
+    digest: 084194202ccec49068e69ad3c53fd01f7d6786ccfc4d9fafc082e39a44bd7dba
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - couchbase
+    - clickhouse
+    - druid
+    - elasticsearch
+    - opensearch
+    - trino
+    - cassandra
+    - libsql
+    - turso
+    - duckdb
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/CrazyForks/libredb-studio/releases/download/libredb-studio-0.1.60/libredb-studio-0.1.60.tgz
+    version: 0.1.60
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "The container picks its own bind address: the ConfigMap now writes an empty HOSTNAME, and the image's entrypoint resolves one at startup, preferring a dual-stack :: (#432)"
         - "It proves dual-stack instead of assuming it - a throwaway :: listener that an IPv4 client must actually connect to - and falls back to 0.0.0.0 when the namespace has no IPv6, or when :: is IPv6-only while a non-loopback IPv4 address exists"
         - "New config.bindAddress value overrules that: :: forces dual-stack, 0.0.0.0 pins IPv4 and restores what every chart before 0.1.42 did unconditionally. extraEnv HOSTNAME still wins over both"
@@ -2321,4 +2395,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-08-20T14:30:28.432205204Z"
+generated: "2026-09-07T02:51:28.416496574Z"
