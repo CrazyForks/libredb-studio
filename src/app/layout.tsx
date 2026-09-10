@@ -39,13 +39,14 @@ export const metadata: Metadata = {
     description,
     images: [previewImage],
   },
+  manifest: withBasePath("/site.webmanifest"),
   icons: {
     icon: [
       { url: withBasePath("/favicon.ico?v=2"), sizes: "any" },
       { url: withBasePath("/logo.svg?v=2"), type: "image/svg+xml" },
     ],
     shortcut: withBasePath("/favicon.ico?v=2"),
-    apple: withBasePath("/favicon-32x32.png?v=2"),
+    apple: [{ url: withBasePath("/apple-touch-icon.png"), sizes: "180x180", type: "image/png" }],
   },
 };
 
