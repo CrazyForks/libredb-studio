@@ -1866,12 +1866,19 @@ describe("ResultsGrid", () => {
       expect(srOnly.some((text) => text?.includes("Nullable(String)"))).toBe(true);
     });
 
-    test("renders headers without types and exposes field tooltips", () => {
+    test("renders headers unchanged when the result declares no types at all", () => {
       const { getAllByRole, getByTestId, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
       fireEvent.click(getByTestId("view-table"));
 
       expect(getAllByRole("button", { name: "name" })[0].textContent).toBe("name");
       expect(container.querySelector('span.truncate[title="name"]')).not.toBeNull();
+      const unexpectedTooltips = Array.from(container.querySelectorAll<HTMLElement>("[title]")).filter(
+        (element) =>
+          element.title !== "Filter column" &&
+          !mockResult.fields.includes(element.title) &&
+          !element.hasAttribute("data-row-detail"),
+      );
+      expect(unexpectedTooltips.length).toBe(0);
     });
   });
 
