@@ -477,7 +477,9 @@ export function ResultsGrid({
               className="flex items-center gap-1 cursor-pointer flex-1 min-w-0 text-left"
               onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
             >
-              <span className="truncate">{field}</span>
+              <span className="truncate" title={field}>
+                {field}
+              </span>
               {declaredType && (
                 <span className="text-[0.625rem] normal-case truncate" title={declaredType}>
                   {declaredType}
