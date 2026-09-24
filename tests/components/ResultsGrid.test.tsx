@@ -255,6 +255,7 @@ mock.module("lucide-react", () => {
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { render, fireEvent, cleanup, act, waitFor, within } from "@testing-library/react";
 import { ResultsGrid, type CellChange } from "@/components/ResultsGrid";
+import { getHeaderFitColumnSize } from "@/components/results-grid/column-sizing";
 import type { QueryResult } from "@/lib/types";
 
 // ── Test data ───────────────────────────────────────────────────────────────
@@ -336,6 +337,17 @@ function findDesktopRow(container: HTMLElement, text: string): HTMLElement | und
   ).find((row) => row.textContent?.includes(text));
 }
 
+function findDesktopHeader(container: HTMLElement, field: string): HTMLElement {
+  const header = Array.from(container.querySelectorAll<HTMLElement>("[data-desktop-grid] .cursor-col-resize"))
+    .map((handle) => handle.parentElement)
+    .find((candidate) =>
+      candidate?.querySelector<HTMLButtonElement>("button")?.getAttribute("aria-label")?.startsWith(field),
+    );
+
+  if (!header) throw new Error(`Could not find the desktop header for ${field}`);
+  return header;
+}
+
 // =============================================================================
 // ResultsGrid Tests
 // =============================================================================
@@ -389,6 +401,31 @@ describe("ResultsGrid", () => {
     expect(getAllByRole("button", { name: "id" }).length).toBeGreaterThan(0);
     expect(getAllByRole("button", { name: "name" }).length).toBeGreaterThan(0);
     expect(getAllByRole("button", { name: "email" }).length).toBeGreaterThan(0);
+  });
+
+  test("sizes desktop result columns from field names, not cell values", () => {
+    const result: QueryResult = {
+      rows: [{ id: "a very long value that must not affect the initial width", name: "x" }],
+      fields: ["id", "name"],
+      rowCount: 1,
+      executionTime: 1,
+    };
+    const { container } = render(React.createElement(ResultsGrid, { result }));
+
+    expect(findDesktopHeader(container, "id").style.width).toBe(`${getHeaderFitColumnSize("id")}px`);
+    expect(findDesktopHeader(container, "name").style.width).toBe(`${getHeaderFitColumnSize("name")}px`);
+
+    cleanup();
+
+    const shortValueResult: QueryResult = {
+      ...result,
+      rows: [{ id: "1", name: "short" }],
+    };
+    const shortValueRender = render(React.createElement(ResultsGrid, { result: shortValueResult }));
+    expect(findDesktopHeader(shortValueRender.container, "id").style.width).toBe(`${getHeaderFitColumnSize("id")}px`);
+    expect(findDesktopHeader(shortValueRender.container, "name").style.width).toBe(
+      `${getHeaderFitColumnSize("name")}px`,
+    );
   });
 
   // ── 3. Renders data rows from result.rows ─────────────────────────────────
@@ -1937,6 +1974,33 @@ describe("ResultsGrid", () => {
       for (const handle of handles) {
         expect(handle.getAttribute("aria-hidden")).toBe("true");
       }
+    });
+  });
+
+  describe("column sizing", () => {
+    test("keeps manual resizing and restores only the selected column on double-click", () => {
+      const result: QueryResult = {
+        rows: [{ name: "Ada", email: "ada@example.com" }],
+        fields: ["name", "email"],
+        rowCount: 1,
+        executionTime: 1,
+      };
+      const { container } = render(React.createElement(ResultsGrid, { result }));
+      const nameHeader = findDesktopHeader(container, "name");
+      const emailHeader = findDesktopHeader(container, "email");
+      const nameHandle = nameHeader.querySelector<HTMLElement>(".cursor-col-resize")!;
+
+      fireEvent.mouseDown(nameHandle, { clientX: 100 });
+      fireEvent.mouseMove(document, { clientX: 150 });
+      fireEvent.mouseUp(document, { clientX: 150 });
+
+      expect(nameHeader.style.width).toBe(`${getHeaderFitColumnSize("name") + 50}px`);
+      expect(emailHeader.style.width).toBe(`${getHeaderFitColumnSize("email")}px`);
+
+      fireEvent.doubleClick(nameHandle);
+
+      expect(nameHeader.style.width).toBe(`${getHeaderFitColumnSize("name")}px`);
+      expect(emailHeader.style.width).toBe(`${getHeaderFitColumnSize("email")}px`);
     });
   });
 
