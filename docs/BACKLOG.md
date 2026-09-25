@@ -31,7 +31,7 @@ None of it is a GitHub issue.
 - [Drivers and connections](#drivers-and-connections) — D1–D119, U17 · 64
 - [Value interpolation](#value-interpolation) — V1
 - [Row editing](#row-editing) — R1–R3 · 3
-- [Studio UI and query execution](#studio-ui-and-query-execution) — X2–X19, U2–U47 · 35
+- [Studio UI and query execution](#studio-ui-and-query-execution) — X2–X19, U2–U49 · 37
 - [Dependencies](#dependencies) — P1–P5 · 5
 - [Documentation](#documentation) — DOC3–DOC7 · 4
 - [Release pipeline](#release-pipeline) — REL1–REL4 · 4
@@ -2703,6 +2703,28 @@ Found 2026-09-23 by the #1085 review.
 Not fixed in #1085: the defect predates it, and a window listener in `StudioWorkspace` is not the remedy, because the event is global to the page: two mounted workspaces would both run one keystroke, and a host that also mounts the exported `QueryEditor` would have that editor's text run against the workspace's connection.
 
 **Done when:** the editor's run request reaches only the shell that mounted it, for example through an optional `onExecute(query)` prop that `handleExecute` calls in place of the window event and that `StudioWorkspace` passes as its own run; the embedded toolbar Run reads the editor's effective query as the standalone one does; and a `StudioWorkspace` test that mounts the real `QueryEditor` over a Monaco double fires the captured Cmd+Enter command over a selection and asserts that `onQueryExecute` receives only the selected text, with two mounted workspaces as the control, where only the workspace whose editor ran it runs.
+
+### U48. A result header whose name holds wide characters opens narrower than its name
+
+`getHeaderFitColumnSize` in `src/components/results-grid/column-sizing.ts` sizes a desktop result header as `field.length` times 7.2px, the Geist Mono advance at the header's 12px.
+A Chinese, Japanese or Korean character renders at about the full 12px, so a name written in one of them gets about 60 percent of the width it needs.
+Measured 2026-09-24 in Chromium on the Sample (Employees) connection: the alias `顧客登録番号` needed 72px of text and was given 51px, so its name was cut at every width from 768px to 2560px; the fixed 150px column before #1113 cut it too.
+
+Found 2026-09-24 by the #1113 review.
+Not fixed in #1113: the issue asked for a header fit, and a rule for wide characters needs its own measurement.
+
+**Done when:** a name made of wide characters opens at a width that shows it whole, below the 500px cap, and `tests/unit/components/results-grid-column-sizing.test.ts` pins one.
+
+### U49. The result header width is computed in pixels while the header is sized in rem
+
+The desktop result header is `text-xs`, `px-4` and `gap-1` with `w-3` icons, all rem based, but `getHeaderFitColumnSize` in `src/components/results-grid/column-sizing.ts` adds fixed pixel constants.
+A reader whose browser sets a larger default font gets a larger header inside a column sized for a 16px root.
+Measured 2026-09-24 in Chromium at 1280px with the root font size set to 20px: all 13 headers of a 13 column result were cut, against 12 of 13 with the fixed 150px column before #1113, and a one letter column at the 80px minimum had no room left for its name.
+
+Found 2026-09-24 by the #1113 review.
+Not fixed in #1113: the fixed width before it was cut at that setting too, so this is not a regression of that change.
+
+**Done when:** the header width follows the root font size, either by scaling the result or by stating the constants in rem, and a test at a 20px root pins a name that is shown whole.
 
 ## Dependencies
 

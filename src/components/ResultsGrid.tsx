@@ -33,6 +33,11 @@ import { ResultCard } from "@/components/results-grid/ResultCard";
 import { RowDetailSheet } from "@/components/results-grid/RowDetailSheet";
 import { StatsBar } from "@/components/results-grid/StatsBar";
 import { describeWarning, formatCellValue } from "@/components/results-grid/utils";
+import {
+  getHeaderFitColumnSize,
+  RESULT_COLUMN_MAX_SIZE,
+  RESULT_COLUMN_MIN_SIZE,
+} from "@/components/results-grid/column-sizing";
 import { hasResultOrder } from "@/lib/sql/result-order";
 import { pageOfferFor } from "@/components/results-grid/page-offer";
 import { useDismissOnOutsideClick } from "@/hooks/use-dismiss-on-outside-click";
@@ -472,7 +477,9 @@ export function ResultsGrid({
               className="flex items-center gap-1 cursor-pointer flex-1 min-w-0 text-left"
               onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
             >
-              <span className="truncate">{field}</span>
+              <span className="truncate" title={field}>
+                {field}
+              </span>
               {declaredType && (
                 <span className="text-[0.625rem] normal-case truncate" title={declaredType}>
                   {declaredType}
@@ -664,9 +671,13 @@ export function ResultsGrid({
           </div>
         );
       },
-      size: 150,
-      minSize: 80,
-      maxSize: 500,
+      size: getHeaderFitColumnSize(
+        field,
+        declaredTypeOf(result.columnTypes, field),
+        effectiveMaskingEnabled && sensitiveColumns.has(field),
+      ),
+      minSize: RESULT_COLUMN_MIN_SIZE,
+      maxSize: RESULT_COLUMN_MAX_SIZE,
     }));
 
     return [detailColumn, ...fieldColumns];
@@ -1011,6 +1022,11 @@ export function ResultsGrid({
                         aria-hidden="true"
                         onMouseDown={header.getResizeHandler()}
                         onTouchStart={header.getResizeHandler()}
+                        onDoubleClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          header.column.resetSize();
+                        }}
                         className={cn(
                           "absolute right-0 top-0 h-full w-1 cursor-col-resize hover:bg-brand-tint/50 transition-colors",
                           header.column.getIsResizing() ? "bg-brand-tint w-1" : "bg-transparent",
